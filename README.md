@@ -5,12 +5,13 @@ This repository bootstraps the Phase A control plane for a Nintendo Switch WireG
 Current scope:
 - CMake-based monorepo layout.
 - Shared config, logging, compatibility, and IPC-facing data structures.
+- Versioned binary IPC request/response encoding and an in-process transport that exercises the future service ABI shape.
 - Host-side sysmodule, overlay, and manager stubs that exercise the control plane without requiring a Switch target yet.
 - A placeholder connection state machine with persistence and diagnostics.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
-- Real libnx service registration.
+- Real libnx service registration and port-accept loop.
 - Tesla UI wiring.
 - WireGuard protocol engine.
 - Transparent routing or MITM paths.
@@ -63,6 +64,7 @@ Implemented:
 - config load/save + validation
 - logging
 - stable SDK client surface
+- versioned IPC message encoding + in-process transport bridge
 - app-session and route-planning SDK surface
 - overlay/manager stubs wired through the client API
 - placeholder connection state machine
@@ -80,6 +82,6 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 Next:
-- real Switch IPC registration and ABI packing
+- real `swg:ctl` registration using the existing IPC dispatcher
 - Tesla UI integration
 - libnx capability probes and firmware-specific routing hooks

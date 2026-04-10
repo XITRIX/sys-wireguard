@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "swg/client_transport.h"
 #include "swg/control_service.h"
 
 namespace swg {
@@ -13,8 +14,10 @@ class Client {
  public:
   Client() = default;
   explicit Client(std::shared_ptr<IControlService> service);
+  explicit Client(std::shared_ptr<IClientTransport> transport);
 
   static void AttachHostService(const std::shared_ptr<IControlService>& service);
+  static void AttachHostTransport(const std::shared_ptr<IClientTransport>& transport);
 
   Result<VersionInfo> GetVersion() const;
   Result<ServiceStatus> GetStatus() const;
@@ -34,8 +37,10 @@ class Client {
 
  private:
   std::shared_ptr<IControlService> ResolveService() const;
+  std::shared_ptr<IClientTransport> ResolveTransport() const;
 
   std::shared_ptr<IControlService> service_;
+  std::shared_ptr<IClientTransport> transport_;
 };
 
 }  // namespace swg

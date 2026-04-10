@@ -6,6 +6,7 @@ Phase A establishes a stable control plane before any real tunnel engine or tran
 
 Current implementation boundaries:
 - `swg_common`: config schema, logging, state machine, compatibility probes, and IPC-facing structs.
+- `swg_common` also owns the request/response codec and command dispatcher for the future `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
 - `swg_sdk`: the client layer used by overlay and manager code.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning and future per-app tunnel control.
@@ -21,6 +22,7 @@ Current implementation boundaries:
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
+- Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
 
 ## Runtime paths
 
@@ -41,6 +43,7 @@ Planned Switch paths:
 4. The connection state machine owns the public runtime state.
 5. The SDK client consumes the same control-service API the overlay and manager use.
 6. App consumers can open scoped sessions and ask the sysmodule for per-traffic routing decisions.
+7. Host-side tools and tests pass through the same versioned command envelope the Switch service will expose later.
 
 ## Moonlight-oriented app API
 

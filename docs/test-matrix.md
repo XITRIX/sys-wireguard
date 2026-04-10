@@ -8,6 +8,7 @@
 | CMake build | Verified | `cmake --build --preset host-debug` succeeds on macOS |
 | Config round-trip | Verified | Covered by `swg_tests` |
 | State transitions | Verified | Covered by `swg_tests` |
+| IPC codec round-trip | Verified | Covered by `swg_tests` using request/response encoding helpers |
 | SDK client host binding | Verified | Regression-covered in `swg_tests` |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |

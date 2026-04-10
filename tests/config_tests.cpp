@@ -5,8 +5,10 @@
 #include "swg/app_session.h"
 #include "swg/client.h"
 #include "swg/config.h"
+#include "swg/ipc_codec.h"
 #include "swg/moonlight.h"
 #include "swg/state_machine.h"
+#include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
 namespace {
@@ -85,9 +87,7 @@ bool TestStateMachine() {
 
 bool TestClientHostBinding() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-client";
-  swg::Client::AttachHostService(swg::sysmodule::CreateLocalControlService(runtime_root));
-
-  swg::Client client;
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
   const auto version = client.GetVersion();
   const auto status = client.GetStatus();
 
@@ -98,12 +98,51 @@ bool TestClientHostBinding() {
   return ok;
 }
 
+bool TestIpcCodecRoundTrip() {
+  const swg::VersionInfo expected_version{};
+  const swg::Result<swg::ByteBuffer> version_payload = swg::EncodePayload(expected_version);
+  if (!Require(version_payload.ok(), "version payload encoding must succeed")) {
+    return false;
+  }
+
+  const swg::Result<swg::VersionInfo> decoded_version = swg::DecodeVersionInfoPayload(version_payload.value);
+  if (!Require(decoded_version.ok(), "version payload decoding must succeed")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(decoded_version.value.abi_version == expected_version.abi_version,
+                "version payload must preserve abi version");
+  ok &= Require(decoded_version.value.semantic_version == expected_version.semantic_version,
+                "version payload must preserve semantic version");
+
+  const swg::Config expected_config = MakeValidConfig();
+  const swg::Result<swg::ByteBuffer> config_payload = swg::EncodePayload(expected_config);
+  ok &= Require(config_payload.ok(), "config payload encoding must succeed");
+  if (!config_payload.ok()) {
+    return false;
+  }
+
+  const swg::Result<swg::Config> decoded_config = swg::DecodeConfigPayload(config_payload.value);
+  ok &= Require(decoded_config.ok(), "config payload decoding must succeed");
+  if (!decoded_config.ok()) {
+    return false;
+  }
+
+  ok &= Require(decoded_config.value.active_profile == expected_config.active_profile,
+                "config payload must preserve active profile");
+  ok &= Require(decoded_config.value.profiles.at("default").endpoint_host ==
+                    expected_config.profiles.at("default").endpoint_host,
+                "config payload must preserve endpoint host");
+  return ok;
+}
+
 bool TestMoonlightRoutePlanning() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-moonlight";
   std::error_code filesystem_error;
   std::filesystem::remove_all(runtime_root, filesystem_error);
 
-  swg::Client client(swg::sysmodule::CreateLocalControlService(runtime_root));
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
   if (!Require(client.SaveConfig(MakeValidConfig()).ok(), "valid config must save before Moonlight planning")) {
     return false;
   }
@@ -158,6 +197,7 @@ int main() {
   const bool config_ok = TestConfigRoundTrip();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
+  const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-  return (config_ok && state_ok && client_ok && moonlight_ok) ? 0 : 1;
+  return (config_ok && state_ok && client_ok && codec_ok && moonlight_ok) ? 0 : 1;
 }

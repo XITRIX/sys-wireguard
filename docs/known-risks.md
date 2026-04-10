@@ -6,3 +6,4 @@
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
 - Switch-target presets currently validate project structure rather than producing deployable binaries.
 - The new app route planner is advisory until real DNS responses or transparent socket interception are implemented.
+- The IPC envelope exists, but it is not yet bound to libnx CMIF server objects or a real port/session loop.

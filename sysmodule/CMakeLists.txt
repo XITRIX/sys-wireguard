@@ -1,10 +1,13 @@
 add_library(swg_sysmodule_core STATIC
+  src/host_transport.cpp
   src/local_service.cpp
 )
 
 target_include_directories(swg_sysmodule_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../sdk/include
 )
 
 target_link_libraries(swg_sysmodule_core

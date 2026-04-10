@@ -5,6 +5,7 @@
 #include "swg/client.h"
 #include "swg/config.h"
 #include "swg/ipc_protocol.h"
+#include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
 namespace {
@@ -32,10 +33,7 @@ void PrintStatus(const swg::Client& client) {
 
 int main(int argc, char** argv) {
   const std::filesystem::path runtime_root = swg::DetectRuntimePaths().root_dir;
-  const auto service = swg::sysmodule::CreateLocalControlService(runtime_root);
-  swg::Client::AttachHostService(service);
-
-  swg::Client client;
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
   const std::string command = argc > 1 ? argv[1] : "status";
 
   if (command == "status") {

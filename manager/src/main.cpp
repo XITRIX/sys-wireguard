@@ -4,6 +4,7 @@
 #include "swg/client.h"
 #include "swg/config.h"
 #include "swg/ipc_protocol.h"
+#include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
 namespace {
@@ -53,8 +54,7 @@ void ShowConfig(const swg::Client& client) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  swg::Client::AttachHostService(swg::sysmodule::CreateLocalControlService());
-  swg::Client client;
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport());
 
   if (argc < 2) {
     PrintUsage();

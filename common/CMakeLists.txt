@@ -1,6 +1,7 @@
 add_library(swg_common STATIC
   src/config.cpp
   src/hos_caps.cpp
+  src/ipc_codec.cpp
   src/log.cpp
   src/state_machine.cpp
 )

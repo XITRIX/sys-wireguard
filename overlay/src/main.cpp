@@ -3,6 +3,7 @@
 
 #include "swg/client.h"
 #include "swg/ipc_protocol.h"
+#include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
 namespace {
@@ -45,8 +46,7 @@ void PrintStatus(const swg::Client& client) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  swg::Client::AttachHostService(swg::sysmodule::CreateLocalControlService());
-  swg::Client client;
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport());
 
   const std::string command = argc > 1 ? argv[1] : "status";
 
