@@ -7,6 +7,7 @@ Current scope:
 - Shared config, logging, compatibility, and IPC-facing data structures.
 - Versioned binary IPC request/response encoding, a real `swg:ctl` CMIF transport on Switch, and an in-process host transport for development.
 - Host-side sysmodule, overlay, and manager stubs that exercise the same control-plane ABI without requiring device deployment.
+- A Switch-side manager NRO that can query `swg:ctl`, change the active profile, toggle runtime flags, and issue connect/disconnect requests on hardware.
 - A placeholder connection state machine with persistence and diagnostics.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
@@ -47,11 +48,15 @@ The `switch-debug` preset uses `$DEVKITPRO/cmake/Switch.cmake` and now produces:
 - `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/exefs.nsp`
 - `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/flags/boot2.flag`
 - `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/toolbox.json`
+- `build/switch-debug/manager/swg_manager.nro`
+- `build/switch-debug/manager/switch/swg_manager.nro`
 
 The `atmosphere/contents/...` tree is the ready-to-copy SD-card layout for the current sysmodule title ID.
 The staged `toolbox.json` allows Tesla's `ovl-sysmodules` overlay to list the sysmodule and toggle its boot flag.
 
-Phase A now ships a real `swg:ctl` service host on Switch. Overlay and manager remain host-only stubs until the Tesla and homebrew frontend targets are wired in.
+Phase A now ships a real `swg:ctl` service host on Switch.
+The overlay remains a host-only stub until the Tesla target is wired in.
+The first real device-side frontend is the manager NRO.
 
 Switch runtime files use the `sdmc:/` mount:
 - config: `sdmc:/config/swg/config.ini`
@@ -80,6 +85,7 @@ Implemented:
 - stable SDK client surface
 - versioned IPC message encoding + in-process transport bridge
 - real `swg:ctl` service registration and CMIF envelope transport on Switch
+- Switch manager NRO for on-device control-plane validation
 - app-session and route-planning SDK surface
 - overlay/manager stubs wired through the client API
 - placeholder connection state machine

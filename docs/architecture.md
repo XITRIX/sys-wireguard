@@ -12,6 +12,7 @@ Current implementation boundaries:
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning and future per-app tunnel control.
 - `swg_overlay_stub`: a host-side stand-in for the future Tesla overlay.
 - `swg_manager_stub`: a host-side config-management CLI.
+- `swg_manager_switch`: a Switch homebrew NRO that talks to `swg:ctl` over the same SDK transport as future device-side frontends.
 
 ## Key decisions
 
@@ -24,6 +25,7 @@ Current implementation boundaries:
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
 - Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
 - Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
+- The first on-device control consumer is a plain console manager app so service validation does not depend on libtesla yet.
 
 ## Runtime paths
 
@@ -35,6 +37,7 @@ Host development paths:
 Planned Switch paths:
 - config: `/config/swg/config.ini`
 - logs: `/atmosphere/logs/swg/swg.log`
+- manager app: `sdmc:/switch/swg_manager.nro`
 
 Switch service packaging:
 - service name: `swg:ctl`
@@ -51,6 +54,7 @@ Switch service packaging:
 5. The SDK client consumes the same control-service API the overlay and manager use.
 6. App consumers can open scoped sessions and ask the sysmodule for per-traffic routing decisions.
 7. Host-side tools and tests pass through the same versioned command envelope the Switch service now exposes through `swg:ctl`.
+8. The Switch manager NRO uses the same client transport and IPC envelope as other consumers, so it doubles as the first on-device integration test for the control plane.
 
 ## Moonlight-oriented app API
 

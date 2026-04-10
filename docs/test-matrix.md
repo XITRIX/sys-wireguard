@@ -18,8 +18,10 @@
 | Check | Status | Notes |
 | --- | --- | --- |
 | Switch preset configure | Verified | `cmake --preset switch-debug` succeeds with devkitPro |
-| Switch shared-code build | Verified | `cmake --build --preset switch-debug` succeeds for current libraries |
-| Sysmodule boot | Not started | Requires libnx/sysmodule target |
+| Switch shared-code build | Verified | `cmake --build --preset switch-debug` succeeds for the current libraries, sysmodule package, and manager NRO |
+| Sysmodule boot | Verified | Current boot2 package reaches the main loop and emits logs on hardware |
+| Switch manager build | Verified | `build/switch-debug/manager/swg_manager.nro` and staged `build/switch-debug/manager/switch/swg_manager.nro` are generated |
+| Switch manager control flow | Not started | Requires copying `swg_manager.nro` to `sdmc:/switch/` |
 | Config survives reboot | Not started | Requires device deployment |
 | Overlay queries status | Not started | Requires Tesla target |
 | Connect/disconnect loop | Not started | Placeholder state machine only |

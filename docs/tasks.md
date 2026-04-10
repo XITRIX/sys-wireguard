@@ -11,6 +11,7 @@
 - Versioned IPC codec and host in-process transport adapter implemented.
 - Real `swg:ctl` service registration and CMIF envelope transport implemented for Switch builds.
 - Switch `swg_sysmodule.nsp` ExeFS packaging target added to the CMake `switch-debug` preset.
+- Switch manager NRO target added for on-device control-plane validation through `swg:ctl`.
 - Overlay and manager host stubs implemented.
 - Host-side tests added for config and state transitions.
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
@@ -19,6 +20,7 @@
 ## Next slices
 
 - Add a Tesla frontend target once libtesla is wired into the build.
+- Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Extend compatibility probing with real libnx and HOS service checks.
 - Add richer validation errors for endpoint and address formats.
 - Add real tunnel-aware DNS resolution results for app consumers.

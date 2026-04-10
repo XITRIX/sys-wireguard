@@ -20,6 +20,7 @@ namespace {
 
 constexpr std::size_t kInnerHeapSize = 0x80000;
 constexpr std::size_t kMaxSessionCount = 8;
+constexpr std::uint16_t kServerPointerBufferSize = 0;
 
 constexpr const char* kBootMarkerDir = "sdmc:/atmosphere/logs/swg";
 constexpr const char* kBootMarkerPath = "sdmc:/atmosphere/logs/swg/boot_marker.log";
@@ -90,7 +91,6 @@ void PrepareCmifResponse(::Result rc, const void* payload, std::size_t payload_s
   auto* base = armGetTls();
   const auto data_words = static_cast<std::uint32_t>((0x10 + sizeof(CmifOutHeader) + payload_size + 3) / 4);
   HipcMetadata metadata{};
-  metadata.type = CmifCommandType_Request;
   metadata.num_data_words = data_words;
   HipcRequest hipc = hipcMakeRequest(base, metadata);
 
@@ -103,6 +103,10 @@ void PrepareCmifResponse(::Result rc, const void* payload, std::size_t payload_s
   if (payload_size > 0) {
     std::memcpy(header + 1, payload, payload_size);
   }
+}
+
+void PrepareBlankHipcMessage() {
+  hipcMakeRequestInline(armGetTls());
 }
 
 struct InvokeBuffers {
@@ -181,6 +185,23 @@ struct InvokeBuffers {
 
   out_response->output_size = static_cast<std::uint32_t>(response_bytes.size());
   return 0;
+}
+
+::Result HandleControlRequest(const HipcParsedRequest& request) {
+  auto* base = armGetTls();
+  const auto* header = static_cast<const CmifInHeader*>(cmifGetAlignedDataStart(request.data.data_words, base));
+  const std::size_t data_size = static_cast<std::size_t>(request.meta.num_data_words) * sizeof(std::uint32_t);
+  if (data_size < sizeof(CmifInHeader) || header->magic != CMIF_IN_HEADER_MAGIC) {
+    return MakeLibnxBadInput();
+  }
+
+  switch (header->command_id) {
+    case 3:
+      PrepareCmifResponse(0, &kServerPointerBufferSize, sizeof(kServerPointerBufferSize));
+      return 0;
+    default:
+      return MakeLibnxBadInput();
+  }
 }
 
 class SwitchControlServer {
@@ -290,9 +311,11 @@ class SwitchControlServer {
 
   ::Result ProcessSession(std::size_t handle_index) {
     s32 unused_index = -1;
+    PrepareBlankHipcMessage();
     const ::Result receive_result = svcReplyAndReceive(&unused_index, &handles_[handle_index], 1, INVALID_HANDLE,
                                                        UINT64_MAX);
     if (R_FAILED(receive_result)) {
+      swg::LogWarning("sysmodule", "failed to receive swg:ctl request: " + FormatLibnxResult(receive_result));
       CloseSession(handle_index);
       return receive_result;
     }
@@ -311,6 +334,17 @@ class SwitchControlServer {
         }
         break;
       }
+      case CmifCommandType_Control: {
+        const ::Result control_result = HandleControlRequest(request);
+        if (R_SUCCEEDED(control_result)) {
+          break;
+        }
+
+        swg::LogWarning("sysmodule", "rejected unsupported swg:ctl control request: " +
+                                        FormatLibnxResult(control_result));
+        PrepareCmifResponse(control_result, nullptr, 0);
+        break;
+      }
       case CmifCommandType_Close:
         close_session = true;
         PrepareCmifResponse(0, nullptr, 0);
@@ -322,12 +356,15 @@ class SwitchControlServer {
 
     const ::Result reply_result = svcReplyAndReceive(&unused_index, &handles_[handle_index], 0,
                                                      handles_[handle_index], 0);
-    if (R_FAILED(reply_result) || close_session) {
-      CloseSession(handle_index);
-    }
-
     if (reply_result == KERNELRESULT(TimedOut)) {
       return 0;
+    }
+
+    if (R_FAILED(reply_result) || close_session) {
+      if (R_FAILED(reply_result)) {
+        swg::LogWarning("sysmodule", "failed to reply to swg:ctl client: " + FormatLibnxResult(reply_result));
+      }
+      CloseSession(handle_index);
     }
 
     return reply_result;
