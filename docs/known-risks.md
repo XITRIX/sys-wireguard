@@ -1,9 +1,8 @@
 # Known Risks
 
-- The current service transport is in-process only; no real Horizon IPC registration exists yet.
+- The Switch service currently exposes one CMIF command that carries the versioned binary envelope in alias buffers; larger future config payloads may require chunking or a larger negotiated buffer budget.
 - The overlay target is a host stub, not a Tesla binary.
 - Capability detection is conservative and mostly placeholder until libnx-backed probes are added.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
-- Switch-target presets currently validate project structure rather than producing deployable binaries.
 - The new app route planner is advisory until real DNS responses or transparent socket interception are implemented.
-- The IPC envelope exists, but it is not yet bound to libnx CMIF server objects or a real port/session loop.
+- The sysmodule NPDM is intentionally permissive in Phase A (`service_access = ["*"]`) and should be tightened once the exact service dependencies are fixed.

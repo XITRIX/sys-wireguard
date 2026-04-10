@@ -28,6 +28,7 @@ class Logger {
  private:
   Logger() = default;
 
+  bool EnsureStreamOpenUnlocked();
   void WriteLineUnlocked(LogLevel level, std::string_view component, std::string_view message);
 
   mutable std::mutex mutex_;

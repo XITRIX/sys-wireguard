@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -8,6 +9,21 @@
 #include "swg/version.h"
 
 namespace swg {
+
+inline constexpr char kControlServiceName[] = "swg:ctl";
+inline constexpr std::size_t kControlPortMaxEnvelopeSize = 128 * 1024;
+
+enum class ControlPortCommandId : std::uint32_t {
+  Invoke = 0,
+};
+
+struct ControlPortInvokeRequest {
+  std::uint32_t input_size = 0;
+};
+
+struct ControlPortInvokeResponse {
+  std::uint32_t output_size = 0;
+};
 
 enum class ServiceCommandId : std::uint32_t {
   GetVersion = 0,

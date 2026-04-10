@@ -1,5 +1,7 @@
 #include "swg/client.h"
 
+#include "swg/switch_transport.h"
+
 namespace swg {
 namespace {
 
@@ -52,6 +54,15 @@ Error DecodeTransportMutationResponse(const Result<ByteBuffer>& response_bytes) 
   return response.value.error;
 }
 
+std::shared_ptr<IClientTransport> ResolvePlatformDefaultTransport() {
+#if defined(SWG_PLATFORM_SWITCH)
+  static std::shared_ptr<IClientTransport> transport = CreateSwitchControlTransport();
+  return transport;
+#else
+  return {};
+#endif
+}
+
 }  // namespace
 
 Client::Client(std::shared_ptr<IControlService> service) : service_(std::move(service)) {}
@@ -79,7 +90,11 @@ std::shared_ptr<IClientTransport> Client::ResolveTransport() const {
     return transport_;
   }
 
-  return g_host_transport;
+  if (g_host_transport) {
+    return g_host_transport;
+  }
+
+  return ResolvePlatformDefaultTransport();
 }
 
 Result<VersionInfo> Client::GetVersion() const {

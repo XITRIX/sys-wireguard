@@ -195,9 +195,9 @@ RuntimePaths DetectRuntimePaths(const std::filesystem::path& root_override) {
 
 #if defined(SWG_PLATFORM_SWITCH)
   (void)root_override;
-  paths.root_dir = "/";
-  paths.config_dir = "/config/swg";
-  paths.log_dir = "/atmosphere/logs/swg";
+  paths.root_dir = "sdmc:/";
+  paths.config_dir = "sdmc:/config/swg";
+  paths.log_dir = "sdmc:/atmosphere/logs/swg";
 #else
   paths.root_dir = root_override.empty() ? (std::filesystem::current_path() / "runtime") : root_override;
   paths.config_dir = paths.root_dir / "config" / "swg";

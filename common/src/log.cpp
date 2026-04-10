@@ -1,10 +1,15 @@
 #include "swg/log.h"
 
-#include <chrono>
-#include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+
+#if defined(SWG_PLATFORM_SWITCH)
+#include <switch.h>
+#else
+#include <chrono>
+#include <ctime>
+#endif
 
 namespace swg {
 namespace {
@@ -25,6 +30,11 @@ const char* ToLabel(LogLevel level) {
 }
 
 std::string TimestampString() {
+#if defined(SWG_PLATFORM_SWITCH)
+  std::ostringstream stream;
+  stream << "tick=" << svcGetSystemTick();
+  return stream.str();
+#else
   const auto now = std::chrono::system_clock::now();
   const std::time_t time = std::chrono::system_clock::to_time_t(now);
   std::tm local_time{};
@@ -37,6 +47,7 @@ std::string TimestampString() {
   std::ostringstream stream;
   stream << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S");
   return stream.str();
+#endif
 }
 
 }  // namespace
@@ -44,6 +55,15 @@ std::string TimestampString() {
 Logger& Logger::Instance() {
   static Logger logger;
   return logger;
+}
+
+bool Logger::EnsureStreamOpenUnlocked() {
+  if (stream_.is_open()) {
+    return true;
+  }
+
+  stream_.open(log_path_, std::ios::app);
+  return stream_.is_open();
 }
 
 Error Logger::Initialize(const std::filesystem::path& log_path) {
@@ -64,12 +84,11 @@ Error Logger::Initialize(const std::filesystem::path& log_path) {
     stream_.close();
   }
 
-  stream_.open(log_path, std::ios::app);
-  if (!stream_.is_open()) {
+  log_path_ = log_path;
+  if (!EnsureStreamOpenUnlocked()) {
     return MakeError(ErrorCode::IoError, "failed to open log file: " + log_path.string());
   }
 
-  log_path_ = log_path;
   initialized_ = true;
   WriteLineUnlocked(LogLevel::Info, "logger", "logger initialized");
   return Error::None();
@@ -98,11 +117,19 @@ std::filesystem::path Logger::log_path() const {
 }
 
 void Logger::WriteLineUnlocked(LogLevel level, std::string_view component, std::string_view message) {
+  if (!EnsureStreamOpenUnlocked()) {
+    return;
+  }
+
   const std::string line = TimestampString() + " [" + ToLabel(level) + "] [" + std::string(component) + "] " +
                            std::string(message);
   stream_ << line << '\n';
   stream_.flush();
+#if !defined(SWG_PLATFORM_SWITCH)
   std::cerr << line << '\n';
+#else
+  stream_.close();
+#endif
 }
 
 void LogDebug(std::string_view component, std::string_view message) {

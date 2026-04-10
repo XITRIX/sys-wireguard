@@ -6,9 +6,9 @@ Phase A establishes a stable control plane before any real tunnel engine or tran
 
 Current implementation boundaries:
 - `swg_common`: config schema, logging, state machine, compatibility probes, and IPC-facing structs.
-- `swg_common` also owns the request/response codec and command dispatcher for the future `swg:ctl` ABI.
+- `swg_common` also owns the request/response codec and command dispatcher used by the current `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
-- `swg_sdk`: the client layer used by overlay and manager code.
+- `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning and future per-app tunnel control.
 - `swg_overlay_stub`: a host-side stand-in for the future Tesla overlay.
 - `swg_manager_stub`: a host-side config-management CLI.
@@ -23,6 +23,7 @@ Current implementation boundaries:
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
 - Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
+- Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
 
 ## Runtime paths
 
@@ -35,6 +36,12 @@ Planned Switch paths:
 - config: `/config/swg/config.ini`
 - logs: `/atmosphere/logs/swg/swg.log`
 
+Switch service packaging:
+- service name: `swg:ctl`
+- CMake output: `build/switch-debug/sysmodule/swg_sysmodule.nsp`
+- Atmosphere install path: `sdmc:/atmosphere/contents/00FF53574743544C/exefs.nsp`
+- boot flag: `sdmc:/atmosphere/contents/00FF53574743544C/flags/boot2.flag`
+
 ## Control flow
 
 1. The sysmodule stub initializes logging.
@@ -43,7 +50,7 @@ Planned Switch paths:
 4. The connection state machine owns the public runtime state.
 5. The SDK client consumes the same control-service API the overlay and manager use.
 6. App consumers can open scoped sessions and ask the sysmodule for per-traffic routing decisions.
-7. Host-side tools and tests pass through the same versioned command envelope the Switch service will expose later.
+7. Host-side tools and tests pass through the same versioned command envelope the Switch service now exposes through `swg:ctl`.
 
 ## Moonlight-oriented app API
 
@@ -55,7 +62,6 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 
 ## What is intentionally deferred
 
-- real `swg:ctl` registration and IPC marshalling
 - Tesla rendering and input handling
 - WireGuard engine integration
 - DNS-over-tunnel and MITM logic

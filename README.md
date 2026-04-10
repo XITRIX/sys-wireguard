@@ -5,13 +5,12 @@ This repository bootstraps the Phase A control plane for a Nintendo Switch WireG
 Current scope:
 - CMake-based monorepo layout.
 - Shared config, logging, compatibility, and IPC-facing data structures.
-- Versioned binary IPC request/response encoding and an in-process transport that exercises the future service ABI shape.
-- Host-side sysmodule, overlay, and manager stubs that exercise the control plane without requiring a Switch target yet.
+- Versioned binary IPC request/response encoding, a real `swg:ctl` CMIF transport on Switch, and an in-process host transport for development.
+- Host-side sysmodule, overlay, and manager stubs that exercise the same control-plane ABI without requiring device deployment.
 - A placeholder connection state machine with persistence and diagnostics.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
-- Real libnx service registration and port-accept loop.
 - Tesla UI wiring.
 - WireGuard protocol engine.
 - Transparent routing or MITM paths.
@@ -19,7 +18,7 @@ Not implemented yet:
 ## Repository layout
 
 - `common`: shared structs, config parsing, logging, compatibility helpers, and state machine.
-- `sysmodule`: local control-service implementation used as the Phase A sysmodule stub.
+- `sysmodule`: control-service implementation and the Switch-side `swg:ctl` service host.
 - `sdk`: client API that other components consume.
 - `overlay`: host-side overlay stub consuming the SDK API only.
 - `manager`: host-side manager CLI for heavier config operations.
@@ -40,9 +39,24 @@ Switch-target configuration slice:
 
 ```sh
 cmake --preset switch-debug
+cmake --build --preset switch-debug
 ```
 
-The `switch-debug` preset uses `$DEVKITPRO/cmake/Switch.cmake`. At this stage it configures shared code and project structure only; libnx- and Tesla-backed binaries are intentionally deferred until the control plane stabilizes.
+The `switch-debug` preset uses `$DEVKITPRO/cmake/Switch.cmake` and now produces:
+- `build/switch-debug/sysmodule/swg_sysmodule.nsp`
+- `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/exefs.nsp`
+- `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/flags/boot2.flag`
+- `build/switch-debug/sysmodule/atmosphere/contents/00FF53574743544C/toolbox.json`
+
+The `atmosphere/contents/...` tree is the ready-to-copy SD-card layout for the current sysmodule title ID.
+The staged `toolbox.json` allows Tesla's `ovl-sysmodules` overlay to list the sysmodule and toggle its boot flag.
+
+Phase A now ships a real `swg:ctl` service host on Switch. Overlay and manager remain host-only stubs until the Tesla and homebrew frontend targets are wired in.
+
+Switch runtime files use the `sdmc:/` mount:
+- config: `sdmc:/config/swg/config.ini`
+- logs: `sdmc:/atmosphere/logs/swg/swg.log`
+- early boot marker: `sdmc:/atmosphere/logs/swg/boot_marker.log`
 
 ## Host stub commands
 
@@ -65,6 +79,7 @@ Implemented:
 - logging
 - stable SDK client surface
 - versioned IPC message encoding + in-process transport bridge
+- real `swg:ctl` service registration and CMIF envelope transport on Switch
 - app-session and route-planning SDK surface
 - overlay/manager stubs wired through the client API
 - placeholder connection state machine
@@ -82,6 +97,5 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 Next:
-- real `swg:ctl` registration using the existing IPC dispatcher
 - Tesla UI integration
 - libnx capability probes and firmware-specific routing hooks

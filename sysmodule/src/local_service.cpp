@@ -284,7 +284,12 @@ class LocalControlService final : public IControlService {
     info.has_ifcfg = capabilities.has_ifcfg;
     info.has_bsd_nu = capabilities.has_bsd_nu;
     info.needs_new_tls_abi = capabilities.needs_new_tls_abi;
+#if defined(SWG_PLATFORM_SWITCH)
+    info.notes = DescribeHosCapabilities(capabilities) +
+                 "; Phase A exposes the control plane through the registered swg:ctl service.";
+#else
     info.notes = DescribeHosCapabilities(capabilities) + "; Phase A currently exercises the control plane through a local stub service.";
+#endif
     return MakeSuccess(std::move(info));
   }
 
