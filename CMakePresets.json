@@ -1,0 +1,54 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "host-debug",
+      "displayName": "Host Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SWG_BUILD_HOST_TOOLS": "ON",
+        "SWG_BUILD_SWITCH_TARGETS": "OFF",
+        "SWG_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "switch-debug",
+      "displayName": "Switch Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/switch-debug",
+      "toolchainFile": "$env{DEVKITPRO}/cmake/Switch.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SWG_BUILD_HOST_TOOLS": "OFF",
+        "SWG_BUILD_SWITCH_TARGETS": "ON",
+        "SWG_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug"
+    },
+    {
+      "name": "switch-debug",
+      "configurePreset": "switch-debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
