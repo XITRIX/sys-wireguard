@@ -17,6 +17,10 @@
 - Initial Milestone 4 slice added: WireGuard profile preflight validation plus a tunnel-engine integration boundary behind `Connect()`.
 - Current Milestone 4 preflight now parses endpoint literals, CIDR networks, interface addresses, and numeric DNS servers into prepared session data.
 - The tunnel-engine seam now prepares an explicit IPv4-only session plan for current Switch transport, keeps hostname endpoints resolution-pending, and records skipped IPv6-only inputs instead of pretending they are usable on-device.
+- Prepared tunnel sessions now have an IPv4 endpoint-resolution helper for future transport wiring, with host tests covering both numeric and `localhost` endpoint resolution without changing current connect behavior.
+- The engine scaffold now initializes a bounded BSD socket runtime and opens a connected IPv4 UDP socket for the resolved endpoint, giving Milestone 4 a real transport lifecycle without yet attempting a WireGuard handshake.
+- The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
+- The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
 - Overlay and manager host stubs implemented.
 - Host-side tests added for config and state transitions.
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
@@ -26,7 +30,7 @@
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Replace the stub tunnel-engine backend with real WireGuard handshake and transport integration.
-- Resolve hostname endpoints to IPv4 and feed the result into the future UDP backend.
+- Feed packets through the connected UDP socket and add bounded TX/RX buffers for the future handshake loop.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Add real tunnel-aware DNS resolution results for app consumers.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.

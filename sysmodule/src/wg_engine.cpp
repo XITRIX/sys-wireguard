@@ -1,7 +1,12 @@
 #include "swg_sysmodule/wg_engine.h"
 
+#include "swg_sysmodule/socket_runtime.h"
+
 #include <algorithm>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sstream>
+#include <sys/socket.h>
 
 namespace swg::sysmodule {
 namespace {
@@ -20,6 +25,26 @@ PreparedIpv4Network PrepareIpv4Network(const ParsedIpNetwork& network) {
   return prepared;
 }
 
+std::array<std::uint8_t, 4> CopyIpv4SockaddrBytes(const sockaddr_in& address) {
+  std::array<std::uint8_t, 4> bytes{};
+  std::copy_n(reinterpret_cast<const std::uint8_t*>(&address.sin_addr), bytes.size(), bytes.begin());
+  return bytes;
+}
+
+Error MakeResolveError(int rc, std::string_view host) {
+  ErrorCode code = ErrorCode::ServiceUnavailable;
+  if (rc == EAI_NONAME) {
+    code = ErrorCode::NotFound;
+  }
+
+  std::string message = "endpoint host '" + std::string(host) + "' could not be resolved to IPv4";
+  if (rc != 0) {
+    message += ": ";
+    message += gai_strerror(rc);
+  }
+  return MakeError(code, std::move(message));
+}
+
 class StubWgTunnelEngine final : public IWgTunnelEngine {
  public:
   Error Start(const TunnelEngineStartRequest& request) override {
@@ -27,8 +52,26 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
       return MakeError(ErrorCode::InvalidState, "WireGuard engine is already running");
     }
 
-    active_profile_ = request.session.profile_name;
-    prepared_session_ = request.session;
+    const Error runtime_error = socket_runtime_.Start();
+    if (runtime_error) {
+      return runtime_error;
+    }
+
+    const Result<PreparedTunnelSession> resolved_session = ResolvePreparedTunnelSessionEndpoint(request.session);
+    if (!resolved_session.ok()) {
+      socket_runtime_.Stop();
+      return resolved_session.error;
+    }
+
+    const Result<int> socket_result = socket_runtime_.OpenConnectedUdpSocket(resolved_session.value.endpoint);
+    if (!socket_result.ok()) {
+      socket_runtime_.Stop();
+      return socket_result.error;
+    }
+
+    udp_socket_ = socket_result.value;
+    active_profile_ = resolved_session.value.profile_name;
+    prepared_session_ = resolved_session.value;
     stats_ = {};
     running_ = true;
     return Error::None();
@@ -39,6 +82,9 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
       return Error::None();
     }
 
+    socket_runtime_.CloseSocket(udp_socket_);
+    socket_runtime_.Stop();
+    udp_socket_ = -1;
     running_ = false;
     active_profile_.clear();
     prepared_session_ = {};
@@ -55,9 +101,11 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
   }
 
  private:
+  BsdSocketRuntime socket_runtime_{};
   std::string active_profile_;
   PreparedTunnelSession prepared_session_{};
   TunnelStats stats_{};
+  int udp_socket_ = -1;
   bool running_ = false;
 };
 
@@ -134,6 +182,65 @@ Result<PreparedTunnelSession> PrepareTunnelSession(std::string_view profile_name
   }
 
   return MakeSuccess(std::move(session));
+}
+
+Result<PreparedTunnelEndpoint> ResolvePreparedTunnelEndpoint(const PreparedTunnelEndpoint& endpoint) {
+  if (endpoint.port == 0) {
+    return MakeFailure<PreparedTunnelEndpoint>(ErrorCode::InvalidConfig,
+                                               "prepared endpoint must not use port 0");
+  }
+
+  if (endpoint.state == PreparedEndpointState::Ready) {
+    return MakeSuccess(endpoint);
+  }
+
+  if (endpoint.host.empty()) {
+    return MakeFailure<PreparedTunnelEndpoint>(ErrorCode::InvalidConfig,
+                                               "prepared endpoint hostname must not be empty");
+  }
+
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+
+  addrinfo* results = nullptr;
+  const int rc = getaddrinfo(endpoint.host.c_str(), nullptr, &hints, &results);
+  if (rc != 0 || results == nullptr) {
+    if (results != nullptr) {
+      freeaddrinfo(results);
+    }
+    const Error error = MakeResolveError(rc, endpoint.host);
+    return Result<PreparedTunnelEndpoint>::Failure(error);
+  }
+
+  for (addrinfo* current = results; current != nullptr; current = current->ai_next) {
+    if (current->ai_family != AF_INET || current->ai_addr == nullptr ||
+        current->ai_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      continue;
+    }
+
+    PreparedTunnelEndpoint resolved = endpoint;
+    resolved.state = PreparedEndpointState::Ready;
+    resolved.ipv4 = CopyIpv4SockaddrBytes(*reinterpret_cast<const sockaddr_in*>(current->ai_addr));
+    freeaddrinfo(results);
+    return MakeSuccess(std::move(resolved));
+  }
+
+  freeaddrinfo(results);
+  return MakeFailure<PreparedTunnelEndpoint>(ErrorCode::NotFound,
+                                             "endpoint host '" + endpoint.host +
+                                                 "' did not return an IPv4 address");
+}
+
+Result<PreparedTunnelSession> ResolvePreparedTunnelSessionEndpoint(const PreparedTunnelSession& session) {
+  const Result<PreparedTunnelEndpoint> resolved_endpoint = ResolvePreparedTunnelEndpoint(session.endpoint);
+  if (!resolved_endpoint.ok()) {
+    return MakeFailure<PreparedTunnelSession>(resolved_endpoint.error.code, resolved_endpoint.error.message);
+  }
+
+  PreparedTunnelSession resolved = session;
+  resolved.endpoint = resolved_endpoint.value;
+  return MakeSuccess(std::move(resolved));
 }
 
 std::string DescribePreparedTunnelSession(const PreparedTunnelSession& session) {

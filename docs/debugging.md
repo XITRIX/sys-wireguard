@@ -27,4 +27,10 @@ The logger currently flushes every line. On Switch builds it now closes the file
 - runtime flag changes
 - connect/disconnect requests
 
+## Current connect semantics
+
+At the current Milestone 4 slice, `Connected` only means the sysmodule validated the active profile, resolved the IPv4 endpoint if needed, started BSD successfully, and opened a connected UDP socket.
+
+It does not yet mean a real WireGuard handshake succeeded. Wrong keys, an offline VPN server, or a server that never responds can still appear as `Connected` at this stage as long as the local UDP setup succeeds.
+
 Sensitive material is never intentionally written to logs.

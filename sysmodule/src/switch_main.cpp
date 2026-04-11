@@ -18,9 +18,11 @@
 
 namespace {
 
-constexpr std::size_t kInnerHeapSize = 0x80000;
+constexpr std::size_t kProcessHeapSize = 0x400000;
 constexpr std::size_t kMaxSessionCount = 8;
 constexpr std::uint16_t kServerPointerBufferSize = 0;
+
+static_assert((kProcessHeapSize % 0x200000) == 0, "process heap size must be 2 MiB aligned");
 
 constexpr const char* kBootMarkerDir = "sdmc:/atmosphere/logs/swg";
 constexpr const char* kBootMarkerPath = "sdmc:/atmosphere/logs/swg/boot_marker.log";
@@ -392,15 +394,7 @@ extern "C" {
 
 u32 __nx_applet_type = AppletType_None;
 u32 __nx_fs_num_sessions = 1;
-
-void __libnx_initheap(void) {
-  static std::uint8_t inner_heap[kInnerHeapSize];
-  extern void* fake_heap_start;
-  extern void* fake_heap_end;
-
-  fake_heap_start = inner_heap;
-  fake_heap_end = inner_heap + sizeof(inner_heap);
-}
+size_t __nx_heap_size = kProcessHeapSize;
 
 void __appInit(void) {
   ::Result rc = smInitialize();

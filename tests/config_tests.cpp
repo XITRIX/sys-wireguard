@@ -71,7 +71,7 @@ swg::Config MakeValidConfig() {
   profile.private_key = kSamplePrivateKey;
   profile.public_key = kSamplePublicKey;
   profile.preshared_key = kSamplePresharedKey;
-  profile.endpoint_host = "peer.example.test";
+  profile.endpoint_host = "localhost";
   profile.endpoint_port = 51820;
   profile.allowed_ips = {"0.0.0.0/0", "::/0"};
   profile.addresses = {"10.0.0.2/32"};
@@ -165,6 +165,95 @@ bool TestTunnelSessionPreparation() {
     ok &= Require(!unsupported_address.ok(), "Switch session prep should require an IPv4 interface address");
   }
 
+  return ok;
+}
+
+bool TestTunnelEndpointResolution() {
+  bool ok = true;
+
+  swg::Config literal_config = MakeValidConfig();
+  literal_config.profiles.at("default").endpoint_host = "127.0.0.1";
+  const auto validated_literal = swg::ValidateWireGuardProfileForConnect(literal_config.profiles.at("default"));
+  ok &= Require(validated_literal.ok(), "IPv4 literal endpoint must validate before resolution");
+  if (!validated_literal.ok()) {
+    return false;
+  }
+
+  const auto prepared_literal =
+      swg::sysmodule::PrepareTunnelSession(literal_config.active_profile, validated_literal.value,
+                                           literal_config.runtime_flags);
+  ok &= Require(prepared_literal.ok(), "IPv4 literal endpoint must prepare a session");
+  if (!prepared_literal.ok()) {
+    return false;
+  }
+
+  const auto resolved_literal = swg::sysmodule::ResolvePreparedTunnelSessionEndpoint(prepared_literal.value);
+  ok &= Require(resolved_literal.ok(), "ready IPv4 literal endpoint must resolve without DNS");
+  if (resolved_literal.ok()) {
+    ok &= Require(resolved_literal.value.endpoint.state == swg::sysmodule::PreparedEndpointState::Ready,
+                  "IPv4 literal endpoint must stay ready after resolution");
+    ok &= Require(resolved_literal.value.endpoint.ipv4[0] == 127 && resolved_literal.value.endpoint.ipv4[3] == 1,
+                  "IPv4 literal endpoint must preserve its numeric address bytes");
+  }
+
+  swg::Config hostname_config = MakeValidConfig();
+  hostname_config.profiles.at("default").endpoint_host = "LOCALHOST";
+  const auto validated_hostname = swg::ValidateWireGuardProfileForConnect(hostname_config.profiles.at("default"));
+  ok &= Require(validated_hostname.ok(), "localhost endpoint must validate before resolution");
+  if (!validated_hostname.ok()) {
+    return false;
+  }
+
+  const auto prepared_hostname =
+      swg::sysmodule::PrepareTunnelSession(hostname_config.active_profile, validated_hostname.value,
+                                           hostname_config.runtime_flags);
+  ok &= Require(prepared_hostname.ok(), "localhost endpoint must prepare a session");
+  if (!prepared_hostname.ok()) {
+    return false;
+  }
+
+  ok &= Require(prepared_hostname.value.endpoint.state == swg::sysmodule::PreparedEndpointState::NeedsIpv4Resolution,
+                "hostname endpoint must require IPv4 resolution before transport");
+
+  const auto resolved_hostname = swg::sysmodule::ResolvePreparedTunnelSessionEndpoint(prepared_hostname.value);
+  ok &= Require(resolved_hostname.ok(), "localhost endpoint must resolve to an IPv4 address on host tests");
+  if (resolved_hostname.ok()) {
+    ok &= Require(resolved_hostname.value.endpoint.state == swg::sysmodule::PreparedEndpointState::Ready,
+                  "resolved hostname endpoint must become ready");
+    ok &= Require(resolved_hostname.value.endpoint.ipv4[0] == 127,
+                  "localhost endpoint must resolve to the IPv4 loopback range");
+    ok &= Require(resolved_hostname.value.endpoint.port == 51820,
+                  "hostname resolution must preserve the endpoint port");
+  }
+
+  return ok;
+}
+
+bool TestTunnelEngineUdpScaffold() {
+  const swg::Config valid_config = MakeValidConfig();
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for engine start");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for engine start");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  auto engine = swg::sysmodule::CreateStubWgTunnelEngine();
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(start_error.ok(), "engine start must open the UDP scaffold for a resolvable endpoint");
+  ok &= Require(engine->IsRunning(), "engine must report running after UDP scaffold start");
+  ok &= Require(engine->GetStats().successful_handshakes == 0,
+                "UDP scaffold must not claim a successful WireGuard handshake");
+  ok &= Require(engine->Stop().ok(), "engine stop must close the UDP scaffold cleanly");
+  ok &= Require(!engine->IsRunning(), "engine must report stopped after shutdown");
   return ok;
 }
 
@@ -389,14 +478,17 @@ int main() {
   const bool config_ok = TestConfigRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
   const bool tunnel_session_ok = TestTunnelSessionPreparation();
+  const bool endpoint_resolution_ok = TestTunnelEndpointResolution();
+  const bool udp_scaffold_ok = TestTunnelEngineUdpScaffold();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
   const bool connect_preflight_ok = TestConnectPreflightStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-    return (endpoint_parser_ok && config_ok && wg_validation_ok && tunnel_session_ok && state_ok && client_ok &&
-      connect_preflight_ok && invalid_connect_ok && codec_ok && moonlight_ok)
+        return (endpoint_parser_ok && config_ok && wg_validation_ok && tunnel_session_ok && endpoint_resolution_ok &&
+          udp_scaffold_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok && codec_ok &&
+          moonlight_ok)
              ? 0
              : 1;
 }

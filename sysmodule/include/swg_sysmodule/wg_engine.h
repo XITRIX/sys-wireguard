@@ -54,6 +54,8 @@ struct TunnelEngineStartRequest {
 Result<PreparedTunnelSession> PrepareTunnelSession(std::string_view profile_name,
                                                    const ValidatedWireGuardProfile& profile,
                                                    RuntimeFlags runtime_flags);
+Result<PreparedTunnelEndpoint> ResolvePreparedTunnelEndpoint(const PreparedTunnelEndpoint& endpoint);
+Result<PreparedTunnelSession> ResolvePreparedTunnelSessionEndpoint(const PreparedTunnelSession& session);
 std::string DescribePreparedTunnelSession(const PreparedTunnelSession& session);
 
 class IWgTunnelEngine {
