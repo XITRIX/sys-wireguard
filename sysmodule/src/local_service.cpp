@@ -240,8 +240,16 @@ class LocalControlService final : public IControlService {
       return validated_profile.error;
     }
 
-    const Error engine_error = tunnel_engine_->Start(
-        TunnelEngineStartRequest{config_.active_profile, validated_profile.value, config_.runtime_flags});
+    const Result<PreparedTunnelSession> prepared_session =
+        PrepareTunnelSession(config_.active_profile, validated_profile.value, config_.runtime_flags);
+    if (!prepared_session.ok()) {
+      state_machine_.MarkConnectFailed(prepared_session.error.message);
+      LogError("sysmodule", "connect session preparation failed for profile " + config_.active_profile + ": " +
+                                 prepared_session.error.message);
+      return prepared_session.error;
+    }
+
+    const Error engine_error = tunnel_engine_->Start(TunnelEngineStartRequest{prepared_session.value});
     if (engine_error) {
       state_machine_.MarkConnectFailed(engine_error.message);
       LogError("sysmodule", "WireGuard engine start failed for profile " + config_.active_profile + ": " +
@@ -255,12 +263,9 @@ class LocalControlService final : public IControlService {
       return mark_error;
     }
 
-    LogInfo("sysmodule", "connect requested for profile " + config_.active_profile + " endpoint=" +
-                            validated_profile.value.endpoint.host + ":" +
-                            std::to_string(validated_profile.value.endpoint.port) + " allowed_ips=" +
-                            std::to_string(validated_profile.value.allowed_ips.size()) + " addresses=" +
-                            std::to_string(validated_profile.value.addresses.size()) +
-                            " (session prepared; handshake and transport remain stubbed)");
+    LogInfo("sysmodule", "connect requested with prepared session: " +
+                            DescribePreparedTunnelSession(prepared_session.value) +
+                            " (handshake and transport remain stubbed)");
     return Error::None();
   }
 

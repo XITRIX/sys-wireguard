@@ -5,6 +5,7 @@
 - Tesla live toggling now relies on `ovl-sysmodules` using `pmshellTerminateProgram()` / `pmshellLaunchProgram()`; active clients should tolerate abrupt `swg:ctl` disconnects during manual stop/start.
 - The Switch manager is the current Phase A control UI; it is text-mode and intentionally simpler than the future Tesla UX.
 - The current Milestone 4 slice only validates WireGuard profile material and starts a stub tunnel-engine boundary; it does not perform a real handshake or UDP transport yet.
+- The current Switch tunnel session preparation is intentionally IPv4-only: hostname endpoints are left unresolved for a later resolver/UDP slice, IPv6 endpoints are rejected, and IPv6 routes or DNS entries are only tracked as skipped metadata.
 - DNS servers currently need to be numeric IP literals during connect preflight; hostname-based resolver configuration is not accepted yet.
 - Capability detection now probes live service reachability, but some flags still map to nearest current surfaces (`sfdnsres` for resolver reachability and `nifm:a`/`nifm:s` for network-configuration reachability) rather than final transparent-mode hooks.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.

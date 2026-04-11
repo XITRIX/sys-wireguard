@@ -9,6 +9,7 @@
 #include "swg/moonlight.h"
 #include "swg/state_machine.h"
 #include "swg/wg_profile.h"
+#include "swg_sysmodule/wg_engine.h"
 #include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
@@ -111,6 +112,59 @@ bool TestWireGuardProfileValidation() {
   invalid_config.profiles.at("default").allowed_ips = {"not-a-cidr"};
   const auto invalid_cidr = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
   ok &= Require(!invalid_cidr.ok(), "invalid allowed_ips entry must fail connect validation");
+  return ok;
+}
+
+bool TestTunnelSessionPreparation() {
+  const swg::Config valid_config = MakeValidConfig();
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for tunnel session prep");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared = swg::sysmodule::PrepareTunnelSession(
+      valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "hostname-based IPv4-ready profile must prepare a tunnel session");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  ok &= Require(prepared.value.endpoint.state == swg::sysmodule::PreparedEndpointState::NeedsIpv4Resolution,
+                "hostname endpoint must remain resolution-pending");
+  ok &= Require(prepared.value.allowed_ipv4_routes.size() == 1,
+                "only IPv4 allowed_ips entries should be kept for the current transport");
+  ok &= Require(prepared.value.ignored_ipv6_allowed_ips == 1,
+                "IPv6 allowed_ips entries should be recorded as ignored for the current transport");
+  ok &= Require(prepared.value.interface_ipv4_addresses.size() == 1,
+                "IPv4 interface addresses should be retained for the current transport");
+  ok &= Require(prepared.value.dns_servers.size() == 2,
+                "IPv4 DNS servers should be retained for the current transport");
+
+  swg::Config ipv6_endpoint_config = MakeValidConfig();
+  ipv6_endpoint_config.profiles.at("default").endpoint_host = "[2001:db8::1]";
+  const auto validated_ipv6_endpoint =
+      swg::ValidateWireGuardProfileForConnect(ipv6_endpoint_config.profiles.at("default"));
+  ok &= Require(validated_ipv6_endpoint.ok(), "IPv6 endpoint should still parse at shared validation layer");
+  if (validated_ipv6_endpoint.ok()) {
+    const auto unsupported_endpoint = swg::sysmodule::PrepareTunnelSession(
+        ipv6_endpoint_config.active_profile, validated_ipv6_endpoint.value, ipv6_endpoint_config.runtime_flags);
+    ok &= Require(!unsupported_endpoint.ok(), "IPv6 transport endpoint should be rejected by Switch session prep");
+  }
+
+  swg::Config ipv6_address_config = MakeValidConfig();
+  ipv6_address_config.profiles.at("default").addresses = {"fd00::2/128"};
+  const auto validated_ipv6_address =
+      swg::ValidateWireGuardProfileForConnect(ipv6_address_config.profiles.at("default"));
+  ok &= Require(validated_ipv6_address.ok(), "IPv6 interface address should still parse at shared validation layer");
+  if (validated_ipv6_address.ok()) {
+    const auto unsupported_address = swg::sysmodule::PrepareTunnelSession(
+        ipv6_address_config.active_profile, validated_ipv6_address.value, ipv6_address_config.runtime_flags);
+    ok &= Require(!unsupported_address.ok(), "Switch session prep should require an IPv4 interface address");
+  }
+
   return ok;
 }
 
@@ -334,14 +388,15 @@ int main() {
   const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
+  const bool tunnel_session_ok = TestTunnelSessionPreparation();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
   const bool connect_preflight_ok = TestConnectPreflightStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-  return (endpoint_parser_ok && config_ok && wg_validation_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok &&
-          codec_ok && moonlight_ok)
+    return (endpoint_parser_ok && config_ok && wg_validation_ok && tunnel_session_ok && state_ok && client_ok &&
+      connect_preflight_ok && invalid_connect_ok && codec_ok && moonlight_ok)
              ? 0
              : 1;
 }
