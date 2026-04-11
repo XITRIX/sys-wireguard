@@ -8,6 +8,7 @@
 #include "swg/ipc_codec.h"
 #include "swg/moonlight.h"
 #include "swg/state_machine.h"
+#include "swg/wg_profile.h"
 #include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
 
@@ -21,12 +22,17 @@ bool Require(bool condition, const std::string& message) {
   return true;
 }
 
+constexpr const char* kSamplePrivateKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+constexpr const char* kSamplePublicKey = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
 swg::Config MakeValidConfig() {
   swg::Config config = swg::DefaultConfig();
   swg::ProfileConfig profile{};
   profile.name = "default";
-  profile.private_key = "private";
-  profile.public_key = "public";
+  profile.private_key = kSamplePrivateKey;
+  profile.public_key = kSamplePublicKey;
+  profile.preshared_key = kSamplePresharedKey;
   profile.endpoint_host = "peer.example.test";
   profile.endpoint_port = 51820;
   profile.allowed_ips = {"0.0.0.0/0", "::/0"};
@@ -37,6 +43,26 @@ swg::Config MakeValidConfig() {
   config.active_profile = profile.name;
   config.runtime_flags = swg::ToFlags(swg::RuntimeFlag::DnsThroughTunnel);
   return config;
+}
+
+bool TestWireGuardProfileValidation() {
+  const swg::Config valid_config = MakeValidConfig();
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "valid WireGuard profile must pass connect validation");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  ok &= Require(validated.value.has_preshared_key, "validated profile must preserve preshared key presence");
+  ok &= Require(validated.value.endpoint_port == 51820, "validated profile must preserve endpoint port");
+
+  swg::Config invalid_config = MakeValidConfig();
+  invalid_config.profiles.at("default").private_key = "not-base64";
+  const auto invalid = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
+  ok &= Require(!invalid.ok(), "invalid WireGuard key must fail connect validation");
+  return ok;
 }
 
 bool TestConfigRoundTrip() {
@@ -95,6 +121,68 @@ bool TestClientHostBinding() {
   ok &= Require(version.ok(), "attached host service must provide version");
   ok &= Require(status.ok(), "attached host service must provide status");
   ok &= Require(status.value.service_ready, "attached host service must be ready");
+  return ok;
+}
+
+bool TestConnectPreflightStats() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-connect";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig()).ok(), "valid config must save before connect preflight test")) {
+    return false;
+  }
+  if (!Require(client.Connect().ok(), "connect must succeed after WireGuard preflight")) {
+    return false;
+  }
+
+  const auto stats = client.GetStats();
+  const auto status = client.GetStatus();
+
+  bool ok = true;
+  ok &= Require(stats.ok(), "stats query must succeed after connect");
+  ok &= Require(status.ok(), "status query must succeed after connect");
+  if (!stats.ok() || !status.ok()) {
+    return false;
+  }
+
+  ok &= Require(stats.value.connect_attempts == 1, "connect must increment connect_attempts");
+  ok &= Require(stats.value.successful_handshakes == 0,
+                "connect must not claim a successful handshake before transport integration exists");
+  ok &= Require(status.value.state == swg::TunnelState::Connected,
+                "validated placeholder engine should keep the existing connected UX for now");
+  return ok;
+}
+
+bool TestInvalidWireGuardConnectFails() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-invalid-connect";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  swg::Config invalid_config = MakeValidConfig();
+  invalid_config.profiles.at("default").public_key = "invalid-key";
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(invalid_config).ok(), "invalid-format profile should still save at config layer")) {
+    return false;
+  }
+
+  const swg::Error connect_error = client.Connect();
+  const auto status = client.GetStatus();
+
+  bool ok = true;
+  ok &= Require(connect_error.code == swg::ErrorCode::InvalidConfig,
+                "connect must fail with InvalidConfig when WireGuard keys are malformed");
+  ok &= Require(status.ok(), "status query must succeed after failed connect");
+  if (!status.ok()) {
+    return false;
+  }
+
+  ok &= Require(status.value.state == swg::TunnelState::Error,
+                "failed WireGuard preflight must move the service into error state");
+  ok &= Require(status.value.last_error.find("public_key") != std::string::npos,
+                "failed connect must surface the WireGuard validation error");
   return ok;
 }
 
@@ -195,9 +283,15 @@ bool TestMoonlightRoutePlanning() {
 
 int main() {
   const bool config_ok = TestConfigRoundTrip();
+  const bool wg_validation_ok = TestWireGuardProfileValidation();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
+  const bool connect_preflight_ok = TestConnectPreflightStats();
+  const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-  return (config_ok && state_ok && client_ok && codec_ok && moonlight_ok) ? 0 : 1;
+  return (config_ok && wg_validation_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok &&
+          codec_ok && moonlight_ok)
+             ? 0
+             : 1;
 }

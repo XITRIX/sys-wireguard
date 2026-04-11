@@ -9,6 +9,8 @@
 #include "swg/hos_caps.h"
 #include "swg/log.h"
 #include "swg/state_machine.h"
+#include "swg/wg_profile.h"
+#include "swg_sysmodule/wg_engine.h"
 
 namespace swg::sysmodule {
 namespace {
@@ -215,6 +217,11 @@ class LocalControlService final : public IControlService {
       return initialization_error_;
     }
 
+    const auto profile_it = config_.profiles.find(config_.active_profile);
+    if (profile_it == config_.profiles.end()) {
+      return MakeError(ErrorCode::InvalidConfig, "active profile does not exist: " + config_.active_profile);
+    }
+
     const Error connect_error = state_machine_.Connect();
     if (connect_error) {
       return connect_error;
@@ -222,16 +229,34 @@ class LocalControlService final : public IControlService {
 
     TunnelStats stats = state_machine_.snapshot().stats;
     ++stats.connect_attempts;
-    ++stats.successful_handshakes;
-    stats.last_handshake_age_seconds = 0;
     state_machine_.UpdateStats(stats);
+
+    const Result<ValidatedWireGuardProfile> validated_profile =
+        ValidateWireGuardProfileForConnect(profile_it->second);
+    if (!validated_profile.ok()) {
+      state_machine_.MarkConnectFailed(validated_profile.error.message);
+      LogError("sysmodule", "connect validation failed for profile " + config_.active_profile + ": " +
+                                 validated_profile.error.message);
+      return validated_profile.error;
+    }
+
+    const Error engine_error = tunnel_engine_->Start(
+        TunnelEngineStartRequest{config_.active_profile, validated_profile.value, config_.runtime_flags});
+    if (engine_error) {
+      state_machine_.MarkConnectFailed(engine_error.message);
+      LogError("sysmodule", "WireGuard engine start failed for profile " + config_.active_profile + ": " +
+                                 engine_error.message);
+      return engine_error;
+    }
 
     const Error mark_error = state_machine_.MarkConnected();
     if (mark_error) {
+      tunnel_engine_->Stop();
       return mark_error;
     }
 
-    LogInfo("sysmodule", "connect requested for profile " + config_.active_profile);
+    LogInfo("sysmodule", "connect requested for profile " + config_.active_profile +
+                            " (WireGuard profile validated; transport remains stubbed)");
     return Error::None();
   }
 
@@ -241,6 +266,12 @@ class LocalControlService final : public IControlService {
     const Error disconnect_error = state_machine_.Disconnect();
     if (disconnect_error) {
       return disconnect_error;
+    }
+
+    const Error engine_error = tunnel_engine_->Stop();
+    if (engine_error) {
+      state_machine_.MarkConnectFailed(engine_error.message);
+      return engine_error;
     }
 
     const Error mark_error = state_machine_.MarkDisconnected();
@@ -482,6 +513,7 @@ class LocalControlService final : public IControlService {
   mutable std::mutex mutex_;
   Config config_{};
   ConnectionStateMachine state_machine_{};
+  std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateStubWgTunnelEngine();
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};

@@ -1,6 +1,7 @@
 add_library(swg_sysmodule_core STATIC
   src/host_transport.cpp
   src/local_service.cpp
+  src/wg_engine.cpp
 )
 
 target_include_directories(swg_sysmodule_core

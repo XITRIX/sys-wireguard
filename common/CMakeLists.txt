@@ -4,6 +4,7 @@ add_library(swg_common STATIC
   src/ipc_codec.cpp
   src/log.cpp
   src/state_machine.cpp
+  src/wg_profile.cpp
 )
 
 target_include_directories(swg_common

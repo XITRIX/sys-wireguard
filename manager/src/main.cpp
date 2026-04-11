@@ -9,6 +9,10 @@
 
 namespace {
 
+constexpr const char* kSamplePrivateKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+constexpr const char* kSamplePublicKey = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
 void PrintUsage() {
   std::cout << "usage: swg_manager_stub [show-config|sample-profile|flags]\n";
 }
@@ -17,8 +21,9 @@ swg::Config MakeSampleConfig() {
   swg::Config config = swg::DefaultConfig();
   swg::ProfileConfig profile{};
   profile.name = "default";
-  profile.private_key = "REPLACE_PRIVATE_KEY";
-  profile.public_key = "REPLACE_PUBLIC_KEY";
+  profile.private_key = kSamplePrivateKey;
+  profile.public_key = kSamplePublicKey;
+  profile.preshared_key = kSamplePresharedKey;
   profile.endpoint_host = "vpn.example.test";
   profile.endpoint_port = 51820;
   profile.allowed_ips = {"0.0.0.0/0", "::/0"};

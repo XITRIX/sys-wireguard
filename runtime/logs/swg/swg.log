@@ -7,3 +7,7 @@
 2026-04-11 01:39:45 [INFO] [logger] logger initialized
 2026-04-11 01:39:45 [INFO] [sysmodule] initializing control service
 2026-04-11 01:39:45 [INFO] [sysmodule] control service ready: profiles=0, runtime_flags=none
+2026-04-11 12:45:46 [INFO] [logger] logger initialized
+2026-04-11 12:45:46 [INFO] [sysmodule] initializing control service
+2026-04-11 12:45:46 [INFO] [sysmodule] control service ready: profiles=0, runtime_flags=none
+2026-04-11 12:45:46 [INFO] [sysmodule] config saved: profiles=1, active_profile=default, runtime_flags=dns_through_tunnel

@@ -65,6 +65,20 @@ Switch runtime files use the `sdmc:/` mount:
 - logs: `sdmc:/atmosphere/logs/swg/swg.log`
 - early boot marker: `sdmc:/atmosphere/logs/swg/boot_marker.log`
 
+## Creating a config now
+
+Right now, the Switch manager can read and use an existing config, but it cannot create or edit profiles yet.
+The practical way to try the current connect path is to manually create `sdmc:/config/swg/config.ini` using the example in [docs/sample-config.ini](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/sample-config.ini).
+
+Current constraints:
+- `Connect()` validates WireGuard key format and endpoint fields, then starts the stub tunnel-engine boundary.
+- It does not perform a real handshake or establish live tunnel traffic yet.
+- The keys in the sample file are syntactically valid test keys, not a real peer configuration.
+
+If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
+
+For host-only development, `./build/host-debug/manager/swg_manager_stub sample-profile` now writes a syntactically valid sample profile into the host runtime config.
+
 ## Host stub commands
 
 After a host build:
@@ -81,6 +95,7 @@ The host runtime creates files under `build/host-debug/runtime/` when executed f
 ## Phase A status
 
 Phase A is currently defined around a manager-first control plane. Tesla integration is intentionally deferred until later milestones.
+Milestones 0 through 3 are now complete. Milestone 4 is the active implementation slice.
 
 Implemented:
 - sysmodule control stub
@@ -108,5 +123,6 @@ This keeps the sysmodule consumer API aligned with Moonlight-Switch's current ar
 
 Next:
 - manager UX expansion
+- WireGuard protocol boundary, key validation, and endpoint handling
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later
