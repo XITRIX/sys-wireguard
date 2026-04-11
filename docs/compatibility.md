@@ -12,8 +12,8 @@
 | --- | --- | --- |
 | Host build | Implemented | Used for Phase A control-plane development and tests |
 | Switch configure preset | Implemented | Uses `$DEVKITPRO/cmake/Switch.cmake` |
-| libnx service registration | Not implemented | Phase A stub only |
-| Tesla integration | Not implemented | Host overlay stub only |
+| libnx service registration | Implemented | `swg:ctl` is registered on Switch and exercised by the manager app |
+| Tesla integration | Deferred | Intentionally excluded from Phase A; host overlay stub only for now |
 | DNS MITM | Not implemented | Deferred to later milestone |
 | `bsd:u` MITM | Not implemented | Deferred to experimental phase |
 

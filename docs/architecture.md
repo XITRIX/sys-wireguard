@@ -2,7 +2,7 @@
 
 ## Phase A intent
 
-Phase A establishes a stable control plane before any real tunnel engine or transparent-routing work.
+Phase A establishes a stable control plane and manager frontend before any real tunnel engine, Tesla overlay work, or transparent-routing work.
 
 Current implementation boundaries:
 - `swg_common`: config schema, logging, state machine, compatibility probes, and IPC-facing structs.
@@ -25,7 +25,8 @@ Current implementation boundaries:
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
 - Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
 - Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
-- The first on-device control consumer is a plain console manager app so service validation does not depend on libtesla yet.
+- The manager app, not Tesla, is the current Phase A device control surface.
+- Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 
 ## Runtime paths
 
@@ -66,7 +67,7 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 
 ## What is intentionally deferred
 
-- Tesla rendering and input handling
+- Tesla overlay parity, rendering, and input handling
 - WireGuard engine integration
 - DNS-over-tunnel and MITM logic
 - policy-driven transparent routing

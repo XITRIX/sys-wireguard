@@ -4,6 +4,7 @@
 Build a Nintendo Switch homebrew project for Atmosphère + libnx that delivers:
 
 1. a **stable WireGuard control sysmodule** with Tesla configuration and status UI,
+	delivered through a manager-based control UI first and a Tesla overlay later,
 2. a **clean IPC/service API** that other homebrew apps can use easily, and
 3. an **experimental transparent-routing mode** that attempts to redirect system traffic through a WireGuard tunnel.
 
@@ -17,7 +18,7 @@ The end-state is a sysmodule that can:
 - store one or more WireGuard profiles,
 - connect/disconnect from a configured tunnel,
 - expose state and stats via IPC,
-- allow Tesla-based configuration and live control,
+- allow manager-based configuration and live control immediately, with Tesla-based quick control added later,
 - provide a simple SDK/API for homebrew apps to opt into tunnel usage,
 - optionally MITM or replace selected Horizon networking services to transparently reroute traffic.
 
@@ -47,8 +48,10 @@ Always implement the project in this order:
 - config load/save
 - logging
 - control IPC service
-- Tesla overlay
+- manager application frontend
 - connection state machine
+
+Tesla overlay work is intentionally deferred until the manager-driven control plane and tunnel path are stable.
 
 ### Phase B — tunnel engine
 - userspace WireGuard protocol integration
@@ -154,6 +157,8 @@ A Tesla overlay for:
 - transparent-mode toggle
 - DNS toggle and summary info
 
+This is a deferred frontend slice, not a Phase A completion gate.
+
 ### 4. `libswg`
 An SDK for homebrew apps.
 
@@ -258,10 +263,21 @@ Deliverables:
 - error-code conventions
 
 Definition of done:
-- a small test client can query the service
-- overlay can consume the same IPC layer later unchanged
+- a small test client or manager app can query the service
+- the future overlay can consume the same IPC layer later unchanged
 
-## Milestone 3 — Tesla overlay
+## Milestone 3 — manager frontend
+Deliverables:
+- manager app UI
+- profile display
+- connect/disconnect action
+- status and error display
+
+Definition of done:
+- manager never directly edits runtime state except through IPC
+- UI remains responsive even when tunnel operations fail
+
+## Deferred frontend slice — Tesla overlay
 Deliverables:
 - overlay menu
 - profile display
@@ -579,13 +595,13 @@ The agent should keep these at the top of the backlog in roughly this order:
 1. sysmodule boot reliability
 2. control IPC stability
 3. config correctness
-4. overlay usability
+4. manager usability
 5. tunnel handshake reliability
 6. homebrew SDK usability
 7. DNS correctness
 8. transparent-mode observability
 9. selective transparent routing
-10. broader compatibility and performance
+10. Tesla overlay parity, broader compatibility and performance
 
 ---
 
@@ -594,12 +610,13 @@ The project is successful if it ends up with:
 
 ### Minimum success
 - stable sysmodule
-- stable Tesla control flow
+- stable manager control flow
 - working WireGuard tunnel
 - usable SDK/API for homebrew apps
 
 ### Strong success
 - tunnel-aware DNS
+- Tesla control flow
 - selected-title transparent routing
 - clear compatibility matrix
 
@@ -616,7 +633,7 @@ If transparent full-tunnel mode remains partial but the SDK path is excellent, t
 3. Implement `swg:ctl` service stub.
 4. Implement config parser + validation.
 5. Add IPC client stub.
-6. Add minimal overlay consuming IPC.
+6. Add minimal manager app consuming IPC.
 7. Add placeholder state machine.
 8. Add stats/error structs.
 9. Add build/test notes.

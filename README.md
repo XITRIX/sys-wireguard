@@ -8,11 +8,12 @@ Current scope:
 - Versioned binary IPC request/response encoding, a real `swg:ctl` CMIF transport on Switch, and an in-process host transport for development.
 - Host-side sysmodule, overlay, and manager stubs that exercise the same control-plane ABI without requiring device deployment.
 - A Switch-side manager NRO that can query `swg:ctl`, change the active profile, toggle runtime flags, and issue connect/disconnect requests on hardware.
+- A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
-- Tesla UI wiring.
+- Tesla UI wiring, deferred from Phase A.
 - WireGuard protocol engine.
 - Transparent routing or MITM paths.
 
@@ -53,10 +54,11 @@ The `switch-debug` preset uses `$DEVKITPRO/cmake/Switch.cmake` and now produces:
 
 The `atmosphere/contents/...` tree is the ready-to-copy SD-card layout for the current sysmodule title ID.
 The staged `toolbox.json` allows Tesla's `ovl-sysmodules` overlay to list the sysmodule and toggle its boot flag.
+The current metadata marks the sysmodule as dynamic, so `ovl-sysmodules` can start and stop it live with `A`; the boot flag remains a separate persistent toggle in that overlay.
 
 Phase A now ships a real `swg:ctl` service host on Switch.
-The overlay remains a host-only stub until the Tesla target is wired in.
-The first real device-side frontend is the manager NRO.
+The manager NRO is the Phase A device frontend.
+The overlay remains a host-only stub until Tesla work is picked up later.
 
 Switch runtime files use the `sdmc:/` mount:
 - config: `sdmc:/config/swg/config.ini`
@@ -77,6 +79,8 @@ After a host build:
 The host runtime creates files under `build/host-debug/runtime/` when executed from the build directory, or `runtime/` from the current working directory.
 
 ## Phase A status
+
+Phase A is currently defined around a manager-first control plane. Tesla integration is intentionally deferred until later milestones.
 
 Implemented:
 - sysmodule control stub
@@ -103,5 +107,6 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 Next:
-- Tesla UI integration
-- libnx capability probes and firmware-specific routing hooks
+- manager UX expansion
+- firmware-specific routing hooks and DNS/tunnel integration
+- Tesla UI integration later

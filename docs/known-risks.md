@@ -1,9 +1,10 @@
 # Known Risks
 
 - The Switch service currently exposes one CMIF command that carries the versioned binary envelope in alias buffers; larger future config payloads may require chunking or a larger negotiated buffer budget.
-- The overlay target is a host stub, not a Tesla binary.
-- The Switch manager is a text-mode validation tool, not the final Tesla UX, so device control is functional but intentionally minimal.
-- Capability detection is conservative and mostly placeholder until libnx-backed probes are added.
+- Tesla overlay work is intentionally deferred from Phase A; the overlay target remains a host stub.
+- Tesla live toggling now relies on `ovl-sysmodules` using `pmshellTerminateProgram()` / `pmshellLaunchProgram()`; active clients should tolerate abrupt `swg:ctl` disconnects during manual stop/start.
+- The Switch manager is the current Phase A control UI; it is text-mode and intentionally simpler than the future Tesla UX.
+- Capability detection now probes live service reachability, but some flags still map to nearest current surfaces (`sfdnsres` for resolver reachability and `nifm:a`/`nifm:s` for network-configuration reachability) rather than final transparent-mode hooks.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
 - The new app route planner is advisory until real DNS responses or transparent socket interception are implemented.
 - The sysmodule NPDM is intentionally permissive in Phase A (`service_access = ["*"]`) and should be tightened once the exact service dependencies are fixed.

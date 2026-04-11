@@ -1,5 +1,5 @@
 {
   "name": "@SWG_SYSMODULE_NAME@",
   "tid": "@SWG_SYSMODULE_TITLE_ID@",
-  "requires_reboot": true
+  "requires_reboot": false
 }

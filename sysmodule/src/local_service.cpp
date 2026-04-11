@@ -286,7 +286,8 @@ class LocalControlService final : public IControlService {
     info.needs_new_tls_abi = capabilities.needs_new_tls_abi;
 #if defined(SWG_PLATFORM_SWITCH)
     info.notes = DescribeHosCapabilities(capabilities) +
-                 "; Phase A exposes the control plane through the registered swg:ctl service.";
+         "; probe mapping: has_dns_priv checks dns:priv then sfdnsres, has_ifcfg checks ifcfg then nifm:a/nifm:s; "
+         "Phase A exposes the control plane through the registered swg:ctl service.";
 #else
     info.notes = DescribeHosCapabilities(capabilities) + "; Phase A currently exercises the control plane through a local stub service.";
 #endif

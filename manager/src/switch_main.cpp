@@ -111,11 +111,14 @@ void DrawScreen(const ScreenModel& model, const std::string& action_message) {
     std::printf("  switch target: %s  new tls abi: %s\n",
                 BoolLabel(compatibility.switch_target),
                 BoolLabel(compatibility.needs_new_tls_abi));
-    std::printf("  bsd:a=%s dns:priv=%s ifcfg=%s bsd:nu=%s\n",
+    std::printf("  bsd:a=%s resolver=%s ifcfg/nifm=%s bsd:nu=%s\n",
                 BoolLabel(compatibility.has_bsd_a),
                 BoolLabel(compatibility.has_dns_priv),
                 BoolLabel(compatibility.has_ifcfg),
                 BoolLabel(compatibility.has_bsd_nu));
+    if (!compatibility.notes.empty()) {
+      std::printf("  notes: %s\n", compatibility.notes.c_str());
+    }
   } else {
     std::printf("  unavailable (%s)\n", model.compatibility.error.message.c_str());
   }
