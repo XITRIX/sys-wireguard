@@ -26,6 +26,43 @@ constexpr const char* kSamplePrivateKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaG
 constexpr const char* kSamplePublicKey = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
 constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 
+bool TestEndpointAndNetworkParsing() {
+  bool ok = true;
+
+  const auto ipv4_network = swg::ParseIpNetwork("10.0.0.2/32", "address");
+  ok &= Require(ipv4_network.ok(), "ipv4 network must parse");
+  if (ipv4_network.ok()) {
+    ok &= Require(ipv4_network.value.address.family == swg::ParsedIpFamily::IPv4,
+                  "ipv4 network must preserve address family");
+    ok &= Require(ipv4_network.value.normalized == "10.0.0.2/32", "ipv4 network must normalize");
+  }
+
+  const auto ipv6_network = swg::ParseIpNetwork("fd00::2/128", "address");
+  ok &= Require(ipv6_network.ok(), "ipv6 network must parse");
+  if (ipv6_network.ok()) {
+    ok &= Require(ipv6_network.value.address.family == swg::ParsedIpFamily::IPv6,
+                  "ipv6 network must preserve address family");
+  }
+
+  const auto dns_server = swg::ParseIpAddress("2606:4700:4700::1111", "dns");
+  ok &= Require(dns_server.ok(), "ipv6 dns address must parse");
+
+  const auto endpoint = swg::ParseEndpoint("[2001:db8::1]", 51820);
+  ok &= Require(endpoint.ok(), "ipv6 endpoint literal must parse");
+  if (endpoint.ok()) {
+    ok &= Require(endpoint.value.type == swg::ParsedEndpointHostType::IPv6,
+                  "ipv6 endpoint must be classified correctly");
+    ok &= Require(endpoint.value.host == "2001:db8::1", "ipv6 endpoint must normalize brackets away");
+  }
+
+  const auto invalid_network = swg::ParseIpNetwork("10.0.0.2", "allowed_ips");
+  ok &= Require(!invalid_network.ok(), "cidr parser must reject missing prefix length");
+
+  const auto invalid_dns = swg::ParseIpAddress("dns.example.test", "dns");
+  ok &= Require(!invalid_dns.ok(), "dns parser must currently reject hostnames");
+  return ok;
+}
+
 swg::Config MakeValidConfig() {
   swg::Config config = swg::DefaultConfig();
   swg::ProfileConfig profile{};
@@ -56,12 +93,24 @@ bool TestWireGuardProfileValidation() {
   }
 
   ok &= Require(validated.value.has_preshared_key, "validated profile must preserve preshared key presence");
-  ok &= Require(validated.value.endpoint_port == 51820, "validated profile must preserve endpoint port");
+  ok &= Require(validated.value.endpoint.port == 51820, "validated profile must preserve endpoint port");
+  ok &= Require(validated.value.endpoint.type == swg::ParsedEndpointHostType::Hostname,
+                "validated profile must preserve endpoint host type");
+  ok &= Require(validated.value.allowed_ips.size() == 2, "validated profile must parse allowed ip networks");
+  ok &= Require(validated.value.addresses.size() == 1, "validated profile must parse interface addresses");
+  ok &= Require(validated.value.dns_servers.size() == 2, "validated profile must parse dns servers");
+  ok &= Require(validated.value.persistent_keepalive == 25,
+                "validated profile must preserve keepalive interval");
 
   swg::Config invalid_config = MakeValidConfig();
   invalid_config.profiles.at("default").private_key = "not-base64";
   const auto invalid = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
   ok &= Require(!invalid.ok(), "invalid WireGuard key must fail connect validation");
+
+  invalid_config = MakeValidConfig();
+  invalid_config.profiles.at("default").allowed_ips = {"not-a-cidr"};
+  const auto invalid_cidr = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
+  ok &= Require(!invalid_cidr.ok(), "invalid allowed_ips entry must fail connect validation");
   return ok;
 }
 
@@ -282,6 +331,7 @@ bool TestMoonlightRoutePlanning() {
 }  // namespace
 
 int main() {
+  const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
   const bool state_ok = TestStateMachine();
@@ -290,7 +340,7 @@ int main() {
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-  return (config_ok && wg_validation_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok &&
+  return (endpoint_parser_ok && config_ok && wg_validation_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok &&
           codec_ok && moonlight_ok)
              ? 0
              : 1;

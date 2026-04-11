@@ -255,8 +255,12 @@ class LocalControlService final : public IControlService {
       return mark_error;
     }
 
-    LogInfo("sysmodule", "connect requested for profile " + config_.active_profile +
-                            " (WireGuard profile validated; transport remains stubbed)");
+    LogInfo("sysmodule", "connect requested for profile " + config_.active_profile + " endpoint=" +
+                            validated_profile.value.endpoint.host + ":" +
+                            std::to_string(validated_profile.value.endpoint.port) + " allowed_ips=" +
+                            std::to_string(validated_profile.value.allowed_ips.size()) + " addresses=" +
+                            std::to_string(validated_profile.value.addresses.size()) +
+                            " (session prepared; handshake and transport remain stubbed)");
     return Error::None();
   }
 

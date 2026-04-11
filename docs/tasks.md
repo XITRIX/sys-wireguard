@@ -15,6 +15,7 @@
 - Manager frontend now satisfies the current Milestone 3 definition of done for the manager-first Phase A plan.
 - Real HOS and service reachability probes added to the compatibility report used by the manager and control API.
 - Initial Milestone 4 slice added: WireGuard profile preflight validation plus a tunnel-engine integration boundary behind `Connect()`.
+- Current Milestone 4 preflight now parses endpoint literals, CIDR networks, interface addresses, and numeric DNS servers into prepared session data.
 - Overlay and manager host stubs implemented.
 - Host-side tests added for config and state transitions.
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
@@ -24,6 +25,6 @@
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Replace the stub tunnel-engine backend with real WireGuard handshake and transport integration.
-- Add richer validation errors for endpoint and address formats.
+- Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Add real tunnel-aware DNS resolution results for app consumers.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.

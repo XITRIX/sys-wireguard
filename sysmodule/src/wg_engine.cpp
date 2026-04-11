@@ -13,6 +13,7 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
     (void)request.profile;
     (void)request.runtime_flags;
     active_profile_ = request.profile_name;
+  prepared_profile_ = request.profile;
     stats_ = {};
     running_ = true;
     return Error::None();
@@ -25,6 +26,7 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
 
     running_ = false;
     active_profile_.clear();
+    prepared_profile_ = {};
     stats_ = {};
     return Error::None();
   }
@@ -39,6 +41,7 @@ class StubWgTunnelEngine final : public IWgTunnelEngine {
 
  private:
   std::string active_profile_;
+  ValidatedWireGuardProfile prepared_profile_{};
   TunnelStats stats_{};
   bool running_ = false;
 };
