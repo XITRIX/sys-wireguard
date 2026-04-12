@@ -49,7 +49,8 @@ For a Moonlight session:
 `ResolveDns()` currently behaves like this:
 - when direct DNS is allowed, it resolves IPv4 hosts locally and returns concrete addresses
 - when Moonlight requires tunnel DNS before connect, it fails closed instead of leaking a direct lookup
-- once the selected profile is connected, it returns a tunnel action plus the configured profile DNS servers so the caller can stage tunnel-side resolution without guessing policy
+- once the selected profile is connected, it sends an IPv4 UDP DNS query through the WireGuard session and returns IPv4 answers when a matching response arrives
+- if the tunnel DNS query cannot produce an IPv4 answer, it still returns the configured profile DNS servers so the caller can report or debug the unresolved tunnel state without leaking direct DNS
 
 `SessionSocket` currently behaves like this:
 - when policy selects `Direct`, it returns resolved IPv4 addresses so Moonlight can open its own native socket
@@ -84,13 +85,15 @@ Moonlight can keep using its own sockets and libcurl. The sysmodule decides whet
 
 The packet API is intentionally narrow: it gives a Moonlight-side shim one place to push and pull authenticated tunnel payloads without requiring transparent routing first, but it still does not replace Moonlight's existing socket semantics by itself.
 
-The DNS helper is also intentionally staged: it provides policy-safe direct results and tunnel-DNS guidance now, but it does not yet execute DNS queries through the tunnel transport itself.
+The DNS helper is still intentionally narrow: it now executes IPv4 A-record DNS queries through the tunnel transport, but it does not yet cover AAAA lookups, TCP fallback, caching, or transparent resolver interception.
+
+The Switch integration app now uses the active profile `endpoint_host` as its live DNS and socket-helper target. If that field is a numeric endpoint, the app skips the DNS probe instead of querying the old placeholder hostname.
 
 The stream wrapper is intentionally staged too: in tunnel mode it exposes framed payload flow over the current session packet channel, not a native TCP stack or transparent HTTPS transport.
 
 ## Next steps for real integration
 
 - harden the new socket wrapper into a Moonlight-ready transport shim
-- execute tunnel-side DNS lookups behind the current `ResolveDns()` guidance response
+- expand tunnel DNS beyond the current IPv4 A-record path
 - add per-title policy so Moonlight NSP forwarders can opt into the tunnel automatically
 - add transparent DNS and later `bsd:u` interception as an optional fast path

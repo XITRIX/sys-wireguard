@@ -76,6 +76,8 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 - a route-aware `SessionSocket` wrapper can collapse plan, DNS, and packet-channel selection into one app-facing transport object
 - future transparent routing can replace some of those explicit decisions later without changing the service contract
 
+The current tunnel DNS implementation is intentionally conservative: it crafts IPv4 UDP DNS queries inside the WireGuard transport for SDK consumers, parses matching IPv4 A-record answers back out of the receive queue, and leaves broader resolver features to later milestones.
+
 ## What is intentionally deferred
 
 - Tesla overlay parity, rendering, and input handling

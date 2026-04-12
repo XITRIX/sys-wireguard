@@ -20,6 +20,7 @@
 #include "swg/moonlight.h"
 #include "swg/session_socket.h"
 #include "swg/state_machine.h"
+#include "swg/tunnel_dns.h"
 #include "swg/wg_crypto.h"
 #include "swg/wg_handshake.h"
 #include "swg/wg_profile.h"
@@ -1868,12 +1869,65 @@ bool TestMoonlightRoutePlanning() {
   return ok;
 }
 
+bool TestTunnelDnsPacketCodec() {
+  swg::TunnelDnsPacketEndpoint endpoint{};
+  endpoint.source_ipv4 = {10, 0, 0, 2};
+  endpoint.destination_ipv4 = {1, 1, 1, 1};
+  endpoint.source_port = 40001;
+  endpoint.destination_port = 53;
+
+  const auto query_packet = swg::BuildTunnelDnsQueryPacket(endpoint, "vpn.example.test", 0x1234);
+  const auto response_packet = swg::BuildTunnelDnsResponsePacket(
+      endpoint, "vpn.example.test", 0x1234, {"203.0.113.44", "203.0.113.45"});
+
+  bool ok = true;
+  ok &= Require(query_packet.ok(), "tunnel DNS query packet must build");
+  ok &= Require(response_packet.ok(), "tunnel DNS response packet must build");
+  if (!query_packet.ok() || !response_packet.ok()) {
+    return false;
+  }
+
+  ok &= Require(!query_packet.value.empty(), "tunnel DNS query packet must not be empty");
+
+  const auto parsed = swg::ParseTunnelDnsResponsePacket(response_packet.value);
+  ok &= Require(parsed.ok(), "tunnel DNS response packet must parse");
+  if (parsed.ok()) {
+    ok &= Require(parsed.value.query_id == 0x1234, "parsed tunnel DNS response must preserve the query id");
+    ok &= Require(parsed.value.source_ipv4 == endpoint.destination_ipv4,
+                  "parsed tunnel DNS response must reverse the source IPv4");
+    ok &= Require(parsed.value.destination_ipv4 == endpoint.source_ipv4,
+                  "parsed tunnel DNS response must reverse the destination IPv4");
+    ok &= Require(parsed.value.source_port == endpoint.destination_port,
+                  "parsed tunnel DNS response must reverse the source port");
+    ok &= Require(parsed.value.destination_port == endpoint.source_port,
+                  "parsed tunnel DNS response must reverse the destination port");
+    ok &= Require(parsed.value.ipv4_addresses.size() == 2,
+                  "parsed tunnel DNS response must preserve both IPv4 answers");
+  }
+
+  return ok;
+}
+
 bool TestAppSessionDnsResolution() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-dns";
   std::error_code filesystem_error;
   std::filesystem::remove_all(runtime_root, filesystem_error);
 
-  LocalHandshakeResponder responder;
+  swg::TunnelDnsPacketEndpoint dns_endpoint{};
+  dns_endpoint.source_ipv4 = {10, 0, 0, 2};
+  dns_endpoint.destination_ipv4 = {1, 1, 1, 1};
+  dns_endpoint.source_port = 40001;
+  dns_endpoint.destination_port = 53;
+
+  const auto expected_query = swg::BuildTunnelDnsQueryPacket(dns_endpoint, "vpn.example.test", 1);
+  const auto inbound_response =
+      swg::BuildTunnelDnsResponsePacket(dns_endpoint, "vpn.example.test", 1, {"203.0.113.44"});
+  if (!Require(expected_query.ok(), "expected tunnel DNS query packet must build for DNS resolution tests") ||
+      !Require(inbound_response.ok(), "expected tunnel DNS response packet must build for DNS resolution tests")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(0, 0, inbound_response.value, expected_query.value);
   if (!Require(responder.ready(), "local handshake responder must start for DNS resolution tests")) {
     return false;
   }
@@ -1946,34 +2000,38 @@ bool TestAppSessionDnsResolution() {
                   "denied DNS resolve must record a leak-prevention event");
   }
 
-  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel DNS guidance test");
-  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the DNS handshake"
-                                                            : responder.error());
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel DNS resolution test");
 
   const auto tunnel_dns = tunnel_session.ResolveDns("vpn.example.test");
-  ok &= Require(tunnel_dns.ok(), "tunnel DNS guidance must succeed after connect");
+  ok &= Require(tunnel_dns.ok(), "tunnel DNS resolve must succeed after connect");
   if (tunnel_dns.ok()) {
     ok &= Require(tunnel_dns.value.action == swg::RouteAction::Tunnel,
                   "connected tunnel DNS resolve must stay on the tunnel path");
     ok &= Require(tunnel_dns.value.use_tunnel_dns,
                   "connected tunnel DNS resolve must mark tunnel DNS usage");
-    ok &= Require(!tunnel_dns.value.resolved,
-                  "connected tunnel DNS guidance must not leak a direct host resolve yet");
+    ok &= Require(tunnel_dns.value.resolved,
+                  "connected tunnel DNS resolve must return an IPv4 answer when the tunnel DNS response is queued");
     ok &= Require(tunnel_dns.value.dns_servers.size() == 2,
-                  "connected tunnel DNS guidance must expose the selected profile DNS servers");
-    ok &= Require(tunnel_dns.value.message.find("tunnel DNS") != std::string::npos,
-                  "connected tunnel DNS guidance must explain the tunnel DNS requirement");
+                  "connected tunnel DNS resolve must expose the selected profile DNS servers");
+    ok &= Require(std::find(tunnel_dns.value.addresses.begin(), tunnel_dns.value.addresses.end(), "203.0.113.44") !=
+                      tunnel_dns.value.addresses.end(),
+                  "connected tunnel DNS resolve must return the queued IPv4 DNS answer");
+    ok &= Require(tunnel_dns.value.message.find("1.1.1.1") != std::string::npos,
+                  "connected tunnel DNS resolve must report the DNS server that answered the query");
   }
 
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the tunnel DNS handshake"
+                                                            : responder.error());
+
   const auto stats_after_tunnel = client.GetStats();
-  ok &= Require(stats_after_tunnel.ok(), "stats must load after tunnel DNS guidance");
+  ok &= Require(stats_after_tunnel.ok(), "stats must load after tunnel DNS resolution");
   if (stats_after_tunnel.ok()) {
     ok &= Require(stats_after_tunnel.value.dns_queries == 3,
-                  "tunnel DNS guidance must increment the DNS query counter");
+                  "tunnel DNS resolution must increment the DNS query counter");
     ok &= Require(stats_after_tunnel.value.dns_fallbacks == 1,
-                  "tunnel DNS guidance must not increment the fallback counter");
+                  "successful tunnel DNS resolution must not increment the fallback counter");
     ok &= Require(stats_after_tunnel.value.leak_prevention_events == 1,
-                  "tunnel DNS guidance must preserve the prior leak-prevention count");
+                  "successful tunnel DNS resolution must preserve the prior leak-prevention count");
   }
 
   ok &= Require(tunnel_session.Close().ok(), "tunnel DNS app session must close cleanly");
@@ -1988,7 +2046,23 @@ bool TestSessionSocketAbstraction() {
 
   const std::vector<std::uint8_t> inbound_payload = {0x44, 0x4e, 0x53, 0x52, 0x45, 0x43, 0x56};
   const std::vector<std::uint8_t> outbound_payload = {0x53, 0x4f, 0x43, 0x4b, 0x45, 0x54, 0x01};
-  LocalHandshakeResponder responder(0, 0, inbound_payload, outbound_payload);
+  swg::TunnelDnsPacketEndpoint dns_endpoint{};
+  dns_endpoint.source_ipv4 = {10, 0, 0, 2};
+  dns_endpoint.destination_ipv4 = {1, 1, 1, 1};
+  dns_endpoint.source_port = 40001;
+  dns_endpoint.destination_port = 53;
+
+  const auto dns_query = swg::BuildTunnelDnsQueryPacket(dns_endpoint, "vpn.example.test", 1);
+  const auto dns_response =
+      swg::BuildTunnelDnsResponsePacket(dns_endpoint, "vpn.example.test", 1, {"203.0.113.44"});
+  if (!Require(dns_query.ok(), "expected tunnel DNS query packet must build for session socket tests") ||
+      !Require(dns_response.ok(), "expected tunnel DNS response packet must build for session socket tests")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(0, 0,
+                                    std::vector<std::vector<std::uint8_t>>{inbound_payload, dns_response.value},
+                                    std::vector<std::vector<std::uint8_t>>{outbound_payload, dns_query.value});
   if (!Require(responder.ready(), "local handshake responder must start for session socket tests")) {
     return false;
   }
@@ -2098,6 +2172,12 @@ bool TestSessionSocketAbstraction() {
                   "connected stream socket must consult the DNS helper for hostname targets");
     ok &= Require(stream_socket.value.info().dns.action == swg::RouteAction::Tunnel,
                   "connected stream socket must preserve tunnel DNS guidance for hostname targets");
+    ok &= Require(stream_socket.value.info().dns.resolved,
+                  "connected stream socket must resolve hostname targets through tunnel DNS when a response is queued");
+    ok &= Require(std::find(stream_socket.value.info().remote_addresses.begin(),
+                           stream_socket.value.info().remote_addresses.end(), "203.0.113.44") !=
+                      stream_socket.value.info().remote_addresses.end(),
+                  "connected stream socket must expose the resolved tunnel DNS IPv4 answer");
   }
 
   ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the session socket handshake"
@@ -2134,6 +2214,7 @@ int main() {
   const bool receive_reconnect_ok = TestEngineReconnectAfterReceiveFailure();
   const bool keepalive_reconnect_ok = TestEngineReconnectAfterKeepaliveFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
+  const bool tunnel_dns_codec_ok = TestTunnelDnsPacketCodec();
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
@@ -2142,7 +2223,7 @@ int main() {
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
-          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && dns_resolution_ok &&
+          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && tunnel_dns_codec_ok && dns_resolution_ok &&
           session_socket_ok)
              ? 0
              : 1;

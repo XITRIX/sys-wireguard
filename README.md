@@ -168,11 +168,12 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 That same app session can now call `ResolveDns()` to get a policy-safe DNS result:
 - direct IPv4 answers when the session is allowed to fall back directly
 - fail-closed results when Moonlight requires tunnel DNS before connect
-- tunnel-DNS guidance plus configured profile resolvers once the selected profile is connected
+- tunnel-side IPv4 A-record answers through the WireGuard session when the selected profile is connected
+- unresolved tunnel results plus the configured profile resolvers when the tunnel DNS query times out or cannot return an IPv4 answer
 
 `swg::SessionSocket` now folds route planning, DNS helper output, and the current session packet path into one wrapper so an app can get a structured `direct_socket`, `tunnel_packet`, or `denied` result from one place.
 
-Current limitation: tunnel-backed datagram wrappers can already forward caller-managed payloads through `SendPacket()` / `ReceivePacket()`, but stream wrappers currently expose framed payload flow over the same packet channel and are not native TCP sockets.
+Current limitation: tunnel DNS is currently IPv4-only and A-record-only, and tunnel-backed stream wrappers still expose framed payload flow over the same packet channel rather than native TCP sockets.
 
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 

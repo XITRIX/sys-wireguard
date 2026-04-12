@@ -3,17 +3,21 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
+#include <chrono>
+#include <deque>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sstream>
 #include <sys/socket.h>
+#include <thread>
 #include <unordered_map>
 
 #include "swg/config.h"
 #include "swg/hos_caps.h"
 #include "swg/log.h"
 #include "swg/state_machine.h"
+#include "swg/tunnel_dns.h"
 #include "swg/wg_profile.h"
 #include "swg_sysmodule/wg_engine.h"
 
@@ -29,6 +33,19 @@ struct AppSessionRecord {
   AppTunnelRequest request;
   std::string selected_profile;
 };
+
+struct TunnelDnsLookupResult {
+  bool resolved = false;
+  std::vector<std::string> addresses;
+  std::string message;
+  std::uint32_t fallback_count = 0;
+};
+
+constexpr std::uint16_t kTunnelDnsSourcePortBase = 40000;
+constexpr std::uint16_t kTunnelDnsSourcePortSpan = 20000;
+constexpr std::uint16_t kTunnelDnsDestinationPort = 53;
+constexpr std::chrono::milliseconds kTunnelDnsPollInterval(25);
+constexpr int kTunnelDnsPollAttemptsPerServer = 40;
 
 Result<std::vector<std::string>> ResolveIpv4HostAddrs(std::string_view hostname) {
   addrinfo hints{};
@@ -78,6 +95,25 @@ Result<std::vector<std::string>> ResolveIpv4HostAddrs(std::string_view hostname)
   }
 
   return MakeSuccess(std::move(addresses));
+}
+
+std::string DescribeDnsResponseCode(std::uint8_t rcode) {
+  switch (rcode) {
+    case 0:
+      return "no_error";
+    case 1:
+      return "format_error";
+    case 2:
+      return "server_failure";
+    case 3:
+      return "name_error";
+    case 4:
+      return "not_implemented";
+    case 5:
+      return "refused";
+    default:
+      return "rcode=" + std::to_string(rcode);
+  }
 }
 
 RuntimeFlags ResolveGrantedFlags(RuntimeFlags active_flags, RuntimeFlags requested_flags) {
@@ -572,7 +608,10 @@ class LocalControlService final : public IControlService {
     AppSessionRecord session{};
     StateSnapshot snapshot{};
     RuntimeFlags granted_flags = 0;
+    RuntimeFlags active_runtime_flags = 0;
     std::vector<std::string> dns_servers;
+    ProfileConfig selected_profile{};
+    bool have_selected_profile = false;
     {
       std::scoped_lock lock(mutex_);
       const auto session_it = app_sessions_.find(request.session_id);
@@ -584,9 +623,12 @@ class LocalControlService final : public IControlService {
       session = session_it->second;
       snapshot = state_machine_.snapshot();
       granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      active_runtime_flags = config_.runtime_flags;
 
       const auto profile_it = config_.profiles.find(session.selected_profile);
       if (profile_it != config_.profiles.end()) {
+        selected_profile = profile_it->second;
+        have_selected_profile = true;
         dns_servers = profile_it->second.dns_servers;
       }
     }
@@ -608,6 +650,7 @@ class LocalControlService final : public IControlService {
 
     const bool local_dns_bypass = session.request.allow_local_network_bypass && LooksLocalHost(request.hostname);
     const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    std::uint32_t fallback_count_increment = 0;
     const bool used_direct_fallback = plan.action == RouteAction::Direct && wants_tunnel_dns && !local_dns_bypass;
     if (plan.action == RouteAction::Direct) {
       const Result<std::vector<std::string>> resolved = ResolveIpv4HostAddrs(request.hostname);
@@ -619,9 +662,32 @@ class LocalControlService final : public IControlService {
         result.message = resolved.error.message;
       }
     } else if (plan.action == RouteAction::Tunnel) {
-      result.message = dns_servers.empty()
-                           ? "tunnel DNS requested, but the selected profile has no configured DNS servers yet"
-                           : "tunnel DNS is required; use the selected profile DNS servers until the tunnel-side resolver lands";
+      if (!have_selected_profile) {
+        return MakeFailure<DnsResolveResult>(ErrorCode::NotFound,
+                                             "selected profile not found for app session DNS resolve");
+      }
+
+      const Result<ValidatedWireGuardProfile> validated = ValidateWireGuardProfileForConnect(selected_profile);
+      if (!validated.ok()) {
+        return MakeFailure<DnsResolveResult>(validated.error.code, validated.error.message);
+      }
+
+      const Result<PreparedTunnelSession> prepared_session =
+          PrepareTunnelSession(session.selected_profile, validated.value, active_runtime_flags);
+      if (!prepared_session.ok()) {
+        return MakeFailure<DnsResolveResult>(prepared_session.error.code, prepared_session.error.message);
+      }
+
+      const Result<TunnelDnsLookupResult> resolved =
+          ResolveTunnelDns(request.session_id, prepared_session.value, request.hostname);
+      if (!resolved.ok()) {
+        return MakeFailure<DnsResolveResult>(resolved.error.code, resolved.error.message);
+      }
+
+      result.resolved = resolved.value.resolved;
+      result.addresses = resolved.value.addresses;
+      result.message = resolved.value.message;
+      fallback_count_increment = resolved.value.fallback_count;
     }
 
     {
@@ -631,6 +697,7 @@ class LocalControlService final : public IControlService {
       if (used_direct_fallback) {
         ++stats.dns_fallbacks;
       }
+      stats.dns_fallbacks += fallback_count_increment;
       if (plan.action == RouteAction::Deny) {
         ++stats.leak_prevention_events;
       }
@@ -690,6 +757,26 @@ class LocalControlService final : public IControlService {
                                        "app session profile is not active on the connected tunnel");
     }
 
+    return PopQueuedOrEnginePacketLocked();
+  }
+
+ private:
+  bool SessionUsesActiveTunnelLocked(const AppSessionRecord& session, const StateSnapshot& snapshot) const {
+    return snapshot.state == TunnelState::Connected && tunnel_engine_->IsRunning() &&
+           !session.selected_profile.empty() && snapshot.active_profile == session.selected_profile;
+  }
+
+  Result<TunnelPacket> PopQueuedOrEnginePacketLocked() const {
+    if (!deferred_packets_.empty()) {
+      TunnelPacket packet = std::move(deferred_packets_.front());
+      deferred_packets_.pop_front();
+      return MakeSuccess(std::move(packet));
+    }
+
+    return PopEnginePacketLocked();
+  }
+
+  Result<TunnelPacket> PopEnginePacketLocked() const {
     const Result<WireGuardConsumedTransportPacket> packet = tunnel_engine_->ReceivePacket();
     if (!packet.ok()) {
       return MakeFailure<TunnelPacket>(packet.error.code, packet.error.message);
@@ -697,11 +784,161 @@ class LocalControlService final : public IControlService {
 
     TunnelPacket received{};
     received.counter = packet.value.counter;
-    received.payload = std::move(packet.value.payload);
+    received.payload = packet.value.payload;
     return MakeSuccess(std::move(received));
   }
 
- private:
+  void DeferPacketLocked(TunnelPacket packet) const {
+    deferred_packets_.push_back(std::move(packet));
+  }
+
+  std::uint16_t ReserveDnsQueryIdLocked() const {
+    if (next_dns_query_id_ == 0) {
+      next_dns_query_id_ = 1;
+    }
+
+    return next_dns_query_id_++;
+  }
+
+  Result<TunnelDnsLookupResult> ResolveTunnelDns(std::uint64_t session_id,
+                                                 const PreparedTunnelSession& prepared_session,
+                                                 std::string_view hostname) const {
+    if (prepared_session.interface_ipv4_addresses.empty()) {
+      return MakeFailure<TunnelDnsLookupResult>(ErrorCode::InvalidConfig,
+                                                "selected profile has no IPv4 interface address for tunnel DNS");
+    }
+
+    if (prepared_session.dns_servers.empty()) {
+      TunnelDnsLookupResult lookup{};
+      lookup.message = "tunnel DNS requested, but the selected profile has no configured DNS servers yet";
+      return MakeSuccess(std::move(lookup));
+    }
+
+    TunnelDnsPacketEndpoint endpoint{};
+    endpoint.source_ipv4 = prepared_session.interface_ipv4_addresses.front().address;
+    endpoint.destination_port = kTunnelDnsDestinationPort;
+
+    TunnelDnsLookupResult lookup{};
+    for (std::size_t server_index = 0; server_index < prepared_session.dns_servers.size(); ++server_index) {
+      endpoint.destination_ipv4 = prepared_session.dns_servers[server_index];
+
+      std::uint16_t query_id = 0;
+      {
+        std::scoped_lock lock(mutex_);
+        query_id = ReserveDnsQueryIdLocked();
+      }
+      endpoint.source_port = static_cast<std::uint16_t>(
+          kTunnelDnsSourcePortBase + (query_id % kTunnelDnsSourcePortSpan));
+
+      const Result<std::vector<std::uint8_t>> query_packet =
+          BuildTunnelDnsQueryPacket(endpoint, hostname, query_id);
+      if (!query_packet.ok()) {
+        return MakeFailure<TunnelDnsLookupResult>(query_packet.error.code, query_packet.error.message);
+      }
+
+      {
+        std::scoped_lock lock(mutex_);
+        const auto session_it = app_sessions_.find(session_id);
+        if (session_it == app_sessions_.end()) {
+          return MakeFailure<TunnelDnsLookupResult>(ErrorCode::NotFound,
+                                                    "app session not found during tunnel DNS lookup");
+        }
+
+        const StateSnapshot snapshot = state_machine_.snapshot();
+        if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+          return MakeFailure<TunnelDnsLookupResult>(ErrorCode::InvalidState,
+                                                    "tunnel is no longer connected for tunnel DNS lookup");
+        }
+
+        const Result<std::uint64_t> sent = tunnel_engine_->SendPacket(query_packet.value);
+        if (!sent.ok()) {
+          return MakeFailure<TunnelDnsLookupResult>(sent.error.code, sent.error.message);
+        }
+      }
+
+      for (int attempt = 0; attempt < kTunnelDnsPollAttemptsPerServer; ++attempt) {
+        Result<TunnelPacket> packet = MakeFailure<TunnelPacket>(ErrorCode::NotFound, "no packet available");
+        {
+          std::scoped_lock lock(mutex_);
+          const auto session_it = app_sessions_.find(session_id);
+          if (session_it == app_sessions_.end()) {
+            return MakeFailure<TunnelDnsLookupResult>(ErrorCode::NotFound,
+                                                      "app session not found during tunnel DNS receive");
+          }
+
+          const StateSnapshot snapshot = state_machine_.snapshot();
+          if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+            return MakeFailure<TunnelDnsLookupResult>(ErrorCode::InvalidState,
+                                                      "tunnel disconnected while waiting for tunnel DNS response");
+          }
+
+          packet = PopEnginePacketLocked();
+        }
+
+        if (!packet.ok()) {
+          if (packet.error.code != ErrorCode::NotFound) {
+            return MakeFailure<TunnelDnsLookupResult>(packet.error.code, packet.error.message);
+          }
+
+          std::this_thread::sleep_for(kTunnelDnsPollInterval);
+          continue;
+        }
+
+        const Result<TunnelDnsResponse> response = ParseTunnelDnsResponsePacket(packet.value.payload);
+        if (!response.ok() || response.value.query_id != query_id ||
+            response.value.source_port != endpoint.destination_port ||
+            response.value.destination_port != endpoint.source_port ||
+            response.value.source_ipv4 != endpoint.destination_ipv4 ||
+            response.value.destination_ipv4 != endpoint.source_ipv4) {
+          std::scoped_lock lock(mutex_);
+          DeferPacketLocked(std::move(packet.value));
+          continue;
+        }
+
+        if (response.value.rcode == 0 && !response.value.ipv4_addresses.empty()) {
+          lookup.resolved = true;
+          lookup.addresses = response.value.ipv4_addresses;
+          lookup.message = "resolved " + std::to_string(lookup.addresses.size()) + " IPv4 address(es) through tunnel DNS server " +
+                           FormatIpv4Address(endpoint.destination_ipv4);
+          return MakeSuccess(std::move(lookup));
+        }
+
+        if (response.value.rcode == 3 || response.value.rcode == 0) {
+          lookup.message = response.value.rcode == 3
+                               ? "tunnel DNS server " + FormatIpv4Address(endpoint.destination_ipv4) +
+                                     " reported name_error for '" + std::string(hostname) + "'"
+                               : "tunnel DNS server " + FormatIpv4Address(endpoint.destination_ipv4) +
+                                     " returned no IPv4 answers for '" + std::string(hostname) + "'";
+          return MakeSuccess(std::move(lookup));
+        }
+
+        if (server_index + 1 < prepared_session.dns_servers.size()) {
+          break;
+        }
+
+        lookup.message = "tunnel DNS server " + FormatIpv4Address(endpoint.destination_ipv4) +
+                         " returned " + DescribeDnsResponseCode(response.value.rcode) +
+                         " for '" + std::string(hostname) + "'";
+        return MakeSuccess(std::move(lookup));
+      }
+
+      if (lookup.resolved) {
+        return MakeSuccess(std::move(lookup));
+      }
+      if (!lookup.message.empty()) {
+        return MakeSuccess(std::move(lookup));
+      }
+      if (server_index + 1 < prepared_session.dns_servers.size()) {
+        ++lookup.fallback_count;
+        continue;
+      }
+    }
+
+    lookup.message = "tunnel DNS query for '" + std::string(hostname) + "' timed out against " +
+                     std::to_string(prepared_session.dns_servers.size()) + " configured server(s)";
+    return MakeSuccess(std::move(lookup));
+  }
+
   Error Initialize() {
     const Error logger_error = Logger::Instance().Initialize(paths_.log_file);
     if (logger_error) {
@@ -753,6 +990,8 @@ class LocalControlService final : public IControlService {
   std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateWgTunnelEngine();
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;
+  mutable std::deque<TunnelPacket> deferred_packets_{};
+  mutable std::uint16_t next_dns_query_id_ = 1;
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};
 };
 

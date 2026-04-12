@@ -12,6 +12,7 @@
 #include "swg/ipc_protocol.h"
 #include "swg/moonlight.h"
 #include "swg/session_socket.h"
+#include "swg/wg_profile.h"
 
 namespace {
 
@@ -23,7 +24,15 @@ struct ScreenModel {
   swg::Result<swg::ServiceStatus> status;
   swg::Result<swg::TunnelStats> stats;
   swg::Result<std::vector<swg::ProfileSummary>> profiles;
+  swg::Result<swg::Config> config;
   swg::Result<swg::CompatibilityInfo> compatibility;
+};
+
+struct DiagnosticTarget {
+  std::string host;
+  bool is_hostname = false;
+  bool is_numeric_ipv4 = false;
+  bool is_numeric_ipv6 = false;
 };
 
 struct IntegrationState {
@@ -61,6 +70,7 @@ void RefreshModel(const swg::Client& client, ScreenModel* model) {
   model->status = client.GetStatus();
   model->stats = client.GetStats();
   model->profiles = client.ListProfiles();
+  model->config = client.GetConfig();
   model->compatibility = client.GetCompatibilityInfo();
 }
 
@@ -88,6 +98,64 @@ std::string CurrentProfileName(const ScreenModel& model) {
   }
 
   return {};
+}
+
+swg::Result<DiagnosticTarget> GetDiagnosticTarget(const ScreenModel& model) {
+  if (!model.config.ok()) {
+    return swg::MakeFailure<DiagnosticTarget>(model.config.error.code,
+                                              "config unavailable: " + model.config.error.message);
+  }
+
+  const std::string profile_name = CurrentProfileName(model);
+  if (profile_name.empty()) {
+    return swg::MakeFailure<DiagnosticTarget>(swg::ErrorCode::NotFound, "no active profile available");
+  }
+
+  const auto profile = model.config.value.profiles.find(profile_name);
+  if (profile == model.config.value.profiles.end()) {
+    return swg::MakeFailure<DiagnosticTarget>(swg::ErrorCode::NotFound,
+                                              "active profile config unavailable: " + profile_name);
+  }
+
+  if (profile->second.endpoint_host.empty()) {
+    return swg::MakeFailure<DiagnosticTarget>(swg::ErrorCode::ParseError,
+                                              "active profile endpoint_host is empty");
+  }
+
+  DiagnosticTarget target{};
+  target.host = profile->second.endpoint_host;
+
+  const swg::Result<swg::ParsedIpAddress> parsed = swg::ParseIpAddress(target.host, "endpoint_host");
+  if (!parsed.ok()) {
+    target.is_hostname = true;
+  } else if (parsed.value.family == swg::ParsedIpFamily::IPv4) {
+    target.is_numeric_ipv4 = true;
+  } else {
+    target.is_numeric_ipv6 = true;
+  }
+
+  return swg::MakeSuccess(std::move(target));
+}
+
+std::string DescribeDiagnosticTarget(const DiagnosticTarget& target) {
+  if (target.is_hostname) {
+    return target.host + " (hostname)";
+  }
+
+  if (target.is_numeric_ipv4) {
+    return target.host + " (numeric IPv4)";
+  }
+
+  return target.host + " (numeric IPv6)";
+}
+
+std::string SelectSmokeTargetHost(const ScreenModel& model) {
+  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  if (!target.ok()) {
+    return "vpn.example.test";
+  }
+
+  return target.value.host;
 }
 
 bool IsSessionTunnelReady(const ScreenModel& model, const IntegrationState& state) {
@@ -233,13 +301,27 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
          " profile=" + opened.value.active_profile;
 }
 
-std::string RunDnsResolve(IntegrationState* state) {
+std::string RunDnsResolve(const ScreenModel& model, IntegrationState* state) {
   if (!state->session.is_open()) {
     return "open app session before resolving dns";
   }
 
-  const auto dns = state->session.ResolveDns("vpn.example.test");
   state->dns_lines.clear();
+  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  if (!target.ok()) {
+    state->last_dns_result = "skipped";
+    state->dns_lines.push_back(target.error.message);
+    return "dns resolve skipped";
+  }
+
+  state->dns_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
+  if (!target.value.is_hostname) {
+    state->last_dns_result = "skipped";
+    state->dns_lines.push_back("active profile endpoint_host is numeric; tunnel DNS diagnostics require a hostname");
+    return "dns resolve skipped";
+  }
+
+  const auto dns = state->session.ResolveDns(target.value.host);
   if (!dns.ok()) {
     state->last_dns_result = "failed";
     state->dns_lines.push_back(dns.error.message);
@@ -277,19 +359,35 @@ void RecordSocketSummary(const char* label,
   }
 }
 
-std::string PrepareSocketSmoke(IntegrationState* state) {
+std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state) {
   if (!state->session.is_open()) {
     return "open app session before opening socket wrappers";
   }
 
   state->socket_lines.clear();
+  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  if (!target.ok()) {
+    state->sample_socket.reset();
+    state->last_socket_result = "skipped";
+    state->socket_lines.push_back(target.error.message);
+    return "socket abstraction skipped";
+  }
+
+  state->socket_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
+  if (target.value.is_numeric_ipv6) {
+    state->sample_socket.reset();
+    state->last_socket_result = "skipped";
+    state->socket_lines.push_back(
+        "numeric IPv6 endpoints are not yet supported by the session socket diagnostics; use a hostname or numeric IPv4 target");
+    return "socket abstraction skipped";
+  }
 
   const auto video_socket = swg::SessionSocket::OpenDatagram(
-      state->session, swg::MakeMoonlightVideoSocketRequest("203.0.113.8", 47998));
+      state->session, swg::MakeMoonlightVideoSocketRequest(target.value.host, 47998));
   RecordSocketSummary("video-datagram", video_socket, &state->socket_lines);
 
   const auto control_socket = swg::SessionSocket::OpenStream(
-      state->session, swg::MakeMoonlightHttpsControlSocketRequest("vpn.example.test", 47984));
+      state->session, swg::MakeMoonlightHttpsControlSocketRequest(target.value.host, 47984));
   RecordSocketSummary("https-control", control_socket, &state->socket_lines);
 
   if (video_socket.ok() && video_socket.value.uses_tunnel_packets()) {
@@ -355,6 +453,7 @@ std::string RunSessionSmoke(const ScreenModel& model, IntegrationState* state) {
 
   const bool connected = IsSessionTunnelReady(model, *state);
   const bool dns_enabled = swg::HasFlag(model.status.value.runtime_flags, swg::RuntimeFlag::DnsThroughTunnel);
+  const std::string smoke_target_host = SelectSmokeTargetHost(model);
   std::vector<std::string> lines;
   int passed = 0;
 
@@ -400,7 +499,7 @@ std::string RunSessionSmoke(const ScreenModel& model, IntegrationState* state) {
   }
   passed += RecordPlanCheck(
       "dns",
-      state->session.PlanNetwork(swg::MakeMoonlightDnsPlan("vpn.example.test")),
+      state->session.PlanNetwork(swg::MakeMoonlightDnsPlan(smoke_target_host)),
       expected_dns_action,
       false,
       false,
@@ -413,7 +512,7 @@ std::string RunSessionSmoke(const ScreenModel& model, IntegrationState* state) {
   const swg::RouteAction expected_stream_action = connected ? swg::RouteAction::Tunnel : swg::RouteAction::Deny;
   passed += RecordPlanCheck(
       "https-control",
-      state->session.PlanNetwork(swg::MakeMoonlightHttpsControlPlan("vpn.example.test", 47984)),
+      state->session.PlanNetwork(swg::MakeMoonlightHttpsControlPlan(smoke_target_host, 47984)),
       expected_stream_action,
       false,
       false,
@@ -424,7 +523,7 @@ std::string RunSessionSmoke(const ScreenModel& model, IntegrationState* state) {
                 : 0;
   passed += RecordPlanCheck(
       "video",
-      state->session.PlanNetwork(swg::MakeMoonlightVideoPlan("vpn.example.test", 47998)),
+      state->session.PlanNetwork(swg::MakeMoonlightVideoPlan(smoke_target_host, 47998)),
       expected_stream_action,
       false,
       false,
@@ -616,11 +715,11 @@ int main(int argc, char** argv) {
     }
 
     if ((buttons_down & HidNpadButton_Up) != 0) {
-      state.last_action = RunDnsResolve(&state);
+      state.last_action = RunDnsResolve(model, &state);
     }
 
     if ((buttons_down & HidNpadButton_Down) != 0) {
-      state.last_action = PrepareSocketSmoke(&state);
+      state.last_action = PrepareSocketSmoke(model, &state);
     }
 
     if ((buttons_down & HidNpadButton_Left) != 0) {

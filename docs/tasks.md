@@ -31,6 +31,8 @@
 - A separate Switch integration app now stages as its own NRO and exercises the real `swg::Client` plus `swg::AppSession` flow on hardware without coupling test scenarios to the manager UI.
 - The SDK and control service now expose a route-aware `ResolveDns` helper that resolves direct-safe hosts locally, fails closed before connect when tunnel DNS is required, and returns tunnel-DNS guidance plus configured profile resolvers once the tunnel is up.
 - The SDK now also exposes a route-aware `SessionSocket` wrapper that composes `GetNetworkPlan`, `ResolveDns`, and session packet I/O into one Moonlight-facing transport surface for direct, tunnel-packet, and deny cases.
+- `ResolveDns` now performs real SDK-side tunnel DNS lookups for IPv4 A records by sending inner IPv4/UDP DNS queries through the connected WireGuard session and parsing matching responses back out of the transport queue.
+- The Switch integration app now drives its DNS and socket-helper diagnostics from the active profile `endpoint_host`, and it skips DNS probes cleanly when the profile uses a numeric endpoint instead of a hostname.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -46,6 +48,6 @@
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.
 - Run the new Switch integration app against a working VPN peer and record on-device connect, route-plan, and diagnostic payload results.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
-- Run the new DNS and `SessionSocket` integration controls on-device against a working VPN peer and record the results.
+- Run the new real tunnel-DNS and `SessionSocket` integration controls on-device against a working VPN peer and record the results.
 - Finish the rest of Milestone 6 with a concrete usage example app and a stronger stream story above the current framed packet channel.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.
