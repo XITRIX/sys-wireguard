@@ -71,7 +71,7 @@ Switch service packaging:
 Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, and Wake-on-LAN. The current SDK therefore supports a low-friction integration model:
 - local discovery and Wake-on-LAN can stay direct
 - remote stream traffic can be marked tunnel-required
-- DNS can be marked tunnel-preferred
+- DNS can be marked tunnel-preferred and resolved through a policy-aware helper
 - authenticated payloads can be sent and received through the same `swg::AppSession`
 - future transparent routing can replace some of those explicit decisions later without changing the service contract
 

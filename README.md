@@ -164,6 +164,11 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 - plan HTTPS control, stream-control, video, audio, and input traffic as tunnel-required
 - plan DNS through the tunnel when the profile enables it
 
+That same app session can now call `ResolveDns()` to get a policy-safe DNS result:
+- direct IPv4 answers when the session is allowed to fall back directly
+- fail-closed results when Moonlight requires tunnel DNS before connect
+- tunnel-DNS guidance plus configured profile resolvers once the selected profile is connected
+
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 When tunnel traffic is routed through the sysmodule, the same session can now send authenticated payloads and drain validated inbound payload packets through `swg::AppSession::SendPacket()` and `swg::AppSession::ReceivePacket()`.
@@ -172,7 +177,7 @@ The raw packet controls in the Switch integration app are diagnostic only for no
 
 Next:
 - manager UX expansion
-- Milestone 6 completion work: round out the homebrew SDK surface with DNS resolve helpers and a concrete usage example
+- Milestone 6 completion work: add a concrete usage example and higher-level transport helpers on top of the new DNS resolve path
 - WireGuard cookie reply handling and later rekey or roaming work on top of the current repeated packet path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

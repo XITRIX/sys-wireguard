@@ -38,6 +38,8 @@ Result<ByteBuffer> EncodePayload(const NetworkPlanRequest& value);
 Result<ByteBuffer> EncodePayload(const NetworkPlan& value);
 Result<ByteBuffer> EncodePayload(const TunnelPacket& value);
 Result<ByteBuffer> EncodePayload(const TunnelSendRequest& value);
+Result<ByteBuffer> EncodePayload(const DnsResolveRequest& value);
+Result<ByteBuffer> EncodePayload(const DnsResolveResult& value);
 
 Result<VersionInfo> DecodeVersionInfoPayload(const ByteBuffer& payload);
 Result<ServiceStatus> DecodeServiceStatusPayload(const ByteBuffer& payload);
@@ -54,6 +56,8 @@ Result<NetworkPlanRequest> DecodeNetworkPlanRequestPayload(const ByteBuffer& pay
 Result<NetworkPlan> DecodeNetworkPlanPayload(const ByteBuffer& payload);
 Result<TunnelPacket> DecodeTunnelPacketPayload(const ByteBuffer& payload);
 Result<TunnelSendRequest> DecodeTunnelSendRequestPayload(const ByteBuffer& payload);
+Result<DnsResolveRequest> DecodeDnsResolveRequestPayload(const ByteBuffer& payload);
+Result<DnsResolveResult> DecodeDnsResolveResultPayload(const ByteBuffer& payload);
 
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request);
 Result<IpcRequestMessage> DecodeRequestMessage(const ByteBuffer& bytes);

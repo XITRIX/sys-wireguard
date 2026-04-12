@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -1866,6 +1867,119 @@ bool TestMoonlightRoutePlanning() {
   return ok;
 }
 
+bool TestAppSessionDnsResolution() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-dns";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  LocalHandshakeResponder responder;
+  if (!Require(responder.ready(), "local handshake responder must start for DNS resolution tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before DNS resolution tests")) {
+    return false;
+  }
+
+  bool ok = true;
+
+  swg::AppSession direct_session(client);
+  const auto direct_opened = direct_session.Open(swg::MakeMoonlightSessionRequest("default", false));
+  ok &= Require(direct_opened.ok(), "direct-fallback DNS app session must open");
+  if (!direct_opened.ok()) {
+    return false;
+  }
+
+  const auto direct_dns = direct_session.ResolveDns("1.1.1.1");
+  ok &= Require(direct_dns.ok(), "direct-fallback DNS resolve must succeed");
+  if (direct_dns.ok()) {
+    ok &= Require(direct_dns.value.action == swg::RouteAction::Direct,
+                  "direct-fallback DNS resolve must stay on the direct path");
+    ok &= Require(direct_dns.value.resolved, "direct-fallback DNS resolve must return addresses");
+    ok &= Require(std::find(direct_dns.value.addresses.begin(), direct_dns.value.addresses.end(), "1.1.1.1") !=
+                      direct_dns.value.addresses.end(),
+            "direct-fallback DNS resolve must include the requested IPv4 literal");
+  }
+
+  const auto stats_after_direct = client.GetStats();
+  ok &= Require(stats_after_direct.ok(), "stats must load after direct DNS resolve");
+  if (stats_after_direct.ok()) {
+    ok &= Require(stats_after_direct.value.dns_queries == 1,
+                  "direct DNS resolve must increment the DNS query counter");
+    ok &= Require(stats_after_direct.value.dns_fallbacks == 1,
+                  "direct fallback DNS resolve must increment the fallback counter");
+    ok &= Require(stats_after_direct.value.leak_prevention_events == 0,
+                  "direct fallback DNS resolve must not record a leak-prevention event");
+  }
+
+  ok &= Require(direct_session.Close().ok(), "direct-fallback DNS app session must close cleanly");
+
+  swg::AppSession tunnel_session(client);
+  const auto tunnel_opened = tunnel_session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(tunnel_opened.ok(), "tunnel DNS app session must open");
+  if (!tunnel_opened.ok()) {
+    return false;
+  }
+
+  const auto denied_dns = tunnel_session.ResolveDns("vpn.example.test");
+  ok &= Require(denied_dns.ok(), "denied DNS resolve must return a policy result");
+  if (denied_dns.ok()) {
+    ok &= Require(denied_dns.value.action == swg::RouteAction::Deny,
+                  "tunnel-required DNS must fail closed before the tunnel is connected");
+    ok &= Require(!denied_dns.value.resolved,
+                  "tunnel-required DNS must not resolve directly before the tunnel is connected");
+    ok &= Require(denied_dns.value.message.find("not ready") != std::string::npos,
+                  "denied DNS result must explain that tunnel DNS is not ready");
+  }
+
+  const auto stats_after_deny = client.GetStats();
+  ok &= Require(stats_after_deny.ok(), "stats must load after denied DNS resolve");
+  if (stats_after_deny.ok()) {
+    ok &= Require(stats_after_deny.value.dns_queries == 2,
+                  "denied DNS resolve must increment the DNS query counter");
+    ok &= Require(stats_after_deny.value.dns_fallbacks == 1,
+                  "denied DNS resolve must not increment the fallback counter");
+    ok &= Require(stats_after_deny.value.leak_prevention_events == 1,
+                  "denied DNS resolve must record a leak-prevention event");
+  }
+
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel DNS guidance test");
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the DNS handshake"
+                                                            : responder.error());
+
+  const auto tunnel_dns = tunnel_session.ResolveDns("vpn.example.test");
+  ok &= Require(tunnel_dns.ok(), "tunnel DNS guidance must succeed after connect");
+  if (tunnel_dns.ok()) {
+    ok &= Require(tunnel_dns.value.action == swg::RouteAction::Tunnel,
+                  "connected tunnel DNS resolve must stay on the tunnel path");
+    ok &= Require(tunnel_dns.value.use_tunnel_dns,
+                  "connected tunnel DNS resolve must mark tunnel DNS usage");
+    ok &= Require(!tunnel_dns.value.resolved,
+                  "connected tunnel DNS guidance must not leak a direct host resolve yet");
+    ok &= Require(tunnel_dns.value.dns_servers.size() == 2,
+                  "connected tunnel DNS guidance must expose the selected profile DNS servers");
+    ok &= Require(tunnel_dns.value.message.find("tunnel DNS") != std::string::npos,
+                  "connected tunnel DNS guidance must explain the tunnel DNS requirement");
+  }
+
+  const auto stats_after_tunnel = client.GetStats();
+  ok &= Require(stats_after_tunnel.ok(), "stats must load after tunnel DNS guidance");
+  if (stats_after_tunnel.ok()) {
+    ok &= Require(stats_after_tunnel.value.dns_queries == 3,
+                  "tunnel DNS guidance must increment the DNS query counter");
+    ok &= Require(stats_after_tunnel.value.dns_fallbacks == 1,
+                  "tunnel DNS guidance must not increment the fallback counter");
+    ok &= Require(stats_after_tunnel.value.leak_prevention_events == 1,
+                  "tunnel DNS guidance must preserve the prior leak-prevention count");
+  }
+
+  ok &= Require(tunnel_session.Close().ok(), "tunnel DNS app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after DNS resolution tests");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1893,13 +2007,14 @@ int main() {
   const bool receive_reconnect_ok = TestEngineReconnectAfterReceiveFailure();
   const bool keepalive_reconnect_ok = TestEngineReconnectAfterKeepaliveFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
+  const bool dns_resolution_ok = TestAppSessionDnsResolution();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
-          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok)
+          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && dns_resolution_ok)
              ? 0
              : 1;
 }

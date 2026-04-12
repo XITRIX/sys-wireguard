@@ -43,6 +43,7 @@ enum class ServiceCommandId : std::uint32_t {
   GetNetworkPlan,
   RecvPacket,
   SendPacket,
+  ResolveDns,
 };
 
 enum class TunnelState : std::uint32_t {
@@ -211,6 +212,23 @@ struct TunnelSendRequest {
   std::uint16_t abi_version = kAbiVersion;
   std::uint64_t session_id = 0;
   std::vector<std::uint8_t> payload;
+};
+
+struct DnsResolveRequest {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t session_id = 0;
+  std::string hostname;
+};
+
+struct DnsResolveResult {
+  std::uint16_t abi_version = kAbiVersion;
+  RouteAction action = RouteAction::Direct;
+  bool resolved = false;
+  bool use_tunnel_dns = false;
+  std::string profile_name;
+  std::vector<std::string> addresses;
+  std::vector<std::string> dns_servers;
+  std::string message;
 };
 
 inline std::string_view ToString(TunnelState state) {

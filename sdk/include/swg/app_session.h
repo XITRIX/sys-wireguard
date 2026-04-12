@@ -14,6 +14,7 @@ class AppSession {
   Result<AppSessionInfo> Open(const AppTunnelRequest& request);
   Error Close();
   Result<NetworkPlan> PlanNetwork(const NetworkPlanRequest& request) const;
+  Result<DnsResolveResult> ResolveDns(std::string_view hostname) const;
   Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) const;
   Result<TunnelPacket> ReceivePacket() const;
 

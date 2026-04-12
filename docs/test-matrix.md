@@ -23,6 +23,7 @@
 | Engine reconnect after keepalive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one periodic keepalive send failure, then verifies the engine re-handshakes and remains usable |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
+| App-session DNS resolution policy | Verified | `swg_tests` now covers direct DNS fallback, fail-closed tunnel-DNS policy before connect, and connected tunnel-DNS guidance |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
 
 ## On-device

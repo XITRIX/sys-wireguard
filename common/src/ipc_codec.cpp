@@ -1126,6 +1126,117 @@ Result<TunnelSendRequest> DecodeTunnelSendRequestPayload(const ByteBuffer& paylo
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const DnsResolveRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteString(value.hostname);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<DnsResolveRequest> DecodeDnsResolveRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  DnsResolveRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<DnsResolveRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<DnsResolveRequest>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<std::string> hostname = reader.ReadString();
+  if (!hostname.ok()) {
+    return MakeFailure<DnsResolveRequest>(hostname.error.code, hostname.error.message);
+  }
+  value.hostname = hostname.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<DnsResolveRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const DnsResolveResult& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WriteEnum(value.action);
+  writer.WriteBool(value.resolved);
+  writer.WriteBool(value.use_tunnel_dns);
+  writer.WriteString(value.profile_name);
+  writer.WriteStringVector(value.addresses);
+  writer.WriteStringVector(value.dns_servers);
+  writer.WriteString(value.message);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<DnsResolveResult> DecodeDnsResolveResultPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  DnsResolveResult value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<DnsResolveResult>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<RouteAction> action = reader.ReadEnum<RouteAction>();
+  if (!action.ok()) {
+    return MakeFailure<DnsResolveResult>(action.error.code, action.error.message);
+  }
+  value.action = action.value;
+
+  const Result<bool> resolved = reader.ReadBool();
+  if (!resolved.ok()) {
+    return MakeFailure<DnsResolveResult>(resolved.error.code, resolved.error.message);
+  }
+  value.resolved = resolved.value;
+
+  const Result<bool> use_tunnel_dns = reader.ReadBool();
+  if (!use_tunnel_dns.ok()) {
+    return MakeFailure<DnsResolveResult>(use_tunnel_dns.error.code, use_tunnel_dns.error.message);
+  }
+  value.use_tunnel_dns = use_tunnel_dns.value;
+
+  const Result<std::string> profile_name = reader.ReadString();
+  if (!profile_name.ok()) {
+    return MakeFailure<DnsResolveResult>(profile_name.error.code, profile_name.error.message);
+  }
+  value.profile_name = profile_name.value;
+
+  const Result<std::vector<std::string>> addresses = reader.ReadStringVector();
+  if (!addresses.ok()) {
+    return MakeFailure<DnsResolveResult>(addresses.error.code, addresses.error.message);
+  }
+  value.addresses = addresses.value;
+
+  const Result<std::vector<std::string>> dns_servers = reader.ReadStringVector();
+  if (!dns_servers.ok()) {
+    return MakeFailure<DnsResolveResult>(dns_servers.error.code, dns_servers.error.message);
+  }
+  value.dns_servers = dns_servers.value;
+
+  const Result<std::string> message = reader.ReadString();
+  if (!message.ok()) {
+    return MakeFailure<DnsResolveResult>(message.error.code, message.error.message);
+  }
+  value.message = message.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<DnsResolveResult>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request) {
   RequestHeaderWire header{};
   header.abi_version = request.abi_version;
@@ -1302,6 +1413,13 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(plan_request.error);
       }
       return EncodeResponseFromResult(service.GetNetworkPlan(plan_request.value));
+    }
+    case ServiceCommandId::ResolveDns: {
+      const Result<DnsResolveRequest> dns_request = DecodeDnsResolveRequestPayload(request.value.payload);
+      if (!dns_request.ok()) {
+        return EncodeResponseFromError(dns_request.error);
+      }
+      return EncodeResponseFromResult(service.ResolveDns(dns_request.value));
     }
     case ServiceCommandId::RecvPacket: {
       const Result<std::uint64_t> session_id = DecodeU64Payload(request.value.payload);

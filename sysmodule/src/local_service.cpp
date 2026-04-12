@@ -1,8 +1,13 @@
 #include "swg_sysmodule/local_service.h"
 
+#include <algorithm>
+#include <arpa/inet.h>
 #include <cctype>
 #include <mutex>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sstream>
+#include <sys/socket.h>
 #include <unordered_map>
 
 #include "swg/config.h"
@@ -24,6 +29,56 @@ struct AppSessionRecord {
   AppTunnelRequest request;
   std::string selected_profile;
 };
+
+Result<std::vector<std::string>> ResolveIpv4HostAddrs(std::string_view hostname) {
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+
+  addrinfo* results = nullptr;
+  const int rc = getaddrinfo(std::string(hostname).c_str(), nullptr, &hints, &results);
+  if (rc != 0 || results == nullptr) {
+    if (results != nullptr) {
+      freeaddrinfo(results);
+    }
+
+    const ErrorCode code = rc == EAI_NONAME ? ErrorCode::NotFound : ErrorCode::ServiceUnavailable;
+    std::string message = "hostname '" + std::string(hostname) + "' did not resolve to IPv4";
+    if (rc != 0) {
+      message += ": ";
+      message += gai_strerror(rc);
+    }
+    return MakeFailure<std::vector<std::string>>(code, std::move(message));
+  }
+
+  std::vector<std::string> addresses;
+  for (addrinfo* current = results; current != nullptr; current = current->ai_next) {
+    if (current->ai_family != AF_INET || current->ai_addr == nullptr ||
+        current->ai_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      continue;
+    }
+
+    const auto& addr = *reinterpret_cast<const sockaddr_in*>(current->ai_addr);
+    char buffer[16] = {};
+    if (inet_ntop(AF_INET, &addr.sin_addr, buffer, sizeof(buffer)) == nullptr) {
+      continue;
+    }
+
+    const std::string address(buffer);
+    if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) {
+      addresses.push_back(address);
+    }
+  }
+
+  freeaddrinfo(results);
+  if (addresses.empty()) {
+    return MakeFailure<std::vector<std::string>>(ErrorCode::NotFound,
+                                                 "hostname '" + std::string(hostname) +
+                                                     "' returned no usable IPv4 addresses");
+  }
+
+  return MakeSuccess(std::move(addresses));
+}
 
 RuntimeFlags ResolveGrantedFlags(RuntimeFlags active_flags, RuntimeFlags requested_flags) {
   return requested_flags == 0 ? active_flags : (active_flags & requested_flags);
@@ -120,6 +175,89 @@ TunnelStats MergeEngineStats(const TunnelStats& base, const TunnelStats& engine)
   merged.leak_prevention_events += engine.leak_prevention_events;
   merged.last_handshake_age_seconds = engine.last_handshake_age_seconds;
   return merged;
+}
+
+NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
+                             const StateSnapshot& snapshot,
+                             RuntimeFlags granted_flags,
+                             const NetworkPlanRequest& request) {
+  const bool tunnel_ready = snapshot.state == TunnelState::Connected && !session.selected_profile.empty() &&
+                            snapshot.active_profile == session.selected_profile;
+
+  NetworkPlan plan{};
+  plan.profile_name = session.selected_profile;
+  plan.transparent_eligible = tunnel_ready && HasFlag(granted_flags, RuntimeFlag::TransparentMode);
+
+  const bool explicit_bypass = request.route_preference == RoutePreference::BypassTunnel;
+  const bool local_bypass = session.request.allow_local_network_bypass &&
+                            (request.local_network_hint || request.traffic_class == AppTrafficClass::Discovery ||
+                             request.traffic_class == AppTrafficClass::WakeOnLan ||
+                             LooksLocalHost(request.remote_host));
+
+  if (explicit_bypass || local_bypass) {
+    plan.action = RouteAction::Direct;
+    plan.local_bypass = local_bypass;
+    plan.reason = explicit_bypass ? "caller requested direct routing"
+                                 : "local discovery or local-network traffic bypasses the tunnel";
+    return plan;
+  }
+
+  if (request.traffic_class == AppTrafficClass::Dns) {
+    const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    if (wants_tunnel_dns && tunnel_ready) {
+      plan.action = RouteAction::Tunnel;
+      plan.use_tunnel_dns = true;
+      plan.reason = "DNS should resolve through the active tunnel for this app session";
+      return plan;
+    }
+
+    if (wants_tunnel_dns && !session.request.allow_direct_internet_fallback) {
+      plan.action = RouteAction::Deny;
+      plan.reason = "tunnel DNS requested but the tunnel is not ready";
+      return plan;
+    }
+
+    plan.action = RouteAction::Direct;
+    plan.reason = wants_tunnel_dns ? "falling back to direct DNS because tunnel DNS is unavailable"
+                                   : "app session does not require tunnel DNS";
+    return plan;
+  }
+
+  bool wants_tunnel = false;
+  switch (request.route_preference) {
+    case RoutePreference::RequireTunnel:
+    case RoutePreference::PreferTunnel:
+      wants_tunnel = true;
+      break;
+    case RoutePreference::Default:
+      wants_tunnel = IsRemoteStreamTraffic(request.traffic_class) || session.request.require_tunnel_for_default_traffic;
+      break;
+    case RoutePreference::BypassTunnel:
+      wants_tunnel = false;
+      break;
+  }
+
+  if (wants_tunnel) {
+    if (tunnel_ready) {
+      plan.action = RouteAction::Tunnel;
+      plan.reason = "remote control or streaming traffic should use the active tunnel";
+      return plan;
+    }
+
+    if (request.route_preference != RoutePreference::RequireTunnel && session.request.allow_direct_internet_fallback) {
+      plan.action = RouteAction::Direct;
+      plan.reason = "tunnel unavailable; app session allows direct fallback";
+      return plan;
+    }
+
+    plan.action = RouteAction::Deny;
+    plan.reason = "tunnel-required traffic cannot proceed until the selected profile is connected";
+    return plan;
+  }
+
+  plan.action = RouteAction::Direct;
+  plan.reason = "traffic class does not require the tunnel";
+  return plan;
 }
 
 class LocalControlService final : public IControlService {
@@ -422,83 +560,84 @@ class LocalControlService final : public IControlService {
     const AppSessionRecord& session = session_it->second;
     const StateSnapshot snapshot = state_machine_.snapshot();
     const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
-    const bool tunnel_ready = snapshot.state == TunnelState::Connected && !session.selected_profile.empty() &&
-                              snapshot.active_profile == session.selected_profile;
-
-    NetworkPlan plan{};
-    plan.profile_name = session.selected_profile;
-    plan.transparent_eligible = tunnel_ready && HasFlag(granted_flags, RuntimeFlag::TransparentMode);
-
-    const bool explicit_bypass = request.route_preference == RoutePreference::BypassTunnel;
-    const bool local_bypass = session.request.allow_local_network_bypass &&
-                              (request.local_network_hint || request.traffic_class == AppTrafficClass::Discovery ||
-                               request.traffic_class == AppTrafficClass::WakeOnLan ||
-                               LooksLocalHost(request.remote_host));
-
-    if (explicit_bypass || local_bypass) {
-      plan.action = RouteAction::Direct;
-      plan.local_bypass = local_bypass;
-      plan.reason = explicit_bypass ? "caller requested direct routing"
-                                   : "local discovery or local-network traffic bypasses the tunnel";
-      return MakeSuccess(std::move(plan));
-    }
-
-    if (request.traffic_class == AppTrafficClass::Dns) {
-      const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
-      if (wants_tunnel_dns && tunnel_ready) {
-        plan.action = RouteAction::Tunnel;
-        plan.use_tunnel_dns = true;
-        plan.reason = "DNS should resolve through the active tunnel for this app session";
-        return MakeSuccess(std::move(plan));
-      }
-
-      if (wants_tunnel_dns && !session.request.allow_direct_internet_fallback) {
-        plan.action = RouteAction::Deny;
-        plan.reason = "tunnel DNS requested but the tunnel is not ready";
-        return MakeSuccess(std::move(plan));
-      }
-
-      plan.action = RouteAction::Direct;
-      plan.reason = wants_tunnel_dns ? "falling back to direct DNS because tunnel DNS is unavailable"
-                                     : "app session does not require tunnel DNS";
-      return MakeSuccess(std::move(plan));
-    }
-
-    bool wants_tunnel = false;
-    switch (request.route_preference) {
-      case RoutePreference::RequireTunnel:
-      case RoutePreference::PreferTunnel:
-        wants_tunnel = true;
-        break;
-      case RoutePreference::Default:
-        wants_tunnel = IsRemoteStreamTraffic(request.traffic_class) || session.request.require_tunnel_for_default_traffic;
-        break;
-      case RoutePreference::BypassTunnel:
-        wants_tunnel = false;
-        break;
-    }
-
-    if (wants_tunnel) {
-      if (tunnel_ready) {
-        plan.action = RouteAction::Tunnel;
-        plan.reason = "remote control or streaming traffic should use the active tunnel";
-        return MakeSuccess(std::move(plan));
-      }
-
-      if (request.route_preference != RoutePreference::RequireTunnel && session.request.allow_direct_internet_fallback) {
-        plan.action = RouteAction::Direct;
-        plan.reason = "tunnel unavailable; app session allows direct fallback";
-        return MakeSuccess(std::move(plan));
-      }
-
-      plan.action = RouteAction::Deny;
-      plan.reason = "tunnel-required traffic cannot proceed until the selected profile is connected";
-      return MakeSuccess(std::move(plan));
-    }
-
-    plan.action = RouteAction::Direct;
-    plan.reason = "traffic class does not require the tunnel";
+    NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, request);
     return MakeSuccess(std::move(plan));
+  }
+
+  Result<DnsResolveResult> ResolveDns(const DnsResolveRequest& request) const override {
+    if (request.hostname.empty()) {
+      return MakeFailure<DnsResolveResult>(ErrorCode::ParseError, "hostname must not be empty");
+    }
+
+    AppSessionRecord session{};
+    StateSnapshot snapshot{};
+    RuntimeFlags granted_flags = 0;
+    std::vector<std::string> dns_servers;
+    {
+      std::scoped_lock lock(mutex_);
+      const auto session_it = app_sessions_.find(request.session_id);
+      if (session_it == app_sessions_.end()) {
+        return MakeFailure<DnsResolveResult>(ErrorCode::NotFound,
+                                             "app session not found: " + std::to_string(request.session_id));
+      }
+
+      session = session_it->second;
+      snapshot = state_machine_.snapshot();
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+
+      const auto profile_it = config_.profiles.find(session.selected_profile);
+      if (profile_it != config_.profiles.end()) {
+        dns_servers = profile_it->second.dns_servers;
+      }
+    }
+
+    NetworkPlanRequest plan_request{};
+    plan_request.session_id = request.session_id;
+    plan_request.remote_host = request.hostname;
+    plan_request.traffic_class = AppTrafficClass::Dns;
+    plan_request.route_preference = RoutePreference::PreferTunnel;
+
+    const NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, plan_request);
+
+    DnsResolveResult result{};
+    result.action = plan.action;
+    result.use_tunnel_dns = plan.use_tunnel_dns;
+    result.profile_name = plan.profile_name;
+    result.dns_servers = dns_servers;
+    result.message = plan.reason;
+
+    const bool local_dns_bypass = session.request.allow_local_network_bypass && LooksLocalHost(request.hostname);
+    const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    const bool used_direct_fallback = plan.action == RouteAction::Direct && wants_tunnel_dns && !local_dns_bypass;
+    if (plan.action == RouteAction::Direct) {
+      const Result<std::vector<std::string>> resolved = ResolveIpv4HostAddrs(request.hostname);
+      if (resolved.ok()) {
+        result.resolved = true;
+        result.addresses = resolved.value;
+        result.message = plan.reason + "; resolved " + std::to_string(result.addresses.size()) + " IPv4 address(es)";
+      } else {
+        result.message = resolved.error.message;
+      }
+    } else if (plan.action == RouteAction::Tunnel) {
+      result.message = dns_servers.empty()
+                           ? "tunnel DNS requested, but the selected profile has no configured DNS servers yet"
+                           : "tunnel DNS is required; use the selected profile DNS servers until the tunnel-side resolver lands";
+    }
+
+    {
+      std::scoped_lock lock(mutex_);
+      TunnelStats stats = state_machine_.snapshot().stats;
+      ++stats.dns_queries;
+      if (used_direct_fallback) {
+        ++stats.dns_fallbacks;
+      }
+      if (plan.action == RouteAction::Deny) {
+        ++stats.leak_prevention_events;
+      }
+      state_machine_.UpdateStats(stats);
+    }
+
+    return MakeSuccess(std::move(result));
   }
 
   Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) override {
@@ -610,7 +749,7 @@ class LocalControlService final : public IControlService {
   RuntimePaths paths_{};
   mutable std::mutex mutex_;
   Config config_{};
-  ConnectionStateMachine state_machine_{};
+  mutable ConnectionStateMachine state_machine_{};
   std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateWgTunnelEngine();
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;

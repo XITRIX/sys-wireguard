@@ -29,6 +29,7 @@
 - The engine now performs a bounded reconnect with backoff when an outbound authenticated transport send hits an I/O failure, and a scripted host runtime test verifies that it re-handshakes and retries the payload successfully.
 - The engine now also routes receive-loop transport failures and periodic keepalive send failures through the same bounded reconnect path, with scripted host runtime tests covering both recovery triggers.
 - A separate Switch integration app now stages as its own NRO and exercises the real `swg::Client` plus `swg::AppSession` flow on hardware without coupling test scenarios to the manager UI.
+- The SDK and control service now expose a route-aware `ResolveDns` helper that resolves direct-safe hosts locally, fails closed before connect when tunnel DNS is required, and returns tunnel-DNS guidance plus configured profile resolvers once the tunnel is up.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -44,6 +45,6 @@
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.
 - Run the new Switch integration app against a working VPN peer and record on-device connect, route-plan, and diagnostic payload results.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
-- Start the Milestone 6 slice by adding tunnel-aware DNS resolve helpers to the SDK surface.
-- Add real tunnel-aware DNS resolution results for app consumers.
+- Expose the new DNS resolve helper through the Switch integration app so on-device Moonlight-style flows can validate it directly.
+- Finish the rest of Milestone 6 with a higher-level socket or stream abstraction and a concrete usage example app.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.

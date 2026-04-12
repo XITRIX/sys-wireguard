@@ -48,6 +48,17 @@ Result<NetworkPlan> AppSession::PlanNetwork(const NetworkPlanRequest& request) c
   return client_.GetNetworkPlan(scoped_request);
 }
 
+Result<DnsResolveResult> AppSession::ResolveDns(std::string_view hostname) const {
+  if (!is_open()) {
+    return MakeFailure<DnsResolveResult>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  DnsResolveRequest request{};
+  request.session_id = session_id_;
+  request.hostname = std::string(hostname);
+  return client_.ResolveDns(request);
+}
+
 Result<std::uint64_t> AppSession::SendPacket(const std::vector<std::uint8_t>& payload) const {
   if (!is_open()) {
     return MakeFailure<std::uint64_t>(ErrorCode::InvalidState, "app session is not open");

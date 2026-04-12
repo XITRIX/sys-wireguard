@@ -291,6 +291,22 @@ Result<NetworkPlan> Client::GetNetworkPlan(const NetworkPlanRequest& request) co
       DecodeNetworkPlanPayload);
 }
 
+Result<DnsResolveResult> Client::ResolveDns(const DnsResolveRequest& request) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->ResolveDns(request);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(request);
+  if (!payload.ok()) {
+    return MakeFailure<DnsResolveResult>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::ResolveDns, payload.value}),
+      DecodeDnsResolveResultPayload);
+}
+
 Result<std::uint64_t> Client::SendPacket(std::uint64_t session_id, const std::vector<std::uint8_t>& payload) const {
   const std::shared_ptr<IControlService> service = ResolveService();
   const TunnelSendRequest request{kAbiVersion, session_id, payload};
