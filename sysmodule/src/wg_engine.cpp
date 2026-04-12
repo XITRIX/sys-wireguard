@@ -134,6 +134,12 @@ struct EstablishedTransportSession {
   TunnelStats stats{};
 };
 
+enum class ReconnectTrigger : std::uint32_t {
+  External = 0,
+  ReceiveLoop,
+  KeepaliveLoop,
+};
+
 class WgTunnelEngine final : public IWgTunnelEngine {
  public:
   explicit WgTunnelEngine(std::unique_ptr<IUdpSocketRuntime> socket_runtime)
@@ -196,6 +202,8 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   }
 
   Error Stop() override {
+    std::scoped_lock reconnect_lock(reconnect_mutex_);
+
     {
       std::scoped_lock lock(engine_mutex_);
       if (!running_ && !keepalive_thread_.joinable() && !receive_thread_.joinable() && !socket_runtime_->IsStarted() &&
@@ -279,7 +287,8 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       }
 
       const Error reconnect_error = ReconnectWithBackoff("authenticated transport send failed: " +
-                                                         bytes_sent.error.message);
+                                                         bytes_sent.error.message,
+                                                         ReconnectTrigger::External);
       if (reconnect_error) {
         return MakeFailure<std::uint64_t>(reconnect_error.code, reconnect_error.message);
       }
@@ -570,7 +579,37 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     ++stats_.packets_out;
   }
 
-  Error ReconnectWithBackoff(const std::string& reason) {
+  bool IsCurrentThread(const std::thread& thread) const {
+    return thread.joinable() && thread.get_id() == std::this_thread::get_id();
+  }
+
+  void PrepareReconnectCallerThread(ReconnectTrigger trigger) {
+    switch (trigger) {
+      case ReconnectTrigger::ReceiveLoop:
+        if (IsCurrentThread(receive_thread_)) {
+          receive_thread_.detach();
+        }
+        break;
+      case ReconnectTrigger::KeepaliveLoop:
+        if (IsCurrentThread(keepalive_thread_)) {
+          keepalive_thread_.detach();
+        }
+        break;
+      case ReconnectTrigger::External:
+        break;
+    }
+  }
+
+  void JoinReconnectPeerThreads(ReconnectTrigger trigger) {
+    if (trigger != ReconnectTrigger::ReceiveLoop && receive_thread_.joinable()) {
+      receive_thread_.join();
+    }
+    if (trigger != ReconnectTrigger::KeepaliveLoop && keepalive_thread_.joinable()) {
+      keepalive_thread_.join();
+    }
+  }
+
+  Error ReconnectWithBackoff(const std::string& reason, ReconnectTrigger trigger) {
     std::scoped_lock reconnect_lock(reconnect_mutex_);
 
     PreparedTunnelSession session{};
@@ -587,12 +626,8 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     }
 
     keepalive_cv_.notify_all();
-    if (receive_thread_.joinable()) {
-      receive_thread_.join();
-    }
-    if (keepalive_thread_.joinable()) {
-      keepalive_thread_.join();
-    }
+    PrepareReconnectCallerThread(trigger);
+    JoinReconnectPeerThreads(trigger);
 
     {
       std::scoped_lock send_lock(transport_send_mutex_);
@@ -645,6 +680,9 @@ class WgTunnelEngine final : public IWgTunnelEngine {
         ++stats_.reconnects;
         next_send_counter_ = 1;
         next_receive_counter_ = 0;
+        queued_transport_packets_.clear();
+        queued_transport_payload_bytes_ = 0;
+        receive_queue_overflow_logged_ = false;
         last_handshake_at_ = std::chrono::steady_clock::now();
         running_ = true;
         last_error_.clear();
@@ -669,6 +707,16 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       last_error_ = "bounded reconnect failed: " + last_error.message;
     }
     return MakeError(last_error.code, "bounded reconnect failed: " + last_error.message);
+  }
+
+  void HandleWorkerTransportFailure(std::string_view reason, ReconnectTrigger trigger) {
+    const Error reconnect_error = ReconnectWithBackoff(std::string(reason), trigger);
+    if (reconnect_error) {
+      LogWarning("wg_engine", reconnect_error.message);
+      return;
+    }
+
+    LogInfo("wg_engine", "worker-triggered bounded reconnect completed: " + std::string(reason));
   }
 
   void ReceiveLoop() {
@@ -703,10 +751,12 @@ class WgTunnelEngine final : public IWgTunnelEngine {
         if (stop_requested_ || !running_) {
           return;
         }
+      }
 
-        LogWarning("wg_engine", "failed to receive post-handshake transport datagram: " +
-                                    received.error.message);
-        continue;
+      if (!received.ok()) {
+        HandleWorkerTransportFailure("post-handshake transport receive failed: " + received.error.message,
+                                     ReconnectTrigger::ReceiveLoop);
+        return;
       }
 
       if (!MatchesEndpoint(endpoint, received.value)) {
@@ -806,6 +856,13 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       const Result<std::size_t> bytes_sent = SendReservedTransportDatagram(
           reserved.value, keepalive.value.packet.data(), keepalive.value.packet.size());
       if (!bytes_sent.ok()) {
+        if (bytes_sent.error.code == ErrorCode::IoError || bytes_sent.error.code == ErrorCode::InvalidState) {
+          HandleWorkerTransportFailure("periodic keepalive send failed after " + std::to_string(interval_seconds) +
+                                           "s: " + bytes_sent.error.message,
+                                       ReconnectTrigger::KeepaliveLoop);
+          return;
+        }
+
         LogWarning("wg_engine", "failed to send periodic keepalive after " + std::to_string(interval_seconds) +
                                     "s: " + bytes_sent.error.message);
         continue;

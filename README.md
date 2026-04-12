@@ -104,8 +104,8 @@ Current constraints:
 - The engine now also accepts inbound authenticated transport packets from the validated peer endpoint and folds them into live stats.
 - Non-empty transport payloads are authenticated, can be sent through `swg:ctl`, are queued in a bounded receive queue, and are available to SDK consumers through `swg::AppSession::SendPacket()` / `ReceivePacket()`.
 - Host regression coverage now exercises repeated authenticated app-session send/receive traffic over one connected tunnel session and validates transport counters plus stats growth across multiple packets.
-- Outbound transport sends now perform a bounded reconnect with backoff before failing if the authenticated datagram send hits an I/O error.
-- It still does not implement cookie replies, rekeying, or reconnect recovery beyond outbound send failures yet.
+- Bounded reconnect with backoff now covers outbound payload sends, receive-loop transport failures, and periodic keepalive send failures.
+- It still does not implement cookie replies, rekeying, or endpoint roaming yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
@@ -131,7 +131,7 @@ It can also emit a deterministic initiation packet dump for side-by-side compari
 ## Phase A status
 
 Phase A is currently defined around a manager-first control plane. Tesla integration is intentionally deferred until later milestones.
-Milestones 0 through 4 are now complete. Milestone 5 is the active implementation slice.
+Milestones 0 through 5 are now complete. Milestone 6 is the next implementation slice.
 
 Implemented:
 - sysmodule control stub
@@ -149,7 +149,7 @@ Implemented:
 - authenticated transport payload validation plus live receive-side stats
 - session-scoped send/receive of authenticated transport payload packets through `swg:ctl`
 - repeated app-session authenticated packet traffic validated on the host regression path
-- bounded reconnect with backoff on outbound authenticated transport send failure
+- bounded reconnect with backoff on outbound sends plus receive-side and periodic-keepalive transport failures
 
 ## App integration
 
@@ -167,6 +167,7 @@ When tunnel traffic is routed through the sysmodule, the same session can now se
 
 Next:
 - manager UX expansion
-- WireGuard cookie reply handling and broader reconnect/rekey policy on top of the current repeated packet path
+- Milestone 6 completion work: round out the homebrew SDK surface with DNS resolve helpers and a concrete usage example
+- WireGuard cookie reply handling and later rekey or roaming work on top of the current repeated packet path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

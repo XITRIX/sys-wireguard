@@ -381,9 +381,16 @@ class LocalHandshakeResponder {
 
 class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRuntime {
  public:
+  enum class FailureMode : std::uint32_t {
+    OutboundSendOnce = 0,
+    ReceiveOnceAfterHandshake,
+    KeepaliveSendOnce,
+  };
+
   explicit ScriptedReconnectSocketRuntime(swg::sysmodule::PreparedTunnelEndpoint endpoint,
-                                          std::vector<std::uint8_t> expected_payload)
-      : endpoint_(std::move(endpoint)), expected_payload_(std::move(expected_payload)) {
+                                          std::vector<std::uint8_t> expected_payload,
+                                          FailureMode failure_mode = FailureMode::OutboundSendOnce)
+      : endpoint_(std::move(endpoint)), expected_payload_(std::move(expected_payload)), failure_mode_(failure_mode) {
     responder_config_result_ = MakeHandshakeResponderConfig();
   }
 
@@ -402,6 +409,8 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
     pending_response_.clear();
     current_response_.reset();
     active_socket_ = -1;
+    awaiting_post_handshake_keepalive_ = false;
+    pending_receive_failure_ = false;
   }
 
   [[nodiscard]] bool IsStarted() const override {
@@ -450,6 +459,7 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
         current_response_ = response.value;
         active_socket_ = socket_fd;
         awaiting_post_handshake_keepalive_ = true;
+        pending_receive_failure_ = false;
         ++handshake_count_;
         return swg::MakeSuccess(size);
       }
@@ -471,10 +481,21 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
                                                  "scripted runtime expected the post-handshake keepalive first");
           }
           awaiting_post_handshake_keepalive_ = false;
+          if (failure_mode_ == FailureMode::ReceiveOnceAfterHandshake && !receive_failure_triggered_) {
+            pending_receive_failure_ = true;
+          }
           return swg::MakeSuccess(size);
         }
 
-        if (!failed_send_once_) {
+        if (failure_mode_ == FailureMode::KeepaliveSendOnce && packet.value.payload.empty() &&
+            !keepalive_send_failure_triggered_) {
+          keepalive_send_failure_triggered_ = true;
+          return swg::MakeFailure<std::size_t>(swg::ErrorCode::IoError,
+                                               "scripted periodic keepalive failure to trigger reconnect");
+        }
+
+        if (failure_mode_ == FailureMode::OutboundSendOnce && !outbound_send_failure_triggered_) {
+          outbound_send_failure_triggered_ = true;
           failed_send_once_ = true;
           return swg::MakeFailure<std::size_t>(swg::ErrorCode::IoError,
                                                "scripted outbound transport failure to trigger reconnect");
@@ -511,6 +532,14 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
       return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::IoError,
                                                                    "scripted runtime received from an unexpected socket");
     }
+    if (failure_mode_ == FailureMode::ReceiveOnceAfterHandshake && pending_receive_failure_ &&
+        !receive_failure_triggered_) {
+      receive_failure_triggered_ = true;
+      pending_receive_failure_ = false;
+      return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(
+          swg::ErrorCode::IoError,
+          "scripted receive failure to trigger reconnect");
+    }
     if (pending_response_.empty()) {
       return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::IoError,
                                                                    "recv timed out after " + std::to_string(timeout_ms) + "ms");
@@ -541,6 +570,16 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
     return outbound_payload_validated_;
   }
 
+  [[nodiscard]] bool receive_failure_triggered() const {
+    std::scoped_lock lock(mutex_);
+    return receive_failure_triggered_;
+  }
+
+  [[nodiscard]] bool keepalive_send_failure_triggered() const {
+    std::scoped_lock lock(mutex_);
+    return keepalive_send_failure_triggered_;
+  }
+
   [[nodiscard]] std::uint32_t handshake_count() const {
     std::scoped_lock lock(mutex_);
     return handshake_count_;
@@ -549,6 +588,7 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
  private:
   swg::sysmodule::PreparedTunnelEndpoint endpoint_{};
   std::vector<std::uint8_t> expected_payload_{};
+  FailureMode failure_mode_ = FailureMode::OutboundSendOnce;
   swg::Result<swg::WireGuardResponderConfig> responder_config_result_ =
       swg::MakeFailure<swg::WireGuardResponderConfig>(swg::ErrorCode::InvalidState, "not initialized");
   mutable std::mutex mutex_{};
@@ -559,7 +599,11 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
   mutable std::vector<std::uint8_t> pending_response_{};
   mutable std::uint32_t handshake_count_ = 0;
   mutable bool awaiting_post_handshake_keepalive_ = false;
+  mutable bool pending_receive_failure_ = false;
   mutable bool failed_send_once_ = false;
+  mutable bool outbound_send_failure_triggered_ = false;
+  mutable bool receive_failure_triggered_ = false;
+  mutable bool keepalive_send_failure_triggered_ = false;
   mutable bool outbound_payload_validated_ = false;
 };
 
@@ -1632,6 +1676,127 @@ bool TestEngineReconnectAfterSendFailure() {
   return ok;
 }
 
+bool TestEngineReconnectAfterReceiveFailure() {
+  const swg::Config valid_config = MakeValidConfig("127.0.0.1", 51820);
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for receive reconnect test");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for receive reconnect test");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  const std::vector<std::uint8_t> payload = {0x52, 0x45, 0x43, 0x56, 0x01};
+  auto runtime = std::make_unique<ScriptedReconnectSocketRuntime>(
+      prepared.value.endpoint, payload, ScriptedReconnectSocketRuntime::FailureMode::ReceiveOnceAfterHandshake);
+  ScriptedReconnectSocketRuntime* runtime_ptr = runtime.get();
+  auto engine = swg::sysmodule::CreateWgTunnelEngine(std::move(runtime));
+
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(start_error.ok(), "engine start must succeed before receive reconnect testing");
+  if (!start_error.ok()) {
+    return false;
+  }
+
+  bool reconnect_observed = false;
+  swg::TunnelStats reconnect_stats{};
+  for (int attempt = 0; attempt < 40; ++attempt) {
+    reconnect_stats = engine->GetStats();
+    if (reconnect_stats.reconnects == 1 && reconnect_stats.successful_handshakes == 2) {
+      reconnect_observed = true;
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  ok &= Require(reconnect_observed, "engine must reconnect after a receive-side transport failure");
+  ok &= Require(runtime_ptr->receive_failure_triggered(),
+                "scripted runtime must trigger the receive-side reconnect failure path");
+  ok &= Require(runtime_ptr->handshake_count() == 2,
+                "scripted runtime must observe a second handshake after receive-side reconnect");
+
+  const auto counter = engine->SendPacket(payload);
+  ok &= Require(counter.ok(), "engine must send successfully after receive-side reconnect");
+  if (counter.ok()) {
+    ok &= Require(counter.value == 1,
+                  "first payload send after a receive-side reconnect must restart the transport counter");
+  }
+  ok &= Require(runtime_ptr->outbound_payload_validated(),
+                "scripted runtime must validate the outbound payload after receive-side reconnect");
+  ok &= Require(engine->IsRunning(), "engine must still report running after receive-side reconnect");
+  ok &= Require(engine->Stop().ok(), "engine stop must succeed after receive reconnect test");
+  return ok;
+}
+
+bool TestEngineReconnectAfterKeepaliveFailure() {
+  swg::Config valid_config = MakeValidConfig("127.0.0.1", 51820);
+  valid_config.profiles.at("default").persistent_keepalive = 1;
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for keepalive reconnect test");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for keepalive reconnect test");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  const std::vector<std::uint8_t> payload = {0x4b, 0x45, 0x45, 0x50, 0x01};
+  auto runtime = std::make_unique<ScriptedReconnectSocketRuntime>(
+      prepared.value.endpoint, payload, ScriptedReconnectSocketRuntime::FailureMode::KeepaliveSendOnce);
+  ScriptedReconnectSocketRuntime* runtime_ptr = runtime.get();
+  auto engine = swg::sysmodule::CreateWgTunnelEngine(std::move(runtime));
+
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(start_error.ok(), "engine start must succeed before keepalive reconnect testing");
+  if (!start_error.ok()) {
+    return false;
+  }
+
+  bool reconnect_observed = false;
+  swg::TunnelStats reconnect_stats{};
+  for (int attempt = 0; attempt < 60; ++attempt) {
+    reconnect_stats = engine->GetStats();
+    if (reconnect_stats.reconnects == 1 && reconnect_stats.successful_handshakes == 2) {
+      reconnect_observed = true;
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  ok &= Require(reconnect_observed, "engine must reconnect after a periodic keepalive send failure");
+  ok &= Require(runtime_ptr->keepalive_send_failure_triggered(),
+                "scripted runtime must trigger the keepalive reconnect failure path");
+  ok &= Require(runtime_ptr->handshake_count() == 2,
+                "scripted runtime must observe a second handshake after keepalive reconnect");
+
+  const auto counter = engine->SendPacket(payload);
+  ok &= Require(counter.ok(), "engine must send successfully after keepalive reconnect");
+  if (counter.ok()) {
+    ok &= Require(counter.value == 1,
+                  "first payload send after a keepalive reconnect must restart the transport counter");
+  }
+  ok &= Require(runtime_ptr->outbound_payload_validated(),
+                "scripted runtime must validate the outbound payload after keepalive reconnect");
+  ok &= Require(engine->IsRunning(), "engine must still report running after keepalive reconnect");
+  ok &= Require(engine->Stop().ok(), "engine stop must succeed after keepalive reconnect test");
+  return ok;
+}
+
 bool TestMoonlightRoutePlanning() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-moonlight";
   std::error_code filesystem_error;
@@ -1718,6 +1883,8 @@ int main() {
   const bool app_session_recv_ok = TestAppSessionReceivePacket();
   const bool sustained_app_session_ok = TestAppSessionSustainedTraffic();
   const bool reconnect_ok = TestEngineReconnectAfterSendFailure();
+  const bool receive_reconnect_ok = TestEngineReconnectAfterReceiveFailure();
+  const bool keepalive_reconnect_ok = TestEngineReconnectAfterKeepaliveFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
@@ -1725,7 +1892,7 @@ int main() {
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
-          moonlight_ok)
+          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok)
              ? 0
              : 1;
 }

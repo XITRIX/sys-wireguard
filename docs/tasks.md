@@ -27,6 +27,7 @@
 - The control plane now also exposes outbound authenticated transport through `swg:ctl::SendPacket`, `Client::SendPacket()`, and `AppSession::SendPacket()`, and host regression coverage now validates an app-session payload end to end against a local responder.
 - Host regression coverage now also exercises repeated app-session authenticated send/receive traffic across a single connected session and validates transport counters plus stats growth over multiple packets.
 - The engine now performs a bounded reconnect with backoff when an outbound authenticated transport send hits an I/O failure, and a scripted host runtime test verifies that it re-handshakes and retries the payload successfully.
+- The engine now also routes receive-loop transport failures and periodic keepalive send failures through the same bounded reconnect path, with scripted host runtime tests covering both recovery triggers.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -39,8 +40,8 @@
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Add WireGuard cookie reply handling on top of the current one-shot handshake path.
-- Validate the repeated authenticated packet path on-device and tighten session-liveness rules around it.
-- Expand reconnect handling beyond outbound send failures so receive-side and idle-liveness failures can recover too.
+- Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
+- Start the Milestone 6 slice by adding tunnel-aware DNS resolve helpers to the SDK surface.
 - Add real tunnel-aware DNS resolution results for app consumers.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.
