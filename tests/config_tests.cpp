@@ -17,10 +17,12 @@
 #include "swg/client.h"
 #include "swg/config.h"
 #include "swg/ipc_codec.h"
+#include "swg/ipv4_tcp.h"
 #include "swg/moonlight.h"
 #include "swg/session_socket.h"
 #include "swg/state_machine.h"
 #include "swg/tunnel_datagram.h"
+#include "swg/tunnel_stream.h"
 #include "swg/tunnel_dns.h"
 #include "swg/wg_crypto.h"
 #include "swg/wg_handshake.h"
@@ -2289,6 +2291,155 @@ bool TestTunnelDatagramSocket() {
   return ok;
 }
 
+bool TestTunnelStreamSocket() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-tunnel-stream";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelStreamSourcePort = 30000;
+  constexpr std::uint16_t kMoonlightHttpsPort = 47984;
+  constexpr std::uint32_t kExpectedFirstTunnelStreamInitialSequence = 0x53570000u;
+  constexpr std::uint32_t kRemoteInitialSequence = 0x40000000u;
+
+  const std::vector<std::uint8_t> request_payload = {'G', 'E', 'T', ' ', '/', 's', 'e', 'r', 'v', 'e', 'r'};
+  const std::vector<std::uint8_t> response_payload = {'O', 'K', ' ', 'M', 'O', 'O', 'N', 'L', 'I', 'G', 'H', 'T'};
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.44", "remote_address");
+  if (!Require(local_address.ok(), "tunnel stream local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "tunnel stream remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4TcpPacketEndpoint endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, endpoint.destination_ipv4.begin());
+  endpoint.source_port = kExpectedFirstTunnelStreamSourcePort;
+  endpoint.destination_port = kMoonlightHttpsPort;
+
+  swg::Ipv4TcpPacket syn{};
+  syn.endpoint = endpoint;
+  syn.sequence_number = kExpectedFirstTunnelStreamInitialSequence;
+  syn.flags = swg::ToFlags(swg::TcpControlFlag::Syn);
+
+  swg::Ipv4TcpPacket synack{};
+  synack.endpoint.source_ipv4 = endpoint.destination_ipv4;
+  synack.endpoint.destination_ipv4 = endpoint.source_ipv4;
+  synack.endpoint.source_port = endpoint.destination_port;
+  synack.endpoint.destination_port = endpoint.source_port;
+  synack.sequence_number = kRemoteInitialSequence;
+  synack.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket ack{};
+  ack.endpoint = endpoint;
+  ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket request{};
+  request.endpoint = endpoint;
+  request.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  request.acknowledgment_number = kRemoteInitialSequence + 1u;
+  request.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  request.payload = request_payload;
+
+  swg::Ipv4TcpPacket response{};
+  response.endpoint = synack.endpoint;
+  response.sequence_number = kRemoteInitialSequence + 1u;
+  response.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u +
+                                   static_cast<std::uint32_t>(request_payload.size());
+  response.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  response.payload = response_payload;
+
+  swg::Ipv4TcpPacket response_ack{};
+  response_ack.endpoint = endpoint;
+  response_ack.sequence_number = response.acknowledgment_number;
+  response_ack.acknowledgment_number = kRemoteInitialSequence + 1u + static_cast<std::uint32_t>(response_payload.size());
+  response_ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  const auto syn_packet = swg::BuildIpv4TcpPacket(syn);
+  const auto synack_packet = swg::BuildIpv4TcpPacket(synack);
+  const auto ack_packet = swg::BuildIpv4TcpPacket(ack);
+  const auto request_packet = swg::BuildIpv4TcpPacket(request);
+  const auto response_packet = swg::BuildIpv4TcpPacket(response);
+  const auto response_ack_packet = swg::BuildIpv4TcpPacket(response_ack);
+  if (!Require(syn_packet.ok(), "tunnel stream SYN packet must build") ||
+      !Require(synack_packet.ok(), "tunnel stream SYN-ACK packet must build") ||
+      !Require(ack_packet.ok(), "tunnel stream ACK packet must build") ||
+      !Require(request_packet.ok(), "tunnel stream request packet must build") ||
+      !Require(response_packet.ok(), "tunnel stream response packet must build") ||
+      !Require(response_ack_packet.ok(), "tunnel stream response ACK packet must build")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(0, 0,
+                                    std::vector<std::vector<std::uint8_t>>{synack_packet.value, response_packet.value},
+                                    std::vector<std::vector<std::uint8_t>>{syn_packet.value, ack_packet.value,
+                                                                           request_packet.value, response_ack_packet.value});
+  if (!Require(responder.ready(), "local handshake responder must start for tunnel stream tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before tunnel stream tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel stream tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto local_bypass = session.OpenTunnelStream(
+      swg::MakeMoonlightHttpsControlStreamRequest("192.168.1.50", kMoonlightHttpsPort));
+  ok &= Require(!local_bypass.ok(), "local-network HTTPS control traffic should not open a tunnel stream");
+
+  const auto control_stream = swg::TunnelStreamSocket::Open(
+      session, swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", kMoonlightHttpsPort));
+  ok &= Require(control_stream.ok(), "Moonlight HTTPS control tunnel stream must open");
+  if (!control_stream.ok()) {
+    return false;
+  }
+
+  ok &= Require(control_stream.value.info().local_port == kExpectedFirstTunnelStreamSourcePort,
+                "first tunnel stream handle must use the expected deterministic local TCP source port");
+  ok &= Require(control_stream.value.info().remote_address == "203.0.113.44",
+                "tunnel stream info must report the resolved remote IPv4 address");
+
+  const auto send_counter = control_stream.value.Send(request_payload);
+  ok &= Require(send_counter.ok(), "tunnel stream send must succeed");
+  if (send_counter.ok()) {
+    ok &= Require(send_counter.value == 3,
+                  "first outbound stream payload must follow the SYN and ACK transport packets");
+  }
+
+  const auto received = control_stream.value.Receive();
+  ok &= Require(received.ok(), "tunnel stream receive must return the queued response payload");
+  if (received.ok()) {
+    ok &= Require(!received.value.peer_closed,
+                  "tunnel stream response should keep the peer connection open in the happy path");
+    ok &= Require(received.value.payload == response_payload,
+                  "tunnel stream receive must return the inner TCP payload bytes");
+  }
+
+  const auto empty = control_stream.value.Receive();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "tunnel stream receive must report an empty queue after consuming the response payload");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must validate the tunnel stream exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after tunnel stream tests");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -2320,6 +2471,7 @@ int main() {
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
   const bool tunnel_datagram_ok = TestTunnelDatagramSocket();
+  const bool tunnel_stream_ok = TestTunnelStreamSocket();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
@@ -2327,7 +2479,7 @@ int main() {
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && tunnel_dns_codec_ok && dns_resolution_ok &&
-          session_socket_ok && tunnel_datagram_ok)
+          session_socket_ok && tunnel_datagram_ok && tunnel_stream_ok)
              ? 0
              : 1;
 }

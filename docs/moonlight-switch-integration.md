@@ -24,6 +24,7 @@ Core pieces:
 - `Client::OpenAppSession()` / `CloseAppSession()` / `GetNetworkPlan()` / `ResolveDns()` / `SendPacket()` / `RecvPacket()`
 - `AppSession::ResolveDns()` / `SendPacket()` / `ReceivePacket()` for DNS policy checks plus authenticated payload movement once tunnel traffic is flowing
 - `swg::TunnelDatagramSocket` for real UDP payload movement over the active tunnel with per-handle remote endpoint metadata
+- `swg::TunnelStreamSocket` for real TCP byte-stream movement over the active tunnel with per-handle remote endpoint metadata
 - `swg::SessionSocket` for a route-aware wrapper that collapses plan + DNS + packet-channel usage into one SDK object
 
 Moonlight helpers:
@@ -64,6 +65,13 @@ For a Moonlight session:
 - `Send()` wraps caller payloads as inner IPv4/UDP packets and forwards them through WireGuard
 - `Receive()` filters the inbound WireGuard payload queue and returns only UDP packets that match the handle's remote IPv4/port and local source port
 
+`TunnelStreamSocket` now behaves like this:
+- it opens only when the app session, active profile, and route policy all agree that the TCP or HTTPS flow must use the connected tunnel
+- it resolves hostname targets to one IPv4 address before opening, binds a stable tunnel-side source TCP port, and seeds a deterministic initial send sequence
+- `Open()` performs a simple SYN, SYN-ACK, ACK handshake against the remote inner IPv4/TCP endpoint over WireGuard
+- `Send()` emits inner IPv4/TCP PSH+ACK segments through WireGuard and advances the tracked local send sequence
+- `Receive()` filters inbound WireGuard payloads to the matching inner IPv4/TCP flow, acknowledges in-order payload or FIN segments, and returns the inner TCP payload plus peer-close state
+
 If Moonlight opens a session that requires the tunnel, remote traffic will fail closed until the selected profile is connected.
 
 ## Example usage
@@ -88,6 +96,8 @@ auto video_tunnel = swg::TunnelDatagramSocket::Open(
   session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", 47998));
 auto control_socket = swg::SessionSocket::OpenStream(
   session, swg::MakeMoonlightHttpsControlSocketRequest("pc.example.net", 47984));
+auto control_tunnel = swg::TunnelStreamSocket::Open(
+  session, swg::MakeMoonlightHttpsControlStreamRequest("pc.example.net", 47984));
 ```
 
 Moonlight can keep using its own sockets and libcurl. The sysmodule decides whether that traffic should go direct, require the tunnel, or wait for the tunnel to come up.
@@ -97,18 +107,19 @@ The packet API is intentionally narrow: it gives a Moonlight-side shim one place
 For Moonlight adoption, the intended split is now:
 - discovery, Wake-on-LAN, and STUN stay on Moonlight's native direct sockets
 - video, audio, and input can move onto `TunnelDatagramSocket`
-- HTTPS control and TCP control still need a stronger stream/TCP transport than the current framed packet wrapper
+- HTTPS control and TCP control can move onto `TunnelStreamSocket`, with TLS or HTTP layered above that byte stream on the app side
 
 The DNS helper is still intentionally narrow: it now executes IPv4 A-record DNS queries through the tunnel transport, but it does not yet cover AAAA lookups, TCP fallback, caching, or transparent resolver interception.
 
 The Switch integration app now uses the active profile `endpoint_host` as its live DNS and socket-helper target. If that field is a numeric endpoint, the app skips the DNS probe instead of querying the old placeholder hostname.
 
-The stream wrapper is intentionally staged too: in tunnel mode it exposes framed payload flow over the current session packet channel, not a native TCP stack or transparent HTTPS transport.
+`SessionSocket::OpenStream()` is still intentionally staged: in tunnel mode it exposes framed payload flow over the current session packet channel, not a native TCP stack or transparent HTTPS transport. Moonlight-ready TCP flows should use `TunnelStreamSocket` instead.
 
 ## Next steps for real integration
 
 - wire Moonlight video/audio/input UDP paths to `TunnelDatagramSocket`
-- add the TCP/HTTPS control transport needed for pairing, app launch, and stream-control flows
+- wire Moonlight pairing, app-launch, and stream-control TCP flows to `TunnelStreamSocket`
+- decide whether to add an SDK TLS helper above `TunnelStreamSocket` or adapt Moonlight's existing HTTPS layer directly
 - expand tunnel DNS beyond the current IPv4 A-record path
 - add per-title policy so Moonlight NSP forwarders can opt into the tunnel automatically
 - add transparent DNS and later `bsd:u` interception as an optional fast path

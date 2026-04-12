@@ -7,6 +7,7 @@
 #include "swg/ipc_protocol.h"
 #include "swg/session_socket.h"
 #include "swg/tunnel_datagram.h"
+#include "swg/tunnel_stream.h"
 
 namespace swg {
 
@@ -196,6 +197,28 @@ inline TunnelDatagramOpenRequest MakeMoonlightInputDatagramRequest(std::string r
   request.remote_host = std::move(remote_host);
   request.remote_port = remote_port;
   request.traffic_class = AppTrafficClass::StreamInput;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline TunnelStreamOpenRequest MakeMoonlightHttpsControlStreamRequest(std::string remote_host,
+                                                                      std::uint16_t remote_port) {
+  TunnelStreamOpenRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Https;
+  request.traffic_class = AppTrafficClass::HttpsControl;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline TunnelStreamOpenRequest MakeMoonlightStreamControlStreamRequest(std::string remote_host,
+                                                                       std::uint16_t remote_port) {
+  TunnelStreamOpenRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Tcp;
+  request.traffic_class = AppTrafficClass::StreamControl;
   request.route_preference = RoutePreference::RequireTunnel;
   return request;
 }

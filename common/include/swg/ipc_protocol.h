@@ -48,6 +48,10 @@ enum class ServiceCommandId : std::uint32_t {
   CloseTunnelDatagram,
   RecvTunnelDatagram,
   SendTunnelDatagram,
+  OpenTunnelStream,
+  CloseTunnelStream,
+  RecvTunnelStream,
+  SendTunnelStream,
 };
 
 enum class TunnelState : std::uint32_t {
@@ -271,6 +275,46 @@ struct TunnelDatagram {
   std::uint64_t counter = 0;
   std::string remote_address;
   std::uint16_t remote_port = 0;
+  std::vector<std::uint8_t> payload;
+};
+
+struct TunnelStreamOpenRequest {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t session_id = 0;
+  std::string remote_host;
+  std::uint16_t remote_port = 0;
+  TransportProtocol transport = TransportProtocol::Tcp;
+  AppTrafficClass traffic_class = AppTrafficClass::Generic;
+  RoutePreference route_preference = RoutePreference::RequireTunnel;
+  bool local_network_hint = false;
+};
+
+struct TunnelStreamInfo {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t stream_id = 0;
+  std::uint64_t session_id = 0;
+  TransportProtocol transport = TransportProtocol::Tcp;
+  AppTrafficClass traffic_class = AppTrafficClass::Generic;
+  std::string profile_name;
+  std::string remote_host;
+  std::string remote_address;
+  std::uint16_t remote_port = 0;
+  std::string local_address;
+  std::uint16_t local_port = 0;
+  std::string message;
+};
+
+struct TunnelStreamSendRequest {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t stream_id = 0;
+  std::vector<std::uint8_t> payload;
+};
+
+struct TunnelStreamReadResult {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t stream_id = 0;
+  std::uint64_t counter = 0;
+  bool peer_closed = false;
   std::vector<std::uint8_t> payload;
 };
 

@@ -16,6 +16,7 @@
 
 #include "swg/config.h"
 #include "swg/hos_caps.h"
+#include "swg/ipv4_tcp.h"
 #include "swg/log.h"
 #include "swg/state_machine.h"
 #include "swg/tunnel_dns.h"
@@ -49,6 +50,24 @@ struct TunnelDatagramHandleRecord {
   std::array<std::uint8_t, 4> local_ipv4{};
 };
 
+struct TunnelStreamHandleRecord {
+  std::uint64_t stream_id = 0;
+  std::uint64_t session_id = 0;
+  TransportProtocol transport = TransportProtocol::Tcp;
+  AppTrafficClass traffic_class = AppTrafficClass::Generic;
+  std::string selected_profile;
+  std::string remote_host;
+  std::string remote_address;
+  std::uint16_t remote_port = 0;
+  std::string local_address;
+  std::uint16_t local_port = 0;
+  std::array<std::uint8_t, 4> remote_ipv4{};
+  std::array<std::uint8_t, 4> local_ipv4{};
+  std::uint32_t next_send_sequence = 0;
+  std::uint32_t next_expected_remote_sequence = 0;
+  bool peer_closed = false;
+};
+
 struct TunnelDnsLookupResult {
   bool resolved = false;
   std::vector<std::string> addresses;
@@ -61,8 +80,13 @@ constexpr std::uint16_t kTunnelDnsSourcePortSpan = 20000;
 constexpr std::uint16_t kTunnelDnsDestinationPort = 53;
 constexpr std::uint16_t kTunnelDatagramSourcePortBase = 20000;
 constexpr std::uint16_t kTunnelDatagramSourcePortSpan = 10000;
+constexpr std::uint16_t kTunnelStreamSourcePortBase = 30000;
+constexpr std::uint16_t kTunnelStreamSourcePortSpan = 10000;
+constexpr std::uint32_t kTunnelStreamInitialSequenceBase = 0x53570000u;
 constexpr std::chrono::milliseconds kTunnelDnsPollInterval(25);
 constexpr int kTunnelDnsPollAttemptsPerServer = 40;
+constexpr std::chrono::milliseconds kTunnelStreamConnectPollInterval(25);
+constexpr int kTunnelStreamConnectPollAttempts = 40;
 
 Result<std::vector<std::string>> ResolveIpv4HostAddrs(std::string_view hostname) {
   addrinfo hints{};
@@ -597,6 +621,7 @@ class LocalControlService final : public IControlService {
     }
 
     RemoveTunnelDatagramsForSessionLocked(session_id);
+    RemoveTunnelStreamsForSessionLocked(session_id);
     app_sessions_.erase(it);
     LogInfo("sysmodule", "closed app session " + std::to_string(session_id));
     return Error::None();
@@ -906,6 +931,263 @@ class LocalControlService final : public IControlService {
     return PopTunnelDatagramLocked(datagram_it->second);
   }
 
+  Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) override {
+    if (request.remote_host.empty()) {
+      return MakeFailure<TunnelStreamInfo>(ErrorCode::ParseError, "remote_host must not be empty");
+    }
+    if (request.remote_port == 0) {
+      return MakeFailure<TunnelStreamInfo>(ErrorCode::ParseError, "remote_port must not be zero");
+    }
+
+    AppSessionRecord session{};
+    StateSnapshot snapshot{};
+    RuntimeFlags granted_flags = 0;
+    RuntimeFlags active_runtime_flags = 0;
+    ProfileConfig selected_profile{};
+    bool have_selected_profile = false;
+    {
+      std::scoped_lock lock(mutex_);
+      const auto session_it = app_sessions_.find(request.session_id);
+      if (session_it == app_sessions_.end()) {
+        return MakeFailure<TunnelStreamInfo>(ErrorCode::NotFound,
+                                             "app session not found: " + std::to_string(request.session_id));
+      }
+
+      session = session_it->second;
+      snapshot = state_machine_.snapshot();
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      active_runtime_flags = config_.runtime_flags;
+
+      const auto profile_it = config_.profiles.find(session.selected_profile);
+      if (profile_it != config_.profiles.end()) {
+        selected_profile = profile_it->second;
+        have_selected_profile = true;
+      }
+    }
+
+    NetworkPlanRequest plan_request{};
+    plan_request.session_id = request.session_id;
+    plan_request.remote_host = request.remote_host;
+    plan_request.remote_port = request.remote_port;
+    plan_request.transport = request.transport;
+    plan_request.traffic_class = request.traffic_class;
+    plan_request.route_preference = request.route_preference;
+    plan_request.local_network_hint = request.local_network_hint;
+
+    const NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, plan_request);
+    if (plan.action != RouteAction::Tunnel) {
+      return MakeFailure<TunnelStreamInfo>(ErrorCode::Unsupported,
+                                           "tunnel stream requires a tunnel route: " + plan.reason);
+    }
+
+    if (!have_selected_profile) {
+      return MakeFailure<TunnelStreamInfo>(ErrorCode::NotFound,
+                                           "selected profile not found for tunnel stream open");
+    }
+
+    const Result<PreparedTunnelSession> prepared_session =
+        PrepareSelectedTunnelSession(session.selected_profile, selected_profile, active_runtime_flags);
+    if (!prepared_session.ok()) {
+      return MakeFailure<TunnelStreamInfo>(prepared_session.error.code, prepared_session.error.message);
+    }
+
+    const Result<std::array<std::uint8_t, 4>> remote_ipv4 =
+        ResolveTunnelRemoteIpv4(request.session_id, prepared_session.value, request.remote_host);
+    if (!remote_ipv4.ok()) {
+      return MakeFailure<TunnelStreamInfo>(remote_ipv4.error.code, remote_ipv4.error.message);
+    }
+
+    TunnelStreamHandleRecord stream{};
+    {
+      std::scoped_lock lock(mutex_);
+      const auto session_it = app_sessions_.find(request.session_id);
+      if (session_it == app_sessions_.end()) {
+        return MakeFailure<TunnelStreamInfo>(ErrorCode::NotFound,
+                                             "app session not found during tunnel stream open");
+      }
+
+      const StateSnapshot live_snapshot = state_machine_.snapshot();
+      if (!SessionUsesActiveTunnelLocked(session_it->second, live_snapshot)) {
+        return MakeFailure<TunnelStreamInfo>(ErrorCode::InvalidState,
+                                             "tunnel is not connected for tunnel stream open");
+      }
+
+      stream.stream_id = next_tunnel_stream_id_++;
+      stream.session_id = request.session_id;
+      stream.transport = request.transport;
+      stream.traffic_class = request.traffic_class;
+      stream.selected_profile = session_it->second.selected_profile;
+      stream.remote_host = request.remote_host;
+      stream.remote_address = FormatIpv4Address(remote_ipv4.value);
+      stream.remote_port = request.remote_port;
+      stream.local_address = FormatIpv4Address(prepared_session.value.interface_ipv4_addresses.front().address);
+      stream.local_port = ReserveTunnelStreamSourcePortLocked();
+      stream.remote_ipv4 = remote_ipv4.value;
+      stream.local_ipv4 = prepared_session.value.interface_ipv4_addresses.front().address;
+      stream.next_send_sequence = ReserveTunnelStreamInitialSequenceLocked();
+      stream.next_expected_remote_sequence = 0;
+    }
+
+    const Result<std::uint64_t> syn_counter = SendTunnelStreamPacket(stream, ToFlags(TcpControlFlag::Syn), {});
+    if (!syn_counter.ok()) {
+      return MakeFailure<TunnelStreamInfo>(syn_counter.error.code, syn_counter.error.message);
+    }
+
+    bool connected = false;
+    for (int attempt = 0; attempt < kTunnelStreamConnectPollAttempts; ++attempt) {
+      Result<TunnelPacket> packet = MakeFailure<TunnelPacket>(ErrorCode::NotFound, "no packet available");
+      {
+        std::scoped_lock lock(mutex_);
+        const auto session_it = app_sessions_.find(request.session_id);
+        if (session_it == app_sessions_.end()) {
+          return MakeFailure<TunnelStreamInfo>(ErrorCode::NotFound,
+                                               "app session not found during tunnel stream connect");
+        }
+
+        const StateSnapshot live_snapshot = state_machine_.snapshot();
+        if (!SessionUsesActiveTunnelLocked(session_it->second, live_snapshot)) {
+          return MakeFailure<TunnelStreamInfo>(ErrorCode::InvalidState,
+                                               "tunnel disconnected while opening tunnel stream");
+        }
+
+        packet = PopEnginePacketLocked();
+      }
+
+      if (!packet.ok()) {
+        if (packet.error.code != ErrorCode::NotFound) {
+          return MakeFailure<TunnelStreamInfo>(packet.error.code, packet.error.message);
+        }
+
+        std::this_thread::sleep_for(kTunnelStreamConnectPollInterval);
+        continue;
+      }
+
+      Ipv4TcpPacket segment{};
+      if (!TryMatchTunnelStreamPacket(stream, packet.value, &segment) ||
+          !HasFlag(segment.flags, TcpControlFlag::Syn) ||
+          !HasFlag(segment.flags, TcpControlFlag::Ack) ||
+          segment.acknowledgment_number != stream.next_send_sequence + 1u) {
+        std::scoped_lock lock(mutex_);
+        DeferPacketLocked(std::move(packet.value));
+        continue;
+      }
+
+      stream.next_send_sequence += 1u;
+      stream.next_expected_remote_sequence = segment.sequence_number + 1u;
+      connected = true;
+      break;
+    }
+
+    if (!connected) {
+      return MakeFailure<TunnelStreamInfo>(ErrorCode::ServiceUnavailable,
+                                           "timed out waiting for tunnel stream SYN-ACK");
+    }
+
+    const Result<std::uint64_t> ack_counter = SendTunnelStreamPacket(stream, ToFlags(TcpControlFlag::Ack), {});
+    if (!ack_counter.ok()) {
+      return MakeFailure<TunnelStreamInfo>(ack_counter.error.code, ack_counter.error.message);
+    }
+
+    TunnelStreamInfo info{};
+    {
+      std::scoped_lock lock(mutex_);
+      tunnel_streams_[stream.stream_id] = stream;
+
+      info.stream_id = stream.stream_id;
+      info.session_id = stream.session_id;
+      info.transport = stream.transport;
+      info.traffic_class = stream.traffic_class;
+      info.profile_name = stream.selected_profile;
+      info.remote_host = stream.remote_host;
+      info.remote_address = stream.remote_address;
+      info.remote_port = stream.remote_port;
+      info.local_address = stream.local_address;
+      info.local_port = stream.local_port;
+      info.message = plan.reason + "; tunnel TCP stream handshake completed";
+    }
+
+    return MakeSuccess(std::move(info));
+  }
+
+  Error CloseTunnelStream(std::uint64_t stream_id) override {
+    std::scoped_lock lock(mutex_);
+
+    const auto it = tunnel_streams_.find(stream_id);
+    if (it == tunnel_streams_.end()) {
+      return MakeError(ErrorCode::NotFound, "tunnel stream not found: " + std::to_string(stream_id));
+    }
+
+    if (tunnel_engine_->IsRunning()) {
+      static_cast<void>(SendTunnelStreamPacket(it->second, ToFlags(TcpControlFlag::Fin) | ToFlags(TcpControlFlag::Ack), {}));
+    }
+
+    tunnel_streams_.erase(it);
+    return Error::None();
+  }
+
+  Result<std::uint64_t> SendTunnelStream(const TunnelStreamSendRequest& request) override {
+    std::scoped_lock lock(mutex_);
+
+    if (request.payload.empty()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "tunnel stream payload must not be empty");
+    }
+
+    auto stream_it = tunnel_streams_.find(request.stream_id);
+    if (stream_it == tunnel_streams_.end()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::NotFound,
+                                        "tunnel stream not found: " + std::to_string(request.stream_id));
+    }
+
+    const auto session_it = app_sessions_.find(stream_it->second.session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::NotFound,
+                                        "app session not found for tunnel stream send");
+    }
+
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+      return MakeFailure<std::uint64_t>(ErrorCode::InvalidState,
+                                        "tunnel is not connected for tunnel stream send");
+    }
+    if (stream_it->second.peer_closed) {
+      return MakeFailure<std::uint64_t>(ErrorCode::InvalidState,
+                                        "tunnel stream peer has already closed the connection");
+    }
+
+    const Result<std::uint64_t> counter =
+        SendTunnelStreamPacket(stream_it->second, ToFlags(TcpControlFlag::Ack) | ToFlags(TcpControlFlag::Psh), request.payload);
+    if (!counter.ok()) {
+      return MakeFailure<std::uint64_t>(counter.error.code, counter.error.message);
+    }
+
+    stream_it->second.next_send_sequence += static_cast<std::uint32_t>(request.payload.size());
+    return counter;
+  }
+
+  Result<TunnelStreamReadResult> RecvTunnelStream(std::uint64_t stream_id) override {
+    std::scoped_lock lock(mutex_);
+
+    auto stream_it = tunnel_streams_.find(stream_id);
+    if (stream_it == tunnel_streams_.end()) {
+      return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound,
+                                                 "tunnel stream not found: " + std::to_string(stream_id));
+    }
+
+    const auto session_it = app_sessions_.find(stream_it->second.session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound,
+                                                 "app session not found for tunnel stream receive");
+    }
+
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+      return MakeFailure<TunnelStreamReadResult>(ErrorCode::InvalidState,
+                                                 "tunnel is not connected for tunnel stream receive");
+    }
+
+    return PopTunnelStreamReadLocked(&stream_it->second);
+  }
+
   Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) override {
     std::scoped_lock lock(mutex_);
 
@@ -1008,10 +1290,39 @@ class LocalControlService final : public IControlService {
     return next_tunnel_datagram_source_port_++;
   }
 
+  std::uint16_t ReserveTunnelStreamSourcePortLocked() const {
+    if (next_tunnel_stream_source_port_ < kTunnelStreamSourcePortBase ||
+        next_tunnel_stream_source_port_ >= kTunnelStreamSourcePortBase + kTunnelStreamSourcePortSpan) {
+      next_tunnel_stream_source_port_ = kTunnelStreamSourcePortBase;
+    }
+
+    return next_tunnel_stream_source_port_++;
+  }
+
+  std::uint32_t ReserveTunnelStreamInitialSequenceLocked() const {
+    if (next_tunnel_stream_initial_sequence_ < kTunnelStreamInitialSequenceBase) {
+      next_tunnel_stream_initial_sequence_ = kTunnelStreamInitialSequenceBase;
+    }
+
+    const std::uint32_t sequence = next_tunnel_stream_initial_sequence_;
+    next_tunnel_stream_initial_sequence_ += 0x1000u;
+    return sequence;
+  }
+
   void RemoveTunnelDatagramsForSessionLocked(std::uint64_t session_id) {
     for (auto it = tunnel_datagrams_.begin(); it != tunnel_datagrams_.end();) {
       if (it->second.session_id == session_id) {
         it = tunnel_datagrams_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void RemoveTunnelStreamsForSessionLocked(std::uint64_t session_id) {
+    for (auto it = tunnel_streams_.begin(); it != tunnel_streams_.end();) {
+      if (it->second.session_id == session_id) {
+        it = tunnel_streams_.erase(it);
       } else {
         ++it;
       }
@@ -1068,6 +1379,46 @@ class LocalControlService final : public IControlService {
     std::array<std::uint8_t, 4> remote_ipv4{};
     std::copy_n(resolved_address.value.bytes.begin(), 4, remote_ipv4.begin());
     return MakeSuccess(std::move(remote_ipv4));
+  }
+
+  Result<std::uint64_t> SendTunnelStreamPacket(const TunnelStreamHandleRecord& stream,
+                                               TcpControlFlags flags,
+                                               const std::vector<std::uint8_t>& payload) const {
+    Ipv4TcpPacket packet{};
+    packet.endpoint.source_ipv4 = stream.local_ipv4;
+    packet.endpoint.destination_ipv4 = stream.remote_ipv4;
+    packet.endpoint.source_port = stream.local_port;
+    packet.endpoint.destination_port = stream.remote_port;
+    packet.sequence_number = stream.next_send_sequence;
+    packet.acknowledgment_number = HasFlag(flags, TcpControlFlag::Ack) ? stream.next_expected_remote_sequence : 0u;
+    packet.flags = flags;
+    packet.payload = payload;
+
+    const Result<std::vector<std::uint8_t>> bytes = BuildIpv4TcpPacket(packet);
+    if (!bytes.ok()) {
+      return MakeFailure<std::uint64_t>(bytes.error.code, bytes.error.message);
+    }
+
+    return tunnel_engine_->SendPacket(bytes.value);
+  }
+
+  bool TryMatchTunnelStreamPacket(const TunnelStreamHandleRecord& stream,
+                                  const TunnelPacket& packet,
+                                  Ipv4TcpPacket* segment) const {
+    const Result<Ipv4TcpPacket> parsed = ParseIpv4TcpPacket(packet.payload);
+    if (!parsed.ok()) {
+      return false;
+    }
+
+    if (parsed.value.endpoint.source_ipv4 != stream.remote_ipv4 ||
+        parsed.value.endpoint.destination_ipv4 != stream.local_ipv4 ||
+        parsed.value.endpoint.source_port != stream.remote_port ||
+        parsed.value.endpoint.destination_port != stream.local_port) {
+      return false;
+    }
+
+    *segment = parsed.value;
+    return true;
   }
 
   bool TryMatchTunnelDatagramPacket(const TunnelDatagramHandleRecord& datagram,
@@ -1127,6 +1478,110 @@ class LocalControlService final : public IControlService {
 
       DeferPacketLocked(packet.value);
     }
+  }
+
+  Result<TunnelStreamReadResult> PopTunnelStreamReadLocked(TunnelStreamHandleRecord* stream) const {
+    std::deque<TunnelPacket> unmatched_deferred;
+    while (!deferred_packets_.empty()) {
+      TunnelPacket packet = std::move(deferred_packets_.front());
+      deferred_packets_.pop_front();
+
+      Ipv4TcpPacket segment{};
+      if (TryMatchTunnelStreamPacket(*stream, packet, &segment)) {
+        const Result<TunnelStreamReadResult> processed =
+            ProcessTunnelStreamPacketLocked(stream, packet.counter, segment);
+        for (TunnelPacket& deferred : unmatched_deferred) {
+          deferred_packets_.push_back(std::move(deferred));
+        }
+        if (processed.ok()) {
+          return processed;
+        }
+        if (processed.error.code != ErrorCode::NotFound) {
+          return processed;
+        }
+        continue;
+      }
+
+      unmatched_deferred.push_back(std::move(packet));
+    }
+
+    for (TunnelPacket& deferred : unmatched_deferred) {
+      deferred_packets_.push_back(std::move(deferred));
+    }
+
+    while (true) {
+      const Result<TunnelPacket> packet = PopEnginePacketLocked();
+      if (!packet.ok()) {
+        return MakeFailure<TunnelStreamReadResult>(packet.error.code, packet.error.message);
+      }
+
+      Ipv4TcpPacket segment{};
+      if (TryMatchTunnelStreamPacket(*stream, packet.value, &segment)) {
+        const Result<TunnelStreamReadResult> processed =
+            ProcessTunnelStreamPacketLocked(stream, packet.value.counter, segment);
+        if (processed.ok()) {
+          return processed;
+        }
+        if (processed.error.code != ErrorCode::NotFound) {
+          return processed;
+        }
+        continue;
+      }
+
+      DeferPacketLocked(packet.value);
+    }
+  }
+
+  Result<TunnelStreamReadResult> ProcessTunnelStreamPacketLocked(TunnelStreamHandleRecord* stream,
+                                                                 std::uint64_t counter,
+                                                                 const Ipv4TcpPacket& segment) const {
+    if (HasFlag(segment.flags, TcpControlFlag::Rst)) {
+      stream->peer_closed = true;
+      TunnelStreamReadResult reset{};
+      reset.stream_id = stream->stream_id;
+      reset.counter = counter;
+      reset.peer_closed = true;
+      return MakeSuccess(std::move(reset));
+    }
+
+    const bool has_sequence_advance = !segment.payload.empty() || HasFlag(segment.flags, TcpControlFlag::Fin) ||
+                                      HasFlag(segment.flags, TcpControlFlag::Syn);
+    if (has_sequence_advance && segment.sequence_number != stream->next_expected_remote_sequence) {
+      return MakeFailure<TunnelStreamReadResult>(ErrorCode::Unsupported,
+                                                 "out-of-order TCP segments are not supported by the current tunnel stream path");
+    }
+
+    if (HasFlag(segment.flags, TcpControlFlag::Syn)) {
+      stream->next_expected_remote_sequence += 1u;
+    }
+
+    if (!segment.payload.empty()) {
+      stream->next_expected_remote_sequence += static_cast<std::uint32_t>(segment.payload.size());
+    }
+
+    const bool peer_closed = HasFlag(segment.flags, TcpControlFlag::Fin);
+    if (peer_closed) {
+      stream->next_expected_remote_sequence += 1u;
+      stream->peer_closed = true;
+    }
+
+    if (has_sequence_advance || HasFlag(segment.flags, TcpControlFlag::Ack)) {
+      const Result<std::uint64_t> ack_counter = SendTunnelStreamPacket(*stream, ToFlags(TcpControlFlag::Ack), {});
+      if (!ack_counter.ok()) {
+        return MakeFailure<TunnelStreamReadResult>(ack_counter.error.code, ack_counter.error.message);
+      }
+    }
+
+    if (segment.payload.empty() && !peer_closed) {
+      return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound, "no stream payload available");
+    }
+
+    TunnelStreamReadResult read{};
+    read.stream_id = stream->stream_id;
+    read.counter = counter;
+    read.peer_closed = peer_closed;
+    read.payload = segment.payload;
+    return MakeSuccess(std::move(read));
   }
 
   Result<TunnelDnsLookupResult> ResolveTunnelDns(std::uint64_t session_id,
@@ -1320,11 +1775,15 @@ class LocalControlService final : public IControlService {
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;
   mutable std::uint64_t next_tunnel_datagram_id_ = 1;
+  mutable std::uint64_t next_tunnel_stream_id_ = 1;
   mutable std::deque<TunnelPacket> deferred_packets_{};
   mutable std::uint16_t next_dns_query_id_ = 1;
   mutable std::uint16_t next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
+  mutable std::uint16_t next_tunnel_stream_source_port_ = kTunnelStreamSourcePortBase;
+  mutable std::uint32_t next_tunnel_stream_initial_sequence_ = kTunnelStreamInitialSequenceBase;
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};
   mutable std::unordered_map<std::uint64_t, TunnelDatagramHandleRecord> tunnel_datagrams_{};
+  mutable std::unordered_map<std::uint64_t, TunnelStreamHandleRecord> tunnel_streams_{};
 };
 
 }  // namespace

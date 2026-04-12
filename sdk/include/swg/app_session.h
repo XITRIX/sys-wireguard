@@ -21,6 +21,10 @@ class AppSession {
   Error CloseTunnelDatagram(std::uint64_t datagram_id) const;
   Result<std::uint64_t> SendTunnelDatagram(std::uint64_t datagram_id, const std::vector<std::uint8_t>& payload) const;
   Result<TunnelDatagram> ReceiveTunnelDatagram(std::uint64_t datagram_id) const;
+  Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) const;
+  Error CloseTunnelStream(std::uint64_t stream_id) const;
+  Result<std::uint64_t> SendTunnelStream(std::uint64_t stream_id, const std::vector<std::uint8_t>& payload) const;
+  Result<TunnelStreamReadResult> ReceiveTunnelStream(std::uint64_t stream_id) const;
 
   [[nodiscard]] bool is_open() const noexcept {
     return session_id_ != 0;

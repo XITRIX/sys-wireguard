@@ -26,6 +26,8 @@
 | App-session DNS resolution policy | Verified | `swg_tests` now covers direct DNS fallback, fail-closed tunnel-DNS policy before connect, and connected tunnel-DNS A-record resolution |
 | Tunnel DNS packet codec | Verified | `swg_tests` covers IPv4 UDP DNS query build plus response parse round-trip |
 | Session socket abstraction | Verified | `swg_tests` now covers direct fallback, disconnected deny, and connected tunnel-packet selection through `swg::SessionSocket` |
+| Tunnel datagram socket | Verified | `swg_tests` covers a Moonlight-style video UDP round trip through `swg::TunnelDatagramSocket` |
+| Tunnel stream socket | Verified | `swg_tests` covers a Moonlight-style HTTPS control TCP round trip through `swg::TunnelStreamSocket` |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
 
 ## On-device
@@ -38,7 +40,7 @@
 | Switch manager build | Verified | `build/switch-debug/manager/swg_manager.nro` and staged `build/switch-debug/manager/switch/swg_manager.nro` are generated |
 | Switch integration app build | Verified | `build/switch-debug/integration/swg_integration_test.nro` and staged `build/switch-debug/integration/switch/swg_integration_test.nro` are generated |
 | Switch manager control flow | Verified | Manager now queries `swg:ctl` successfully on hardware and surfaces compatibility diagnostics |
-| Switch integration app smoke flow | In progress | The separate integration NRO now exposes `ResolveDns()` and sample `SessionSocket` checks in addition to route-planning and packet diagnostics; live VPN-peer validation of real tunnel DNS is still pending |
+| Switch integration app smoke flow | In progress | The separate integration NRO now exposes `ResolveDns()` and sample `SessionSocket` checks in addition to route-planning and packet diagnostics; live VPN-peer validation of real tunnel DNS, tunnel datagrams, and tunnel streams is still pending |
 | Milestone 3 manager frontend | Verified | Current manager implementation is sufficient to close the manager-first frontend milestone |
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |

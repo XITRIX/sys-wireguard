@@ -403,4 +403,67 @@ Result<TunnelDatagram> Client::RecvTunnelDatagram(std::uint64_t datagram_id) con
       DecodeTunnelDatagramPayload);
 }
 
+Result<TunnelStreamInfo> Client::OpenTunnelStream(const TunnelStreamOpenRequest& request) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->OpenTunnelStream(request);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(request);
+  if (!payload.ok()) {
+    return MakeFailure<TunnelStreamInfo>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::OpenTunnelStream, payload.value}),
+      DecodeTunnelStreamInfoPayload);
+}
+
+Error Client::CloseTunnelStream(std::uint64_t stream_id) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->CloseTunnelStream(stream_id);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(stream_id);
+  if (!payload.ok()) {
+    return payload.error;
+  }
+  return DecodeTransportMutationResponse(InvokeTransportRequest(
+      transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::CloseTunnelStream, payload.value}));
+}
+
+Result<std::uint64_t> Client::SendTunnelStream(const TunnelStreamSendRequest& request) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->SendTunnelStream(request);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(request);
+  if (!payload.ok()) {
+    return MakeFailure<std::uint64_t>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::SendTunnelStream, payload.value}),
+      DecodeU64Payload);
+}
+
+Result<TunnelStreamReadResult> Client::RecvTunnelStream(std::uint64_t stream_id) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->RecvTunnelStream(stream_id);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(stream_id);
+  if (!payload.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::RecvTunnelStream, payload.value}),
+      DecodeTunnelStreamReadResultPayload);
+}
+
 }  // namespace swg

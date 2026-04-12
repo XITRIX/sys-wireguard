@@ -113,4 +113,42 @@ Result<TunnelDatagram> AppSession::ReceiveTunnelDatagram(std::uint64_t datagram_
   return client_.RecvTunnelDatagram(datagram_id);
 }
 
+Result<TunnelStreamInfo> AppSession::OpenTunnelStream(const TunnelStreamOpenRequest& request) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelStreamInfo>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  TunnelStreamOpenRequest scoped_request = request;
+  scoped_request.session_id = session_id_;
+  return client_.OpenTunnelStream(scoped_request);
+}
+
+Error AppSession::CloseTunnelStream(std::uint64_t stream_id) const {
+  if (!is_open()) {
+    return MakeError(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.CloseTunnelStream(stream_id);
+}
+
+Result<std::uint64_t> AppSession::SendTunnelStream(std::uint64_t stream_id,
+                                                   const std::vector<std::uint8_t>& payload) const {
+  if (!is_open()) {
+    return MakeFailure<std::uint64_t>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  TunnelStreamSendRequest request{};
+  request.stream_id = stream_id;
+  request.payload = payload;
+  return client_.SendTunnelStream(request);
+}
+
+Result<TunnelStreamReadResult> AppSession::ReceiveTunnelStream(std::uint64_t stream_id) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelStreamReadResult>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.RecvTunnelStream(stream_id);
+}
+
 }  // namespace swg

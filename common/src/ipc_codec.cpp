@@ -1494,6 +1494,270 @@ Result<TunnelDatagram> DecodeTunnelDatagramPayload(const ByteBuffer& payload) {
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const TunnelStreamOpenRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteString(value.remote_host);
+  writer.WritePod<std::uint16_t>(value.remote_port);
+  writer.WriteEnum(value.transport);
+  writer.WriteEnum(value.traffic_class);
+  writer.WriteEnum(value.route_preference);
+  writer.WriteBool(value.local_network_hint);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelStreamOpenRequest> DecodeTunnelStreamOpenRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelStreamOpenRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<std::string> remote_host = reader.ReadString();
+  if (!remote_host.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(remote_host.error.code, remote_host.error.message);
+  }
+  value.remote_host = remote_host.value;
+
+  const Result<std::uint16_t> remote_port = reader.ReadPod<std::uint16_t>();
+  if (!remote_port.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(remote_port.error.code, remote_port.error.message);
+  }
+  value.remote_port = remote_port.value;
+
+  const Result<TransportProtocol> transport = reader.ReadEnum<TransportProtocol>();
+  if (!transport.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(transport.error.code, transport.error.message);
+  }
+  value.transport = transport.value;
+
+  const Result<AppTrafficClass> traffic_class = reader.ReadEnum<AppTrafficClass>();
+  if (!traffic_class.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(traffic_class.error.code, traffic_class.error.message);
+  }
+  value.traffic_class = traffic_class.value;
+
+  const Result<RoutePreference> route_preference = reader.ReadEnum<RoutePreference>();
+  if (!route_preference.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(route_preference.error.code, route_preference.error.message);
+  }
+  value.route_preference = route_preference.value;
+
+  const Result<bool> local_network_hint = reader.ReadBool();
+  if (!local_network_hint.ok()) {
+    return MakeFailure<TunnelStreamOpenRequest>(local_network_hint.error.code, local_network_hint.error.message);
+  }
+  value.local_network_hint = local_network_hint.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelStreamOpenRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelStreamInfo& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.stream_id);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteEnum(value.transport);
+  writer.WriteEnum(value.traffic_class);
+  writer.WriteString(value.profile_name);
+  writer.WriteString(value.remote_host);
+  writer.WriteString(value.remote_address);
+  writer.WritePod<std::uint16_t>(value.remote_port);
+  writer.WriteString(value.local_address);
+  writer.WritePod<std::uint16_t>(value.local_port);
+  writer.WriteString(value.message);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelStreamInfo> DecodeTunnelStreamInfoPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelStreamInfo value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelStreamInfo>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> stream_id = reader.ReadPod<std::uint64_t>();
+  if (!stream_id.ok()) {
+    return MakeFailure<TunnelStreamInfo>(stream_id.error.code, stream_id.error.message);
+  }
+  value.stream_id = stream_id.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<TunnelStreamInfo>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<TransportProtocol> transport = reader.ReadEnum<TransportProtocol>();
+  if (!transport.ok()) {
+    return MakeFailure<TunnelStreamInfo>(transport.error.code, transport.error.message);
+  }
+  value.transport = transport.value;
+
+  const Result<AppTrafficClass> traffic_class = reader.ReadEnum<AppTrafficClass>();
+  if (!traffic_class.ok()) {
+    return MakeFailure<TunnelStreamInfo>(traffic_class.error.code, traffic_class.error.message);
+  }
+  value.traffic_class = traffic_class.value;
+
+  const Result<std::string> profile_name = reader.ReadString();
+  if (!profile_name.ok()) {
+    return MakeFailure<TunnelStreamInfo>(profile_name.error.code, profile_name.error.message);
+  }
+  value.profile_name = profile_name.value;
+
+  const Result<std::string> remote_host = reader.ReadString();
+  if (!remote_host.ok()) {
+    return MakeFailure<TunnelStreamInfo>(remote_host.error.code, remote_host.error.message);
+  }
+  value.remote_host = remote_host.value;
+
+  const Result<std::string> remote_address = reader.ReadString();
+  if (!remote_address.ok()) {
+    return MakeFailure<TunnelStreamInfo>(remote_address.error.code, remote_address.error.message);
+  }
+  value.remote_address = remote_address.value;
+
+  const Result<std::uint16_t> remote_port = reader.ReadPod<std::uint16_t>();
+  if (!remote_port.ok()) {
+    return MakeFailure<TunnelStreamInfo>(remote_port.error.code, remote_port.error.message);
+  }
+  value.remote_port = remote_port.value;
+
+  const Result<std::string> local_address = reader.ReadString();
+  if (!local_address.ok()) {
+    return MakeFailure<TunnelStreamInfo>(local_address.error.code, local_address.error.message);
+  }
+  value.local_address = local_address.value;
+
+  const Result<std::uint16_t> local_port = reader.ReadPod<std::uint16_t>();
+  if (!local_port.ok()) {
+    return MakeFailure<TunnelStreamInfo>(local_port.error.code, local_port.error.message);
+  }
+  value.local_port = local_port.value;
+
+  const Result<std::string> message = reader.ReadString();
+  if (!message.ok()) {
+    return MakeFailure<TunnelStreamInfo>(message.error.code, message.error.message);
+  }
+  value.message = message.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelStreamInfo>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelStreamSendRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.stream_id);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelStreamSendRequest> DecodeTunnelStreamSendRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelStreamSendRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelStreamSendRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> stream_id = reader.ReadPod<std::uint64_t>();
+  if (!stream_id.ok()) {
+    return MakeFailure<TunnelStreamSendRequest>(stream_id.error.code, stream_id.error.message);
+  }
+  value.stream_id = stream_id.value;
+
+  const Result<std::vector<std::uint8_t>> payload_bytes = reader.ReadByteVector();
+  if (!payload_bytes.ok()) {
+    return MakeFailure<TunnelStreamSendRequest>(payload_bytes.error.code, payload_bytes.error.message);
+  }
+  value.payload = payload_bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelStreamSendRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelStreamReadResult& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.stream_id);
+  writer.WritePod<std::uint64_t>(value.counter);
+  writer.WriteBool(value.peer_closed);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelStreamReadResult> DecodeTunnelStreamReadResultPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelStreamReadResult value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> stream_id = reader.ReadPod<std::uint64_t>();
+  if (!stream_id.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(stream_id.error.code, stream_id.error.message);
+  }
+  value.stream_id = stream_id.value;
+
+  const Result<std::uint64_t> counter = reader.ReadPod<std::uint64_t>();
+  if (!counter.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(counter.error.code, counter.error.message);
+  }
+  value.counter = counter.value;
+
+  const Result<bool> peer_closed = reader.ReadBool();
+  if (!peer_closed.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(peer_closed.error.code, peer_closed.error.message);
+  }
+  value.peer_closed = peer_closed.value;
+
+  const Result<std::vector<std::uint8_t>> payload_bytes = reader.ReadByteVector();
+  if (!payload_bytes.ok()) {
+    return MakeFailure<TunnelStreamReadResult>(payload_bytes.error.code, payload_bytes.error.message);
+  }
+  value.payload = payload_bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelStreamReadResult>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request) {
   RequestHeaderWire header{};
   header.abi_version = request.abi_version;
@@ -1721,6 +1985,36 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(send_request.error);
       }
       return EncodeResponseFromResult(service.SendTunnelDatagram(send_request.value));
+    }
+    case ServiceCommandId::OpenTunnelStream: {
+      const Result<TunnelStreamOpenRequest> open_request =
+          DecodeTunnelStreamOpenRequestPayload(request.value.payload);
+      if (!open_request.ok()) {
+        return EncodeResponseFromError(open_request.error);
+      }
+      return EncodeResponseFromResult(service.OpenTunnelStream(open_request.value));
+    }
+    case ServiceCommandId::CloseTunnelStream: {
+      const Result<std::uint64_t> stream_id = DecodeU64Payload(request.value.payload);
+      if (!stream_id.ok()) {
+        return EncodeResponseFromError(stream_id.error);
+      }
+      return EncodeResponseFromConfigMutation(service.CloseTunnelStream(stream_id.value));
+    }
+    case ServiceCommandId::RecvTunnelStream: {
+      const Result<std::uint64_t> stream_id = DecodeU64Payload(request.value.payload);
+      if (!stream_id.ok()) {
+        return EncodeResponseFromError(stream_id.error);
+      }
+      return EncodeResponseFromResult(service.RecvTunnelStream(stream_id.value));
+    }
+    case ServiceCommandId::SendTunnelStream: {
+      const Result<TunnelStreamSendRequest> send_request =
+          DecodeTunnelStreamSendRequestPayload(request.value.payload);
+      if (!send_request.ok()) {
+        return EncodeResponseFromError(send_request.error);
+      }
+      return EncodeResponseFromResult(service.SendTunnelStream(send_request.value));
     }
   }
 

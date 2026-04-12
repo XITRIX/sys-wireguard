@@ -41,6 +41,10 @@ class Client {
   Error CloseTunnelDatagram(std::uint64_t datagram_id) const;
   Result<std::uint64_t> SendTunnelDatagram(const TunnelDatagramSendRequest& request) const;
   Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) const;
+  Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) const;
+  Error CloseTunnelStream(std::uint64_t stream_id) const;
+  Result<std::uint64_t> SendTunnelStream(const TunnelStreamSendRequest& request) const;
+  Result<TunnelStreamReadResult> RecvTunnelStream(std::uint64_t stream_id) const;
 
  private:
   std::shared_ptr<IControlService> ResolveService() const;
