@@ -45,7 +45,6 @@ constexpr std::size_t kResponseMac1Offset = kResponseEncryptedNothingOffset + kR
 constexpr std::size_t kTransportReceiverIndexOffset = 4;
 constexpr std::size_t kTransportCounterOffset = 8;
 constexpr std::size_t kTransportEncryptedPayloadOffset = kWireGuardTransportHeaderSize;
-constexpr std::size_t kTransportEncryptedPayloadSize = kWireGuardTransportKeepaliveSize - kWireGuardTransportHeaderSize;
 constexpr std::uint64_t kTai64Base = 0x400000000000000aULL;
 constexpr char kWireGuardConstruction[] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 constexpr char kWireGuardIdentifier[] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -404,6 +403,34 @@ Result<std::array<std::uint8_t, PlaintextSize + kAeadTagSize>> EncryptAead(
   return MakeSuccess(encrypted);
 }
 
+Result<std::vector<std::uint8_t>> EncryptAead(const WireGuardKey& key,
+                                              std::uint64_t counter,
+                                              const std::vector<std::uint8_t>& plaintext,
+                                              const ByteSlice aad) {
+  std::vector<std::uint8_t> encrypted(plaintext.size() + kAeadTagSize);
+  const std::array<std::uint8_t, 12> nonce = MakeAeadNonce(counter);
+  const std::uint8_t* aad_data = aad.size == 0 ? nullptr : aad.data;
+  const std::uint8_t* plaintext_data = plaintext.empty() ? nullptr : plaintext.data();
+
+  mbedtls_chachapoly_context context;
+  mbedtls_chachapoly_init(&context);
+
+  int rc = mbedtls_chachapoly_setkey(&context, key.bytes.data());
+  if (rc == 0) {
+    rc = mbedtls_chachapoly_encrypt_and_tag(&context, plaintext.size(), nonce.data(), aad_data, aad.size,
+                                            plaintext_data, encrypted.data(),
+                                            encrypted.data() + static_cast<std::ptrdiff_t>(plaintext.size()));
+  }
+
+  mbedtls_chachapoly_free(&context);
+  if (rc != 0) {
+    return Result<std::vector<std::uint8_t>>::Failure(
+        MakeMbedTlsError(rc, "mbedtls_chachapoly_encrypt_and_tag"));
+  }
+
+  return MakeSuccess(std::move(encrypted));
+}
+
 template <std::size_t PlaintextSize>
 Result<std::array<std::uint8_t, PlaintextSize + kAeadTagSize>> EncryptAead(
     const WireGuardKey& key,
@@ -449,6 +476,42 @@ Result<std::array<std::uint8_t, PlaintextSize>> DecryptAead(
   }
 
   return MakeSuccess(plaintext);
+}
+
+Result<std::vector<std::uint8_t>> DecryptAead(const WireGuardKey& key,
+                                              std::uint64_t counter,
+                                              const std::uint8_t* ciphertext,
+                                              std::size_t ciphertext_size,
+                                              const ByteSlice aad,
+                                              std::string_view field_name) {
+  if (ciphertext_size < kAeadTagSize) {
+    return MakeFailure<std::vector<std::uint8_t>>(ErrorCode::ParseError,
+                                                  std::string(field_name) + " has an unexpected AEAD size");
+  }
+
+  const std::size_t plaintext_size = ciphertext_size - kAeadTagSize;
+  std::vector<std::uint8_t> plaintext(plaintext_size);
+  const std::array<std::uint8_t, 12> nonce = MakeAeadNonce(counter);
+  const std::uint8_t* aad_data = aad.size == 0 ? nullptr : aad.data;
+  std::uint8_t* plaintext_data = plaintext.empty() ? nullptr : plaintext.data();
+
+  mbedtls_chachapoly_context context;
+  mbedtls_chachapoly_init(&context);
+
+  int rc = mbedtls_chachapoly_setkey(&context, key.bytes.data());
+  if (rc == 0) {
+    rc = mbedtls_chachapoly_auth_decrypt(&context, plaintext_size, nonce.data(), aad_data, aad.size,
+                                         ciphertext + static_cast<std::ptrdiff_t>(plaintext_size), ciphertext,
+                                         plaintext_data);
+  }
+
+  mbedtls_chachapoly_free(&context);
+  if (rc != 0) {
+    return MakeFailure<std::vector<std::uint8_t>>(ErrorCode::ParseError,
+                                                  std::string(field_name) + " AEAD verification failed");
+  }
+
+  return MakeSuccess(std::move(plaintext));
 }
 
 template <std::size_t PlaintextSize>
@@ -931,59 +994,98 @@ Result<WireGuardValidatedHandshake> ConsumeHandshakeResponse(const WireGuardHand
 Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGuardKey& sending_key,
                                                                    std::uint32_t receiver_index,
                                                                    std::uint64_t counter) {
+  const Result<WireGuardTransportPacket> transport = CreateTransportPacket(sending_key, receiver_index, {}, counter);
+  if (!transport.ok()) {
+    return MakeFailure<WireGuardTransportKeepalive>(transport.error.code, transport.error.message);
+  }
+  if (transport.value.packet.size() != kWireGuardTransportKeepaliveSize) {
+    return MakeFailure<WireGuardTransportKeepalive>(ErrorCode::ParseError,
+                                                    "WireGuard transport keepalive produced an unexpected size");
+  }
+
   WireGuardTransportKeepalive keepalive{};
   keepalive.receiver_index = receiver_index;
   keepalive.counter = counter;
-  keepalive.packet[0] = static_cast<std::uint8_t>(WireGuardMessageType::Data);
-  Store32Le(keepalive.packet.data() + kTransportReceiverIndexOffset, receiver_index);
-  Store64Le(keepalive.packet.data() + kTransportCounterOffset, counter);
+  std::copy(transport.value.packet.begin(), transport.value.packet.end(), keepalive.packet.begin());
+  return MakeSuccess(keepalive);
+}
 
-  const std::array<std::uint8_t, 0> empty_plaintext{};
-  const auto encrypted_empty = EncryptAead<0>(sending_key, counter, empty_plaintext, MakeSlice(nullptr, 0));
-  if (!encrypted_empty.ok()) {
-    return MakeFailure<WireGuardTransportKeepalive>(encrypted_empty.error.code, encrypted_empty.error.message);
+Result<WireGuardTransportPacket> CreateTransportPacket(const WireGuardKey& sending_key,
+                                                       std::uint32_t receiver_index,
+                                                       const std::vector<std::uint8_t>& payload,
+                                                       std::uint64_t counter) {
+  WireGuardTransportPacket transport{};
+  transport.receiver_index = receiver_index;
+  transport.counter = counter;
+  transport.packet.resize(kWireGuardTransportHeaderSize + payload.size() + kAeadTagSize);
+  transport.packet[0] = static_cast<std::uint8_t>(WireGuardMessageType::Data);
+  Store32Le(transport.packet.data() + kTransportReceiverIndexOffset, receiver_index);
+  Store64Le(transport.packet.data() + kTransportCounterOffset, counter);
+
+  const auto encrypted_payload = EncryptAead(sending_key, counter, payload, MakeSlice(nullptr, 0));
+  if (!encrypted_payload.ok()) {
+    return MakeFailure<WireGuardTransportPacket>(encrypted_payload.error.code, encrypted_payload.error.message);
   }
 
-  std::copy(encrypted_empty.value.begin(), encrypted_empty.value.end(),
-            keepalive.packet.begin() + static_cast<std::ptrdiff_t>(kTransportEncryptedPayloadOffset));
-  return MakeSuccess(keepalive);
+  std::copy(encrypted_payload.value.begin(), encrypted_payload.value.end(),
+            transport.packet.begin() + static_cast<std::ptrdiff_t>(kTransportEncryptedPayloadOffset));
+  return MakeSuccess(std::move(transport));
+}
+
+Result<WireGuardConsumedTransportPacket> ConsumeTransportPacket(const WireGuardKey& receiving_key,
+                                                                std::uint32_t expected_receiver_index,
+                                                                const std::uint8_t* packet,
+                                                                std::size_t packet_size) {
+  if (packet_size < kWireGuardTransportHeaderSize + kAeadTagSize) {
+    return MakeFailure<WireGuardConsumedTransportPacket>(ErrorCode::ParseError,
+                                                         "WireGuard transport packet has an unexpected size");
+  }
+  if (packet[0] != static_cast<std::uint8_t>(WireGuardMessageType::Data)) {
+    return MakeFailure<WireGuardConsumedTransportPacket>(ErrorCode::ParseError,
+                                                         "WireGuard transport packet uses an unexpected message type");
+  }
+
+  const Error reserved_error = ValidateReservedZero(packet, packet_size);
+  if (reserved_error) {
+    return Result<WireGuardConsumedTransportPacket>::Failure(reserved_error);
+  }
+
+  const std::uint32_t receiver_index = Load32Le(packet + kTransportReceiverIndexOffset);
+  if (receiver_index != expected_receiver_index) {
+    return MakeFailure<WireGuardConsumedTransportPacket>(
+        ErrorCode::ParseError,
+        "WireGuard transport packet receiver index did not match the expected peer index");
+  }
+
+  const std::uint64_t counter = Load64Le(packet + kTransportCounterOffset);
+  const auto decrypted = DecryptAead(receiving_key, counter, packet + kTransportEncryptedPayloadOffset,
+                                     packet_size - kTransportEncryptedPayloadOffset,
+                                     MakeSlice(nullptr, 0), "transport_packet");
+  if (!decrypted.ok()) {
+    return MakeFailure<WireGuardConsumedTransportPacket>(decrypted.error.code, decrypted.error.message);
+  }
+
+  WireGuardConsumedTransportPacket transport{};
+  transport.counter = counter;
+  transport.payload = std::move(decrypted.value);
+  return MakeSuccess(std::move(transport));
 }
 
 Result<std::uint64_t> ConsumeTransportKeepalivePacket(const WireGuardKey& receiving_key,
                                                       std::uint32_t expected_receiver_index,
                                                       const std::uint8_t* packet,
                                                       std::size_t packet_size) {
-  if (packet_size != kWireGuardTransportKeepaliveSize) {
+  const Result<WireGuardConsumedTransportPacket> transport =
+      ConsumeTransportPacket(receiving_key, expected_receiver_index, packet, packet_size);
+  if (!transport.ok()) {
+    return MakeFailure<std::uint64_t>(transport.error.code, transport.error.message);
+  }
+  if (!transport.value.payload.empty()) {
     return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
-                                      "WireGuard transport keepalive has an unexpected size");
-  }
-  if (packet[0] != static_cast<std::uint8_t>(WireGuardMessageType::Data)) {
-    return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
-                                      "WireGuard transport keepalive uses an unexpected message type");
+                                      "WireGuard transport keepalive unexpectedly carried payload bytes");
   }
 
-  const Error reserved_error = ValidateReservedZero(packet, packet_size);
-  if (reserved_error) {
-    return Result<std::uint64_t>::Failure(reserved_error);
-  }
-
-  const std::uint32_t receiver_index = Load32Le(packet + kTransportReceiverIndexOffset);
-  if (receiver_index != expected_receiver_index) {
-    return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
-                                      "WireGuard transport keepalive receiver index did not match the expected peer index");
-  }
-
-  const std::uint64_t counter = Load64Le(packet + kTransportCounterOffset);
-  const auto decrypted = DecryptAead<0>(receiving_key, counter,
-                                        packet + kTransportEncryptedPayloadOffset,
-                                        kTransportEncryptedPayloadSize,
-                                        MakeSlice(nullptr, 0),
-                                        "transport_keepalive");
-  if (!decrypted.ok()) {
-    return MakeFailure<std::uint64_t>(decrypted.error.code, decrypted.error.message);
-  }
-
-  return MakeSuccess(counter);
+  return MakeSuccess(transport.value.counter);
 }
 
 Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,

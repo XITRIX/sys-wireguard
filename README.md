@@ -11,12 +11,12 @@ Current scope:
 - A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
 - Real X25519-based WireGuard cryptographic preflight using mbedTLS PSA, including local public-key derivation and static peer shared-secret validation.
-- A real WireGuard handshake path that builds an initiation packet, exchanges the handshake response over UDP, sends an authenticated post-handshake keepalive, continues scheduled keepalives while connected when `persistent_keepalive` is configured, and accepts inbound authenticated keepalives from the validated peer endpoint.
+- A real WireGuard handshake path that builds an initiation packet, exchanges the handshake response over UDP, sends an authenticated post-handshake keepalive, continues scheduled keepalives while connected when `persistent_keepalive` is configured, and accepts inbound authenticated transport packets from the validated peer endpoint into a bounded internal receive queue.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
 - Tesla UI wiring, deferred from Phase A.
-- WireGuard cookie replies, retries/rekeys, authenticated transport payload handling beyond empty keepalives, and a general transport packet loop.
+- WireGuard cookie replies, retries/rekeys, exposing queued transport payloads through the control/API surface, and a general transport packet loop.
 - Transparent routing or MITM paths.
 
 ## Repository layout
@@ -101,8 +101,9 @@ The practical way to try the current connect path is to manually create `sdmc:/c
 Current constraints:
 - `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet, validates the response, and then sends one authenticated keepalive before the service enters `Connected`.
 - While connected, `GetStats()` now includes live engine counters and scheduled keepalives when `persistent_keepalive` is non-zero.
-- The engine now also accepts one or more inbound authenticated keepalive packets from the validated peer endpoint and folds them into live stats.
-- It still does not implement cookie replies, rekeying, authenticated transport payload handling beyond empty keepalives, or a general transport packet loop yet.
+- The engine now also accepts inbound authenticated transport packets from the validated peer endpoint and folds them into live stats.
+- Non-empty transport payloads are currently authenticated, queued in a bounded internal engine receive queue, and counted in live stats, but they are not yet surfaced through `swg:ctl` or an app-facing API.
+- It still does not implement cookie replies, rekeying, exposing queued payloads through the control/API surface, or a general transport packet loop yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
@@ -143,6 +144,8 @@ Implemented:
 - placeholder connection state machine
 - scheduled authenticated keepalives plus live tunnel stats while connected
 - inbound authenticated keepalive handling plus live receive-side stats
+- authenticated transport payload validation plus live receive-side stats
+- bounded internal engine queueing for authenticated inbound payload packets
 
 ## App integration
 
@@ -158,6 +161,6 @@ This keeps the sysmodule consumer API aligned with Moonlight-Switch's current ar
 
 Next:
 - manager UX expansion
-- WireGuard cookie reply handling, retries/rekeys, authenticated transport payload handling beyond empty keepalives, and a general packet loop on top of the new handshake plus keepalive path
+- WireGuard cookie reply handling, retries/rekeys, exposing queued transport payloads through the control/API surface, and a general packet loop on top of the new handshake plus keepalive path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

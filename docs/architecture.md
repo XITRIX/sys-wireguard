@@ -30,7 +30,7 @@ Current implementation boundaries:
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
-- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, and accepts authenticated inbound keepalive packets from the validated peer endpoint.
+- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, and accepts authenticated inbound transport packets from the validated peer endpoint into a bounded internal receive queue.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
 - Control-service stats now merge live engine counters while connected so manager and future overlay consumers can observe keepalive traffic without disconnecting first.
 
@@ -74,6 +74,6 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 ## What is intentionally deferred
 
 - Tesla overlay parity, rendering, and input handling
-- WireGuard cookie handling, rekeys, authenticated transport payload handling beyond empty keepalives, and a general packet loop
+- WireGuard cookie handling, rekeys, exposing queued transport payloads through the control/API surface, and a general packet loop
 - DNS-over-tunnel and MITM logic
 - policy-driven transparent routing

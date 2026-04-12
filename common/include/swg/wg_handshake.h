@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "swg/result.h"
 #include "swg/wg_profile.h"
@@ -84,6 +85,17 @@ struct WireGuardTransportKeepalive {
   std::uint64_t counter = 0;
 };
 
+struct WireGuardTransportPacket {
+  std::vector<std::uint8_t> packet;
+  std::uint32_t receiver_index = 0;
+  std::uint64_t counter = 0;
+};
+
+struct WireGuardConsumedTransportPacket {
+  std::uint64_t counter = 0;
+  std::vector<std::uint8_t> payload;
+};
+
 Result<WireGuardHandshakeInitiation> CreateHandshakeInitiation(
     const WireGuardHandshakeConfig& config,
     const WireGuardHandshakeInitiationOptions& options = {});
@@ -99,6 +111,14 @@ Result<WireGuardValidatedHandshake> ConsumeHandshakeResponse(const WireGuardHand
 Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGuardKey& sending_key,
                                                                    std::uint32_t receiver_index,
                                                                    std::uint64_t counter = 0);
+Result<WireGuardTransportPacket> CreateTransportPacket(const WireGuardKey& sending_key,
+                                                       std::uint32_t receiver_index,
+                                                       const std::vector<std::uint8_t>& payload,
+                                                       std::uint64_t counter = 0);
+Result<WireGuardConsumedTransportPacket> ConsumeTransportPacket(const WireGuardKey& receiving_key,
+                                                                std::uint32_t expected_receiver_index,
+                                                                const std::uint8_t* packet,
+                                                                std::size_t packet_size);
 Result<std::uint64_t> ConsumeTransportKeepalivePacket(const WireGuardKey& receiving_key,
                                                       std::uint32_t expected_receiver_index,
                                                       const std::uint8_t* packet,

@@ -111,9 +111,11 @@ swg::Result<swg::WireGuardResponderConfig> MakeHandshakeResponderConfig() {
 class LocalHandshakeResponder {
  public:
   explicit LocalHandshakeResponder(std::uint32_t expected_additional_keepalives = 0,
-                                   std::uint32_t inbound_keepalives_to_send = 0)
+                                   std::uint32_t inbound_keepalives_to_send = 0,
+                                   std::vector<std::uint8_t> inbound_transport_payload = {})
       : expected_additional_keepalives_(expected_additional_keepalives),
-        inbound_keepalives_to_send_(inbound_keepalives_to_send) {
+        inbound_keepalives_to_send_(inbound_keepalives_to_send),
+        inbound_transport_payload_(std::move(inbound_transport_payload)) {
     socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd_ < 0) {
       error_ = DescribeSocketError("socket");
@@ -261,6 +263,28 @@ class LocalHandshakeResponder {
       }
     }
 
+    if (!inbound_transport_payload_.empty()) {
+      const auto inbound_transport = swg::CreateTransportPacket(
+          response.value.sending_key, response.value.receiver_index,
+          inbound_transport_payload_, inbound_keepalives_to_send_);
+      if (!inbound_transport.ok()) {
+        error_ = inbound_transport.error.message;
+        return;
+      }
+
+      const ssize_t inbound_sent = ::sendto(socket_fd_, inbound_transport.value.packet.data(),
+                                            inbound_transport.value.packet.size(), 0,
+                                            reinterpret_cast<const sockaddr*>(&client_address), client_length);
+      if (inbound_sent < 0) {
+        error_ = DescribeSocketError("sendto");
+        return;
+      }
+      if (static_cast<std::size_t>(inbound_sent) != inbound_transport.value.packet.size()) {
+        error_ = "sendto returned a short authenticated transport payload";
+        return;
+      }
+    }
+
     for (std::uint32_t expected_counter = 1; expected_counter <= expected_additional_keepalives_; ++expected_counter) {
       client_length = sizeof(client_address);
       const ssize_t periodic_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
@@ -295,6 +319,7 @@ class LocalHandshakeResponder {
   std::uint32_t expected_additional_keepalives_ = 0;
   std::uint32_t validated_additional_keepalives_ = 0;
   std::uint32_t inbound_keepalives_to_send_ = 0;
+  std::vector<std::uint8_t> inbound_transport_payload_{};
   std::string error_{};
 };
 
@@ -392,6 +417,22 @@ bool TestWireGuardHandshakeRoundTrip() {
     ok &= Require(consumed.ok(), "responder must validate the initiator post-handshake keepalive");
     if (consumed.ok()) {
       ok &= Require(consumed.value == 0, "first post-handshake keepalive must use transport counter zero");
+    }
+  }
+
+  const std::vector<std::uint8_t> payload = {0x53, 0x57, 0x47, 0x01};
+  const auto transport =
+      swg::CreateTransportPacket(validated.value.sending_key, validated.value.peer_sender_index, payload, 1);
+  ok &= Require(transport.ok(), "initiator must build an authenticated transport payload packet");
+  if (transport.ok()) {
+    const auto consumed = swg::ConsumeTransportPacket(response.value.receiving_key, response.value.sender_index,
+                                                      transport.value.packet.data(), transport.value.packet.size());
+    ok &= Require(consumed.ok(), "responder must validate the initiator transport payload packet");
+    if (consumed.ok()) {
+      ok &= Require(consumed.value.counter == 1,
+                    "transport payload packet must preserve the transport counter");
+      ok &= Require(consumed.value.payload == payload,
+                    "transport payload packet must round-trip the authenticated payload bytes");
     }
   }
   return ok;
@@ -870,6 +911,123 @@ bool TestInboundKeepaliveStats() {
   return ok;
 }
 
+bool TestInboundPayloadStats() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-inbound-payload";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  const std::vector<std::uint8_t> payload = {0x53, 0x57, 0x47, 0x42};
+  LocalHandshakeResponder responder(0, 0, payload);
+  if (!Require(responder.ready(), "local handshake responder must start for inbound payload test")) {
+    return false;
+  }
+
+  swg::Config config = MakeValidConfig("127.0.0.1", responder.port());
+  config.profiles.at("default").persistent_keepalive = 0;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(),
+               "inbound payload config must save before connect")) {
+    return false;
+  }
+  if (!Require(client.Connect().ok(), "connect must succeed before inbound payload stats are sampled")) {
+    return false;
+  }
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must send one inbound payload packet"
+                                                           : responder.error())) {
+    return false;
+  }
+
+  swg::TunnelStats observed_stats{};
+  bool payload_observed = false;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    const auto stats = client.GetStats();
+    if (stats.ok() && stats.value.bytes_in >
+                          swg::kWireGuardHandshakeResponseSize + swg::kWireGuardTransportKeepaliveSize &&
+        stats.value.packets_in >= 2) {
+      observed_stats = stats.value;
+      payload_observed = true;
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  bool ok = true;
+  ok &= Require(payload_observed, "live stats must include one inbound authenticated transport payload packet");
+  if (payload_observed) {
+    ok &= Require(observed_stats.successful_handshakes == 1,
+                  "inbound payload stats must preserve the successful handshake count");
+    ok &= Require(observed_stats.bytes_out ==
+                      swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                  "inbound payload stats must not require extra outbound packets when keepalives are disabled");
+  }
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after inbound payload stats test");
+  return ok;
+}
+
+bool TestEngineInboundPayloadQueue() {
+  const std::vector<std::uint8_t> payload = {0x51, 0x55, 0x45, 0x55, 0x45};
+  LocalHandshakeResponder responder(0, 0, payload);
+  if (!Require(responder.ready(), "local handshake responder must start for engine payload queue test")) {
+    return false;
+  }
+
+  const swg::Config valid_config = MakeValidConfig("127.0.0.1", responder.port());
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for engine payload queue test");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for engine payload queue test");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  auto engine = swg::sysmodule::CreateWgTunnelEngine();
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must send one inbound payload packet"
+                                                            : responder.error());
+  ok &= Require(start_error.ok(), "engine start must complete the payload queue handshake");
+  if (!start_error.ok()) {
+    return false;
+  }
+
+  swg::Result<swg::WireGuardConsumedTransportPacket> packet =
+      swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::NotFound, "not queued yet");
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    packet = engine->ReceivePacket();
+    if (packet.ok()) {
+      break;
+    }
+    if (packet.error.code != swg::ErrorCode::NotFound) {
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  ok &= Require(packet.ok(), "engine must queue one validated inbound transport payload packet");
+  if (packet.ok()) {
+    ok &= Require(packet.value.payload == payload,
+                  "engine receive queue must preserve the authenticated payload bytes");
+    ok &= Require(packet.value.counter == 0,
+                  "first queued inbound transport payload packet must preserve counter zero");
+  }
+
+  const auto empty = engine->ReceivePacket();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "engine receive queue must report empty after the queued packet is drained");
+
+  ok &= Require(engine->Stop().ok(), "engine stop must succeed after payload queue test");
+  return ok;
+}
+
 bool TestInvalidWireGuardConnectFails() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-invalid-connect";
   std::error_code filesystem_error;
@@ -1013,17 +1171,21 @@ int main() {
   const bool tunnel_session_ok = TestTunnelSessionPreparation();
   const bool endpoint_resolution_ok = TestTunnelEndpointResolution();
   const bool engine_handshake_ok = TestTunnelEngineHandshake();
+  const bool engine_payload_queue_ok = TestEngineInboundPayloadQueue();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
   const bool connect_handshake_ok = TestConnectHandshakeStats();
   const bool periodic_keepalive_ok = TestPeriodicKeepaliveStats();
   const bool inbound_keepalive_ok = TestInboundKeepaliveStats();
+  const bool inbound_payload_ok = TestInboundPayloadStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
-          tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && state_ok && client_ok &&
-          connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && invalid_connect_ok &&
+      tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
+      state_ok && client_ok &&
+          connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
+          invalid_connect_ok &&
           codec_ok && moonlight_ok)
              ? 0
              : 1;

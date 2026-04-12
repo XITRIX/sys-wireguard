@@ -8,6 +8,7 @@
 
 #include "swg/ipc_protocol.h"
 #include "swg/result.h"
+#include "swg/wg_handshake.h"
 #include "swg/wg_profile.h"
 
 namespace swg::sysmodule {
@@ -66,6 +67,7 @@ class IWgTunnelEngine {
 
   virtual Error Start(const TunnelEngineStartRequest& request) = 0;
   virtual Error Stop() = 0;
+  [[nodiscard]] virtual Result<WireGuardConsumedTransportPacket> ReceivePacket() = 0;
   [[nodiscard]] virtual TunnelStats GetStats() const = 0;
   [[nodiscard]] virtual bool IsRunning() const = 0;
 };

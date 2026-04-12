@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -23,6 +24,8 @@ namespace {
 constexpr std::uint32_t kHandshakeResponseTimeoutMs = 5000;
 constexpr std::uint32_t kHandshakeRetryCount = 2;
 constexpr std::uint32_t kTransportReceiveTimeoutMs = 250;
+constexpr std::size_t kMaxQueuedTransportPackets = 8;
+constexpr std::size_t kMaxQueuedTransportPayloadBytes = 8 * 1024;
 constexpr std::size_t kMaxHandshakeDatagramSize = 256;
 constexpr std::size_t kMaxTransportDatagramSize = 2048;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -378,11 +381,30 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       receiving_key_ = {};
       next_send_counter_ = 0;
       next_receive_counter_ = 0;
+      queued_transport_packets_.clear();
+      queued_transport_payload_bytes_ = 0;
+      receive_queue_overflow_logged_ = false;
       stop_requested_ = false;
       last_handshake_at_ = {};
     }
 
     return Error::None();
+  }
+
+  Result<WireGuardConsumedTransportPacket> ReceivePacket() override {
+    std::scoped_lock lock(engine_mutex_);
+    if (queued_transport_packets_.empty()) {
+      return MakeFailure<WireGuardConsumedTransportPacket>(ErrorCode::NotFound,
+                                                           "no authenticated transport packets are queued");
+    }
+
+    WireGuardConsumedTransportPacket packet = std::move(queued_transport_packets_.front());
+    queued_transport_packets_.pop_front();
+    queued_transport_payload_bytes_ -= packet.payload.size();
+    if (queued_transport_packets_.empty()) {
+      receive_queue_overflow_logged_ = false;
+    }
+    return MakeSuccess(std::move(packet));
   }
 
   TunnelStats GetStats() const override {
@@ -460,25 +482,40 @@ class WgTunnelEngine final : public IWgTunnelEngine {
         continue;
       }
 
-      const auto keepalive =
-          ConsumeTransportKeepalivePacket(receiving_key, local_sender_index, buffer.data(), received.value.size);
-      if (!keepalive.ok()) {
-        LogWarning("wg_engine", "failed to validate inbound authenticated keepalive from " +
-                                    DescribeReplySource(received.value) + ": " + keepalive.error.message);
+        auto transport = ConsumeTransportPacket(receiving_key, local_sender_index, buffer.data(), received.value.size);
+      if (!transport.ok()) {
+        LogWarning("wg_engine", "failed to validate inbound authenticated transport packet from " +
+                                    DescribeReplySource(received.value) + ": " + transport.error.message);
         continue;
       }
 
       {
         std::scoped_lock lock(engine_mutex_);
-        if (keepalive.value < next_receive_counter_) {
-          LogWarning("wg_engine", "ignoring replayed authenticated keepalive with counter " +
-                                      std::to_string(keepalive.value));
+        if (transport.value.counter < next_receive_counter_) {
+          LogWarning("wg_engine", "ignoring replayed authenticated transport packet with counter " +
+                                      std::to_string(transport.value.counter));
           continue;
         }
 
-        next_receive_counter_ = keepalive.value + 1;
+        next_receive_counter_ = transport.value.counter + 1;
         stats_.bytes_in += received.value.size;
         ++stats_.packets_in;
+
+        if (!transport.value.payload.empty()) {
+          const std::size_t payload_size = transport.value.payload.size();
+          if (payload_size > kMaxQueuedTransportPayloadBytes ||
+              queued_transport_packets_.size() >= kMaxQueuedTransportPackets ||
+              queued_transport_payload_bytes_ + payload_size > kMaxQueuedTransportPayloadBytes) {
+            if (!receive_queue_overflow_logged_) {
+              LogWarning("wg_engine", "dropping authenticated transport payload because the bounded receive queue is full");
+              receive_queue_overflow_logged_ = true;
+            }
+          } else {
+            queued_transport_payload_bytes_ += payload_size;
+            queued_transport_packets_.push_back(std::move(transport.value));
+            receive_queue_overflow_logged_ = false;
+          }
+        }
       }
     }
   }
@@ -556,6 +593,9 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   WireGuardKey receiving_key_{};
   std::uint64_t next_send_counter_ = 0;
   std::uint64_t next_receive_counter_ = 0;
+  std::deque<WireGuardConsumedTransportPacket> queued_transport_packets_{};
+  std::size_t queued_transport_payload_bytes_ = 0;
+  bool receive_queue_overflow_logged_ = false;
   bool stop_requested_ = false;
   std::chrono::steady_clock::time_point last_handshake_at_{};
   bool running_ = false;
