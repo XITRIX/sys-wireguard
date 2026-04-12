@@ -42,6 +42,7 @@ enum class ServiceCommandId : std::uint32_t {
   CloseAppSession,
   GetNetworkPlan,
   RecvPacket,
+  SendPacket,
 };
 
 enum class TunnelState : std::uint32_t {
@@ -203,6 +204,12 @@ struct NetworkPlan {
 struct TunnelPacket {
   std::uint16_t abi_version = kAbiVersion;
   std::uint64_t counter = 0;
+  std::vector<std::uint8_t> payload;
+};
+
+struct TunnelSendRequest {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t session_id = 0;
   std::vector<std::uint8_t> payload;
 };
 

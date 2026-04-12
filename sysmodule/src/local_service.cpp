@@ -498,6 +498,35 @@ class LocalControlService final : public IControlService {
     return MakeSuccess(std::move(plan));
   }
 
+  Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) override {
+    std::scoped_lock lock(mutex_);
+
+    if (request.payload.empty()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
+                                        "authenticated transport payload must not be empty");
+    }
+
+    const auto session_it = app_sessions_.find(request.session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::NotFound,
+                                        "app session not found: " + std::to_string(request.session_id));
+    }
+
+    const AppSessionRecord& session = session_it->second;
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (snapshot.state != TunnelState::Connected || !tunnel_engine_->IsRunning()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::InvalidState,
+                                        "tunnel is not connected for packet send");
+    }
+
+    if (session.selected_profile.empty() || snapshot.active_profile != session.selected_profile) {
+      return MakeFailure<std::uint64_t>(ErrorCode::InvalidState,
+                                        "app session profile is not active on the connected tunnel");
+    }
+
+    return tunnel_engine_->SendPacket(request.payload);
+  }
+
   Result<TunnelPacket> RecvPacket(std::uint64_t session_id) override {
     std::scoped_lock lock(mutex_);
 

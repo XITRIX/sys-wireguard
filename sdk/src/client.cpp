@@ -291,6 +291,23 @@ Result<NetworkPlan> Client::GetNetworkPlan(const NetworkPlanRequest& request) co
       DecodeNetworkPlanPayload);
 }
 
+Result<std::uint64_t> Client::SendPacket(std::uint64_t session_id, const std::vector<std::uint8_t>& payload) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  const TunnelSendRequest request{kAbiVersion, session_id, payload};
+  if (service) {
+    return service->SendPacket(request);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> request_payload = EncodePayload(request);
+  if (!request_payload.ok()) {
+    return MakeFailure<std::uint64_t>(request_payload.error.code, request_payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::SendPacket, request_payload.value}),
+      DecodeU64Payload);
+}
+
 Result<TunnelPacket> Client::RecvPacket(std::uint64_t session_id) const {
   const std::shared_ptr<IControlService> service = ResolveService();
   if (service) {

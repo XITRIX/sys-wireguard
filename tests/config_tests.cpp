@@ -112,10 +112,12 @@ class LocalHandshakeResponder {
  public:
   explicit LocalHandshakeResponder(std::uint32_t expected_additional_keepalives = 0,
                                    std::uint32_t inbound_keepalives_to_send = 0,
-                                   std::vector<std::uint8_t> inbound_transport_payload = {})
+                                   std::vector<std::uint8_t> inbound_transport_payload = {},
+                                   std::vector<std::uint8_t> expected_outbound_transport_payload = {})
       : expected_additional_keepalives_(expected_additional_keepalives),
         inbound_keepalives_to_send_(inbound_keepalives_to_send),
-        inbound_transport_payload_(std::move(inbound_transport_payload)) {
+        inbound_transport_payload_(std::move(inbound_transport_payload)),
+        expected_outbound_transport_payload_(std::move(expected_outbound_transport_payload)) {
     socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd_ < 0) {
       error_ = DescribeSocketError("socket");
@@ -174,7 +176,8 @@ class LocalHandshakeResponder {
       worker_.join();
     }
     return error_.empty() && responded_ && keepalive_validated_ &&
-           validated_additional_keepalives_ == expected_additional_keepalives_;
+           validated_additional_keepalives_ == expected_additional_keepalives_ &&
+           (expected_outbound_transport_payload_.empty() || outbound_transport_validated_);
   }
 
   const std::string& error() const {
@@ -285,6 +288,35 @@ class LocalHandshakeResponder {
       }
     }
 
+    if (!expected_outbound_transport_payload_.empty()) {
+      client_length = sizeof(client_address);
+      const ssize_t outbound_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                                   reinterpret_cast<sockaddr*>(&client_address), &client_length);
+      if (outbound_received < 0) {
+        error_ = DescribeSocketError("recvfrom");
+        return;
+      }
+
+      const auto outbound_transport = swg::ConsumeTransportPacket(
+          response.value.receiving_key, response.value.sender_index, buffer.data(),
+          static_cast<std::size_t>(outbound_received));
+      if (!outbound_transport.ok()) {
+        error_ = outbound_transport.error.message;
+        return;
+      }
+
+      if (outbound_transport.value.counter != 1) {
+        error_ = "outbound transport payload used an unexpected transport counter";
+        return;
+      }
+      if (outbound_transport.value.payload != expected_outbound_transport_payload_) {
+        error_ = "outbound transport payload bytes did not match the expected authenticated payload";
+        return;
+      }
+
+      outbound_transport_validated_ = true;
+    }
+
     for (std::uint32_t expected_counter = 1; expected_counter <= expected_additional_keepalives_; ++expected_counter) {
       client_length = sizeof(client_address);
       const ssize_t periodic_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
@@ -320,6 +352,8 @@ class LocalHandshakeResponder {
   std::uint32_t validated_additional_keepalives_ = 0;
   std::uint32_t inbound_keepalives_to_send_ = 0;
   std::vector<std::uint8_t> inbound_transport_payload_{};
+  std::vector<std::uint8_t> expected_outbound_transport_payload_{};
+  bool outbound_transport_validated_ = false;
   std::string error_{};
 };
 
@@ -1181,6 +1215,65 @@ bool TestAppSessionReceivePacket() {
   return ok;
 }
 
+bool TestAppSessionSendPacket() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-app-session-send";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  const std::vector<std::uint8_t> payload = {0x53, 0x45, 0x4e, 0x44, 0x01};
+  LocalHandshakeResponder responder(0, 0, {}, payload);
+  if (!Require(responder.ready(), "local handshake responder must start for app-session send test")) {
+    return false;
+  }
+
+  swg::Config config = MakeValidConfig("127.0.0.1", responder.port());
+  config.profiles.at("default").persistent_keepalive = 0;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(),
+               "valid config must save before app-session send test")) {
+    return false;
+  }
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  if (!Require(opened.ok(), "app session must open before sending tunnel packets")) {
+    return false;
+  }
+
+  if (!Require(client.Connect().ok(), "connect must succeed before app-session packet send")) {
+    return false;
+  }
+
+  const auto counter = session.SendPacket(payload);
+  if (!Require(counter.ok(), "app session must send one authenticated tunnel packet through IPC")) {
+    return false;
+  }
+  if (!Require(counter.value == 1, "first app-session transport payload send must use counter one")) {
+    return false;
+  }
+
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must validate the outbound payload packet"
+                                                           : responder.error())) {
+    return false;
+  }
+
+  const auto stats = client.GetStats();
+  bool ok = true;
+  ok &= Require(stats.ok(), "stats query must succeed after app-session packet send");
+  if (stats.ok()) {
+    ok &= Require(stats.value.packets_out >= 3,
+                  "app-session packet send must increase outbound packet counters beyond handshake and keepalive");
+    ok &= Require(stats.value.bytes_out >
+                      swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                  "app-session packet send must increase outbound byte counters beyond handshake and keepalive");
+  }
+
+  ok &= Require(session.Close().ok(), "app session must close cleanly after packet send test");
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after app-session send test");
+  return ok;
+}
+
 bool TestMoonlightRoutePlanning() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-moonlight";
   std::error_code filesystem_error;
@@ -1263,6 +1356,7 @@ int main() {
   const bool inbound_payload_ok = TestInboundPayloadStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
+  const bool app_session_send_ok = TestAppSessionSendPacket();
   const bool app_session_recv_ok = TestAppSessionReceivePacket();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
@@ -1270,7 +1364,7 @@ int main() {
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
-          codec_ok && app_session_recv_ok && moonlight_ok)
+          codec_ok && app_session_send_ok && app_session_recv_ok && moonlight_ok)
              ? 0
              : 1;
 }

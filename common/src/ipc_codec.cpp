@@ -1088,6 +1088,44 @@ Result<TunnelPacket> DecodeTunnelPacketPayload(const ByteBuffer& payload) {
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const TunnelSendRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelSendRequest> DecodeTunnelSendRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelSendRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelSendRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<TunnelSendRequest>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<std::vector<std::uint8_t>> payload_bytes = reader.ReadByteVector();
+  if (!payload_bytes.ok()) {
+    return MakeFailure<TunnelSendRequest>(payload_bytes.error.code, payload_bytes.error.message);
+  }
+  value.payload = payload_bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelSendRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request) {
   RequestHeaderWire header{};
   header.abi_version = request.abi_version;
@@ -1271,6 +1309,13 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(session_id.error);
       }
       return EncodeResponseFromResult(service.RecvPacket(session_id.value));
+    }
+    case ServiceCommandId::SendPacket: {
+      const Result<TunnelSendRequest> send_request = DecodeTunnelSendRequestPayload(request.value.payload);
+      if (!send_request.ok()) {
+        return EncodeResponseFromError(send_request.error);
+      }
+      return EncodeResponseFromResult(service.SendPacket(send_request.value));
     }
   }
 

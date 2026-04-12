@@ -48,6 +48,14 @@ Result<NetworkPlan> AppSession::PlanNetwork(const NetworkPlanRequest& request) c
   return client_.GetNetworkPlan(scoped_request);
 }
 
+Result<std::uint64_t> AppSession::SendPacket(const std::vector<std::uint8_t>& payload) const {
+  if (!is_open()) {
+    return MakeFailure<std::uint64_t>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.SendPacket(session_id_, payload);
+}
+
 Result<TunnelPacket> AppSession::ReceivePacket() const {
   if (!is_open()) {
     return MakeFailure<TunnelPacket>(ErrorCode::InvalidState, "app session is not open");

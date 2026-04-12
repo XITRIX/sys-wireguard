@@ -28,6 +28,9 @@ constexpr std::size_t kMaxQueuedTransportPackets = 8;
 constexpr std::size_t kMaxQueuedTransportPayloadBytes = 8 * 1024;
 constexpr std::size_t kMaxHandshakeDatagramSize = 256;
 constexpr std::size_t kMaxTransportDatagramSize = 2048;
+constexpr std::size_t kWireGuardTransportAeadOverhead = 16;
+constexpr std::size_t kMaxOutboundTransportPayloadBytes =
+  kMaxTransportDatagramSize - kWireGuardTransportHeaderSize - kWireGuardTransportAeadOverhead;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::array<std::uint8_t, 4> CopyIpv4Bytes(const ParsedIpAddress& address) {
@@ -108,6 +111,14 @@ Error MakeResolveError(int rc, std::string_view host) {
   }
   return MakeError(code, std::move(message));
 }
+
+struct ReservedTransportSend {
+  PreparedTunnelEndpoint endpoint{};
+  WireGuardKey sending_key{};
+  std::uint32_t peer_sender_index = 0;
+  std::uint64_t counter = 0;
+  int socket_fd = -1;
+};
 
 class WgTunnelEngine final : public IWgTunnelEngine {
  public:
@@ -391,6 +402,42 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     return Error::None();
   }
 
+  Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) override {
+    if (payload.empty()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "authenticated transport payload must not be empty");
+    }
+    if (payload.size() > kMaxOutboundTransportPayloadBytes) {
+      return MakeFailure<std::uint64_t>(
+          ErrorCode::Unsupported,
+          "authenticated transport payload exceeds the current bounded send limit of " +
+              std::to_string(kMaxOutboundTransportPayloadBytes) + " bytes");
+    }
+
+    const Result<ReservedTransportSend> reserved = ReserveTransportSend();
+    if (!reserved.ok()) {
+      return MakeFailure<std::uint64_t>(reserved.error.code, reserved.error.message);
+    }
+
+    const Result<WireGuardTransportPacket> packet =
+        CreateTransportPacket(reserved.value.sending_key, reserved.value.peer_sender_index, payload, reserved.value.counter);
+    if (!packet.ok()) {
+      return MakeFailure<std::uint64_t>(packet.error.code, packet.error.message);
+    }
+    if (packet.value.packet.size() > kMaxTransportDatagramSize) {
+      return MakeFailure<std::uint64_t>(ErrorCode::Unsupported,
+                                        "authenticated transport datagram exceeds the current bounded send limit");
+    }
+
+    const Result<std::size_t> bytes_sent = SendReservedTransportDatagram(reserved.value, packet.value.packet.data(),
+                                                                         packet.value.packet.size());
+    if (!bytes_sent.ok()) {
+      return MakeFailure<std::uint64_t>(bytes_sent.error.code, bytes_sent.error.message);
+    }
+
+    RecordSuccessfulOutboundDatagram(bytes_sent.value);
+    return MakeSuccess(reserved.value.counter);
+  }
+
   Result<WireGuardConsumedTransportPacket> ReceivePacket() override {
     std::scoped_lock lock(engine_mutex_);
     if (queued_transport_packets_.empty()) {
@@ -424,6 +471,45 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   }
 
  private:
+  Result<ReservedTransportSend> ReserveTransportSend() {
+    std::scoped_lock lock(engine_mutex_);
+    if (!running_ || stop_requested_ || udp_socket_ < 0) {
+      return MakeFailure<ReservedTransportSend>(ErrorCode::InvalidState, "WireGuard transport is not running");
+    }
+
+    ReservedTransportSend reserved{};
+    reserved.endpoint = prepared_session_.endpoint;
+    reserved.sending_key = sending_key_;
+    reserved.peer_sender_index = peer_sender_index_;
+    reserved.counter = next_send_counter_++;
+    reserved.socket_fd = udp_socket_;
+    return MakeSuccess(std::move(reserved));
+  }
+
+  Result<std::size_t> SendReservedTransportDatagram(const ReservedTransportSend& reserved,
+                                                    const std::uint8_t* data,
+                                                    std::size_t size) {
+    std::scoped_lock send_lock(transport_send_mutex_);
+    const Result<std::size_t> bytes_sent =
+        socket_runtime_.SendTo(reserved.socket_fd, reserved.endpoint, data, size);
+    if (!bytes_sent.ok()) {
+      return MakeFailure<std::size_t>(bytes_sent.error.code, bytes_sent.error.message);
+    }
+    if (bytes_sent.value != size) {
+      return MakeFailure<std::size_t>(ErrorCode::IoError,
+                                      "authenticated transport send returned a short datagram for endpoint " +
+                                          DescribeResolvedEndpoint(reserved.endpoint));
+    }
+
+    return bytes_sent;
+  }
+
+  void RecordSuccessfulOutboundDatagram(std::size_t bytes_sent) {
+    std::scoped_lock lock(engine_mutex_);
+    stats_.bytes_out += bytes_sent;
+    ++stats_.packets_out;
+  }
+
   void ReceiveLoop() {
     std::array<std::uint8_t, kMaxTransportDatagramSize> buffer{};
 
@@ -522,16 +608,12 @@ class WgTunnelEngine final : public IWgTunnelEngine {
 
   void KeepaliveLoop() {
     while (true) {
-      PreparedTunnelEndpoint endpoint{};
-      WireGuardKey sending_key{};
-      std::uint32_t peer_sender_index = 0;
-      std::uint64_t counter = 0;
       std::uint16_t interval_seconds = 0;
-      int socket_fd = -1;
 
       {
         std::unique_lock lock(engine_mutex_);
-        if (keepalive_cv_.wait_for(lock, std::chrono::seconds(prepared_session_.persistent_keepalive), [this]() {
+        interval_seconds = prepared_session_.persistent_keepalive;
+        if (keepalive_cv_.wait_for(lock, std::chrono::seconds(interval_seconds), [this]() {
               return stop_requested_ || !running_;
             })) {
           return;
@@ -540,45 +622,41 @@ class WgTunnelEngine final : public IWgTunnelEngine {
         if (stop_requested_ || !running_) {
           return;
         }
+      }
 
-        endpoint = prepared_session_.endpoint;
-        sending_key = sending_key_;
-        peer_sender_index = peer_sender_index_;
-        counter = next_send_counter_;
-        interval_seconds = prepared_session_.persistent_keepalive;
-        socket_fd = udp_socket_;
+      const Result<ReservedTransportSend> reserved = ReserveTransportSend();
+      if (!reserved.ok()) {
+        if (reserved.error.code == ErrorCode::InvalidState) {
+          return;
+        }
+
+        LogWarning("wg_engine", "failed to reserve periodic keepalive transport state: " + reserved.error.message);
+        continue;
       }
 
       const Result<WireGuardTransportKeepalive> keepalive =
-          CreateTransportKeepalivePacket(sending_key, peer_sender_index, counter);
+          CreateTransportKeepalivePacket(reserved.value.sending_key, reserved.value.peer_sender_index,
+                                         reserved.value.counter);
       if (!keepalive.ok()) {
         LogWarning("wg_engine", "failed to build periodic keepalive packet: " + keepalive.error.message);
         continue;
       }
 
-      const Result<std::size_t> bytes_sent =
-          socket_runtime_.SendTo(socket_fd, endpoint, keepalive.value.packet.data(), keepalive.value.packet.size());
+      const Result<std::size_t> bytes_sent = SendReservedTransportDatagram(
+          reserved.value, keepalive.value.packet.data(), keepalive.value.packet.size());
       if (!bytes_sent.ok()) {
         LogWarning("wg_engine", "failed to send periodic keepalive after " + std::to_string(interval_seconds) +
                                     "s: " + bytes_sent.error.message);
         continue;
       }
-      if (bytes_sent.value != keepalive.value.packet.size()) {
-        LogWarning("wg_engine", "periodic keepalive send returned a short datagram");
-        continue;
-      }
 
-      {
-        std::scoped_lock lock(engine_mutex_);
-        stats_.bytes_out += bytes_sent.value;
-        ++stats_.packets_out;
-        ++next_send_counter_;
-      }
+      RecordSuccessfulOutboundDatagram(bytes_sent.value);
     }
   }
 
   BsdSocketRuntime socket_runtime_{};
   mutable std::mutex engine_mutex_{};
+  std::mutex transport_send_mutex_{};
   std::condition_variable keepalive_cv_{};
   std::thread keepalive_thread_{};
   std::thread receive_thread_{};
