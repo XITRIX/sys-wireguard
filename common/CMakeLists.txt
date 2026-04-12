@@ -5,6 +5,7 @@ add_library(swg_common STATIC
   src/log.cpp
   src/state_machine.cpp
   src/wg_crypto.cpp
+  src/wg_handshake.cpp
   src/wg_profile.cpp
 )
 

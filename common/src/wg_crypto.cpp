@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -146,6 +147,66 @@ Result<ScopedPsaKey> ImportPrivateKey(const WireGuardKey& private_key) {
 }
 
 }  // namespace
+
+Result<WireGuardKeyPair> GenerateWireGuardKeyPair() {
+  const psa_status_t init_status = EnsurePsaCrypto();
+  if (init_status != PSA_SUCCESS) {
+    return Result<WireGuardKeyPair>::Failure(MakePsaError(init_status, "psa_crypto_init"));
+  }
+
+  psa_key_attributes_t attributes = MakeX25519PrivateAttributes();
+  mbedtls_svc_key_id_t key_id = MBEDTLS_SVC_KEY_ID_INIT;
+  const psa_status_t generate_status = psa_generate_key(&attributes, &key_id);
+  psa_reset_key_attributes(&attributes);
+  if (generate_status != PSA_SUCCESS) {
+    return Result<WireGuardKeyPair>::Failure(MakePsaError(generate_status, "psa_generate_key"));
+  }
+
+  ScopedPsaKey generated_key(key_id);
+  std::array<std::uint8_t,
+             PSA_EXPORT_KEY_OUTPUT_SIZE(PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY), 255)>
+      private_key_bytes{};
+  size_t private_key_size = 0;
+  psa_status_t export_status =
+      psa_export_key(generated_key.get(), private_key_bytes.data(), private_key_bytes.size(), &private_key_size);
+  if (export_status != PSA_SUCCESS) {
+    return Result<WireGuardKeyPair>::Failure(MakePsaError(export_status, "psa_export_key"));
+  }
+
+  std::array<std::uint8_t,
+             PSA_EXPORT_PUBLIC_KEY_OUTPUT_SIZE(PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY), 255)>
+      public_key_bytes{};
+  size_t public_key_size = 0;
+  export_status = psa_export_public_key(generated_key.get(), public_key_bytes.data(), public_key_bytes.size(),
+                                        &public_key_size);
+  if (export_status != PSA_SUCCESS) {
+    return Result<WireGuardKeyPair>::Failure(MakePsaError(export_status, "psa_export_public_key"));
+  }
+
+  if (private_key_size != kWireGuardKeySize || public_key_size != kWireGuardKeySize) {
+    return MakeFailure<WireGuardKeyPair>(ErrorCode::InvalidConfig,
+                                         "psa generated an unexpected X25519 key size");
+  }
+
+  WireGuardKeyPair key_pair{};
+  std::copy_n(private_key_bytes.begin(), key_pair.private_key.bytes.size(), key_pair.private_key.bytes.begin());
+  std::copy_n(public_key_bytes.begin(), key_pair.public_key.bytes.size(), key_pair.public_key.bytes.begin());
+  return MakeSuccess(key_pair);
+}
+
+Error GenerateRandomBytes(std::uint8_t* output, std::size_t size) {
+  const psa_status_t init_status = EnsurePsaCrypto();
+  if (init_status != PSA_SUCCESS) {
+    return MakePsaError(init_status, "psa_crypto_init");
+  }
+
+  const psa_status_t random_status = psa_generate_random(output, size);
+  if (random_status != PSA_SUCCESS) {
+    return MakePsaError(random_status, "psa_generate_random");
+  }
+
+  return Error::None();
+}
 
 Result<WireGuardKey> DeriveWireGuardPublicKey(const WireGuardKey& private_key) {
   const Result<ScopedPsaKey> imported_key = ImportPrivateKey(private_key);

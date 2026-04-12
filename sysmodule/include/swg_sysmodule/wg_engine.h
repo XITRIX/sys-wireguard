@@ -70,6 +70,6 @@ class IWgTunnelEngine {
   [[nodiscard]] virtual bool IsRunning() const = 0;
 };
 
-std::unique_ptr<IWgTunnelEngine> CreateStubWgTunnelEngine();
+std::unique_ptr<IWgTunnelEngine> CreateWgTunnelEngine();
 
 }  // namespace swg::sysmodule

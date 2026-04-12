@@ -10,6 +10,8 @@
 | State transitions | Verified | Covered by `swg_tests` |
 | IPC codec round-trip | Verified | Covered by `swg_tests` using request/response encoding helpers |
 | SDK client host binding | Verified | Regression-covered in `swg_tests` |
+| WireGuard handshake round-trip | Verified | `swg_tests` now covers initiation build, responder processing, and initiator response validation in-process |
+| Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
 
@@ -26,4 +28,4 @@
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |
 | Overlay queries status | Deferred | Tesla overlay is intentionally outside the current Phase A scope |
-| Connect/disconnect loop | In progress | `Connect()` now runs WireGuard preflight validation before using the stub tunnel engine, but handshake and UDP transport are not integrated yet |
+| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, and only then reports `Connected`; real hardware peer-response validation is the next on-device check |

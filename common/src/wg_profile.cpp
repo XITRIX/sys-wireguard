@@ -295,6 +295,13 @@ Result<ValidatedWireGuardProfile> ValidateWireGuardProfileForConnect(const Profi
                                                       local_public_key.error.message);
   }
 
+  if (local_public_key.value.bytes == public_key.value.bytes) {
+    return MakeFailure<ValidatedWireGuardProfile>(
+        ErrorCode::InvalidConfig,
+        "profile '" + profile.name +
+            "': public_key must be the remote peer public key and must not match the local public key derived from private_key");
+  }
+
   const Result<WireGuardKey> static_shared_secret =
       ComputeWireGuardSharedSecret(private_key.value, public_key.value);
   if (!static_shared_secret.ok()) {

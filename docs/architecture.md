@@ -20,6 +20,7 @@ Current implementation boundaries:
 - Config, runtime state, and logging are centralized in the sysmodule service boundary.
 - The overlay stub talks through the SDK client, not by mutating files directly.
 - Host execution is a first-class development mode so the control plane can be tested without device-only dependencies.
+- A dedicated host live-handshake probe now exists for Milestone 4 diagnosis so a real config can be exercised through the same local control service and tunnel engine path without deploying to hardware.
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
@@ -29,7 +30,7 @@ Current implementation boundaries:
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
-- The current engine scaffold now owns a small BSD socket runtime boundary and opens one connected IPv4 UDP socket per active tunnel session, without claiming any WireGuard handshake or packet-processing support yet.
+- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a one-shot WireGuard initiation packet, and validates the handshake response before exposing `Connected`.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
 
 ## Runtime paths
@@ -72,6 +73,6 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 ## What is intentionally deferred
 
 - Tesla overlay parity, rendering, and input handling
-- WireGuard engine integration
+- WireGuard cookie handling, rekeys, and transport packet loop
 - DNS-over-tunnel and MITM logic
 - policy-driven transparent routing

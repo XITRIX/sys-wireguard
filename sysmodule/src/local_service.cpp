@@ -107,6 +107,21 @@ std::string BuildAppSessionNotes(const AppTunnelRequest& request, const std::str
   return stream.str();
 }
 
+TunnelStats MergeEngineStats(const TunnelStats& base, const TunnelStats& engine) {
+  TunnelStats merged = base;
+  merged.bytes_in += engine.bytes_in;
+  merged.bytes_out += engine.bytes_out;
+  merged.packets_in += engine.packets_in;
+  merged.packets_out += engine.packets_out;
+  merged.successful_handshakes += engine.successful_handshakes;
+  merged.reconnects += engine.reconnects;
+  merged.dns_queries += engine.dns_queries;
+  merged.dns_fallbacks += engine.dns_fallbacks;
+  merged.leak_prevention_events += engine.leak_prevention_events;
+  merged.last_handshake_age_seconds = engine.last_handshake_age_seconds;
+  return merged;
+}
+
 class LocalControlService final : public IControlService {
  public:
   explicit LocalControlService(std::filesystem::path runtime_root) : paths_(DetectRuntimePaths(runtime_root)) {
@@ -263,9 +278,11 @@ class LocalControlService final : public IControlService {
       return mark_error;
     }
 
+    state_machine_.UpdateStats(MergeEngineStats(state_machine_.snapshot().stats, tunnel_engine_->GetStats()));
+
     LogInfo("sysmodule", "connect requested with prepared session: " +
                             DescribePreparedTunnelSession(prepared_session.value) +
-                            " (handshake and transport remain stubbed)");
+                            " (WireGuard response validated)");
     return Error::None();
   }
 
@@ -522,7 +539,7 @@ class LocalControlService final : public IControlService {
   mutable std::mutex mutex_;
   Config config_{};
   ConnectionStateMachine state_machine_{};
-  std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateStubWgTunnelEngine();
+  std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateWgTunnelEngine();
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};

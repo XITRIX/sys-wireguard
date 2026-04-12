@@ -1,6 +1,16 @@
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "swg/app_session.h"
 #include "swg/client.h"
@@ -9,6 +19,7 @@
 #include "swg/moonlight.h"
 #include "swg/state_machine.h"
 #include "swg/wg_crypto.h"
+#include "swg/wg_handshake.h"
 #include "swg/wg_profile.h"
 #include "swg_sysmodule/wg_engine.h"
 #include "swg_sysmodule/host_transport.h"
@@ -29,6 +40,186 @@ constexpr const char* kSamplePublicKey = "Kx666j8fvAMhWmqVQsmtmXeljBNvf0vB1SEHaU
 constexpr const char* kSamplePeerPrivateKey = "mJTpfsnklx/WSF8AEbdbvB8pimF17uoRX69FYVxs2F4=";
 constexpr const char* kSampleLocalPublicKey = "qsqG0CFCWMI/D34HIRhM9ZdXpmhvrKJK/FNQ5Q1egRo=";
 constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
+std::string DescribeSocketError(const char* operation) {
+  return std::string(operation) + " failed: " + std::strerror(errno);
+}
+
+swg::Result<swg::WireGuardHandshakeConfig> MakeHandshakeInitiatorConfig() {
+  const auto local_private = swg::ParseWireGuardKey(kSamplePrivateKey, "private_key");
+  if (!local_private.ok()) {
+    return swg::MakeFailure<swg::WireGuardHandshakeConfig>(local_private.error.code, local_private.error.message);
+  }
+
+  const auto local_public = swg::ParseWireGuardKey(kSampleLocalPublicKey, "local_public_key");
+  if (!local_public.ok()) {
+    return swg::MakeFailure<swg::WireGuardHandshakeConfig>(local_public.error.code, local_public.error.message);
+  }
+
+  const auto peer_public = swg::ParseWireGuardKey(kSamplePublicKey, "public_key");
+  if (!peer_public.ok()) {
+    return swg::MakeFailure<swg::WireGuardHandshakeConfig>(peer_public.error.code, peer_public.error.message);
+  }
+
+  const auto preshared = swg::ParseWireGuardKey(kSamplePresharedKey, "preshared_key");
+  if (!preshared.ok()) {
+    return swg::MakeFailure<swg::WireGuardHandshakeConfig>(preshared.error.code, preshared.error.message);
+  }
+
+  swg::WireGuardHandshakeConfig config{};
+  config.local_private_key = local_private.value;
+  config.local_public_key = local_public.value;
+  config.peer_public_key = peer_public.value;
+  config.preshared_key = preshared.value;
+  config.has_preshared_key = true;
+  return swg::MakeSuccess(config);
+}
+
+swg::Result<swg::WireGuardResponderConfig> MakeHandshakeResponderConfig() {
+  const auto responder_private = swg::ParseWireGuardKey(kSamplePeerPrivateKey, "responder_private_key");
+  if (!responder_private.ok()) {
+    return swg::MakeFailure<swg::WireGuardResponderConfig>(responder_private.error.code,
+                                                           responder_private.error.message);
+  }
+
+  const auto responder_public = swg::ParseWireGuardKey(kSamplePublicKey, "responder_public_key");
+  if (!responder_public.ok()) {
+    return swg::MakeFailure<swg::WireGuardResponderConfig>(responder_public.error.code,
+                                                           responder_public.error.message);
+  }
+
+  const auto expected_peer = swg::ParseWireGuardKey(kSampleLocalPublicKey, "expected_peer_public_key");
+  if (!expected_peer.ok()) {
+    return swg::MakeFailure<swg::WireGuardResponderConfig>(expected_peer.error.code,
+                                                           expected_peer.error.message);
+  }
+
+  const auto preshared = swg::ParseWireGuardKey(kSamplePresharedKey, "preshared_key");
+  if (!preshared.ok()) {
+    return swg::MakeFailure<swg::WireGuardResponderConfig>(preshared.error.code, preshared.error.message);
+  }
+
+  swg::WireGuardResponderConfig config{};
+  config.local_private_key = responder_private.value;
+  config.local_public_key = responder_public.value;
+  config.expected_peer_public_key = expected_peer.value;
+  config.preshared_key = preshared.value;
+  config.has_preshared_key = true;
+  return swg::MakeSuccess(config);
+}
+
+class LocalHandshakeResponder {
+ public:
+  LocalHandshakeResponder() {
+    socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd_ < 0) {
+      error_ = DescribeSocketError("socket");
+      return;
+    }
+
+    timeval timeout{};
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+    if (::setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+      error_ = DescribeSocketError("setsockopt");
+      return;
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(socket_fd_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+      error_ = DescribeSocketError("bind");
+      return;
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(socket_fd_, reinterpret_cast<sockaddr*>(&address), &address_length) != 0) {
+      error_ = DescribeSocketError("getsockname");
+      return;
+    }
+
+    port_ = ntohs(address.sin_port);
+    worker_ = std::thread([this]() {
+      Run();
+    });
+  }
+
+  LocalHandshakeResponder(const LocalHandshakeResponder&) = delete;
+  LocalHandshakeResponder& operator=(const LocalHandshakeResponder&) = delete;
+
+  ~LocalHandshakeResponder() {
+    Join();
+    if (socket_fd_ >= 0) {
+      ::close(socket_fd_);
+    }
+  }
+
+  bool ready() const {
+    return error_.empty() && socket_fd_ >= 0 && port_ != 0;
+  }
+
+  std::uint16_t port() const {
+    return port_;
+  }
+
+  bool Join() {
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    return error_.empty() && responded_;
+  }
+
+  const std::string& error() const {
+    return error_;
+  }
+
+ private:
+  void Run() {
+    const auto responder_config = MakeHandshakeResponderConfig();
+    if (!responder_config.ok()) {
+      error_ = responder_config.error.message;
+      return;
+    }
+
+    std::array<std::uint8_t, 256> buffer{};
+    sockaddr_in client_address{};
+    socklen_t client_length = sizeof(client_address);
+    const ssize_t received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                        reinterpret_cast<sockaddr*>(&client_address), &client_length);
+    if (received < 0) {
+      error_ = DescribeSocketError("recvfrom");
+      return;
+    }
+
+    const auto response = swg::RespondToHandshakeInitiationForTest(
+        responder_config.value, buffer.data(), static_cast<std::size_t>(received));
+    if (!response.ok()) {
+      error_ = response.error.message;
+      return;
+    }
+
+    const ssize_t sent = ::sendto(socket_fd_, response.value.packet.data(), response.value.packet.size(), 0,
+                                  reinterpret_cast<const sockaddr*>(&client_address), client_length);
+    if (sent < 0) {
+      error_ = DescribeSocketError("sendto");
+      return;
+    }
+    if (static_cast<std::size_t>(sent) != response.value.packet.size()) {
+      error_ = "sendto returned a short WireGuard response";
+      return;
+    }
+
+    responded_ = true;
+  }
+
+  int socket_fd_ = -1;
+  std::uint16_t port_ = 0;
+  std::thread worker_{};
+  bool responded_ = false;
+  std::string error_{};
+};
 
 bool TestWireGuardCrypto() {
   bool ok = true;
@@ -74,6 +265,48 @@ bool TestWireGuardCrypto() {
   return ok;
 }
 
+bool TestWireGuardHandshakeRoundTrip() {
+  const auto initiator_config = MakeHandshakeInitiatorConfig();
+  const auto responder_config = MakeHandshakeResponderConfig();
+
+  bool ok = true;
+  ok &= Require(initiator_config.ok(), "sample initiator handshake config must parse");
+  ok &= Require(responder_config.ok(), "sample responder handshake config must parse");
+  if (!initiator_config.ok() || !responder_config.ok()) {
+    return false;
+  }
+
+  const auto initiation = swg::CreateHandshakeInitiation(initiator_config.value);
+  ok &= Require(initiation.ok(), "handshake initiation packet must build");
+  if (!initiation.ok()) {
+    return false;
+  }
+
+  const auto response = swg::RespondToHandshakeInitiationForTest(
+      responder_config.value, initiation.value.packet.data(), initiation.value.packet.size());
+  ok &= Require(response.ok(), "responder must build a valid handshake response");
+  if (!response.ok()) {
+    return false;
+  }
+
+  const auto validated = swg::ConsumeHandshakeResponse(
+      initiator_config.value, initiation.value.state, response.value.packet.data(), response.value.packet.size());
+  ok &= Require(validated.ok(), "initiator must validate the responder handshake response");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  ok &= Require(validated.value.local_sender_index == initiation.value.state.sender_index,
+                "validated handshake must preserve the initiator sender index");
+  ok &= Require(validated.value.peer_sender_index == response.value.sender_index,
+                "validated handshake must preserve the responder sender index");
+  ok &= Require(validated.value.sending_key.bytes == response.value.receiving_key.bytes,
+                "initiator sending key must match responder receiving key");
+  ok &= Require(validated.value.receiving_key.bytes == response.value.sending_key.bytes,
+                "initiator receiving key must match responder sending key");
+  return ok;
+}
+
 bool TestEndpointAndNetworkParsing() {
   bool ok = true;
 
@@ -111,15 +344,15 @@ bool TestEndpointAndNetworkParsing() {
   return ok;
 }
 
-swg::Config MakeValidConfig() {
+swg::Config MakeValidConfig(std::string endpoint_host = "localhost", std::uint16_t endpoint_port = 51820) {
   swg::Config config = swg::DefaultConfig();
   swg::ProfileConfig profile{};
   profile.name = "default";
   profile.private_key = kSamplePrivateKey;
   profile.public_key = kSamplePublicKey;
   profile.preshared_key = kSamplePresharedKey;
-  profile.endpoint_host = "localhost";
-  profile.endpoint_port = 51820;
+  profile.endpoint_host = std::move(endpoint_host);
+  profile.endpoint_port = endpoint_port;
   profile.allowed_ips = {"0.0.0.0/0", "::/0"};
   profile.addresses = {"10.0.0.2/32"};
   profile.dns_servers = {"1.1.1.1", "1.0.0.1"};
@@ -167,6 +400,15 @@ bool TestWireGuardProfileValidation() {
   invalid_config.profiles.at("default").allowed_ips = {"not-a-cidr"};
   const auto invalid_cidr = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
   ok &= Require(!invalid_cidr.ok(), "invalid allowed_ips entry must fail connect validation");
+
+  invalid_config = MakeValidConfig();
+  invalid_config.profiles.at("default").public_key = kSampleLocalPublicKey;
+  const auto self_peer = swg::ValidateWireGuardProfileForConnect(invalid_config.profiles.at("default"));
+  ok &= Require(!self_peer.ok(), "peer public key must not match the local derived public key");
+  if (!self_peer.ok()) {
+    ok &= Require(self_peer.error.message.find("must not match the local public key") != std::string::npos,
+                  "self-peer validation failure must explain the remote peer key requirement");
+  }
   return ok;
 }
 
@@ -288,8 +530,13 @@ bool TestTunnelEndpointResolution() {
   return ok;
 }
 
-bool TestTunnelEngineUdpScaffold() {
-  const swg::Config valid_config = MakeValidConfig();
+bool TestTunnelEngineHandshake() {
+  LocalHandshakeResponder responder;
+  if (!Require(responder.ready(), "local handshake responder must start for engine handshake test")) {
+    return false;
+  }
+
+  const swg::Config valid_config = MakeValidConfig("127.0.0.1", responder.port());
   const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
 
   bool ok = true;
@@ -305,13 +552,22 @@ bool TestTunnelEngineUdpScaffold() {
     return false;
   }
 
-  auto engine = swg::sysmodule::CreateStubWgTunnelEngine();
+  auto engine = swg::sysmodule::CreateWgTunnelEngine();
   const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
-  ok &= Require(start_error.ok(), "engine start must open the UDP scaffold for a resolvable endpoint");
-  ok &= Require(engine->IsRunning(), "engine must report running after UDP scaffold start");
-  ok &= Require(engine->GetStats().successful_handshakes == 0,
-                "UDP scaffold must not claim a successful WireGuard handshake");
-  ok &= Require(engine->Stop().ok(), "engine stop must close the UDP scaffold cleanly");
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must answer the initiation"
+                                                            : responder.error());
+  ok &= Require(start_error.ok(), "engine start must complete a WireGuard handshake against the local responder");
+  ok &= Require(engine->IsRunning(), "engine must report running after handshake success");
+  if (start_error.ok()) {
+    const swg::TunnelStats stats = engine->GetStats();
+    ok &= Require(stats.successful_handshakes == 1,
+                  "engine handshake must record one successful handshake");
+    ok &= Require(stats.bytes_out == swg::kWireGuardHandshakeInitiationSize,
+                  "engine handshake must send one initiation packet");
+    ok &= Require(stats.bytes_in == swg::kWireGuardHandshakeResponseSize,
+                  "engine handshake must receive one response packet");
+  }
+  ok &= Require(engine->Stop().ok(), "engine stop must close the handshake socket cleanly");
   ok &= Require(!engine->IsRunning(), "engine must report stopped after shutdown");
   return ok;
 }
@@ -375,16 +631,26 @@ bool TestClientHostBinding() {
   return ok;
 }
 
-bool TestConnectPreflightStats() {
+bool TestConnectHandshakeStats() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-connect";
   std::error_code filesystem_error;
   std::filesystem::remove_all(runtime_root, filesystem_error);
 
-  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
-  if (!Require(client.SaveConfig(MakeValidConfig()).ok(), "valid config must save before connect preflight test")) {
+  LocalHandshakeResponder responder;
+  if (!Require(responder.ready(), "local handshake responder must start for service connect test")) {
     return false;
   }
-  if (!Require(client.Connect().ok(), "connect must succeed after WireGuard preflight")) {
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before connect handshake test")) {
+    return false;
+  }
+  if (!Require(client.Connect().ok(), "connect must succeed after receiving a WireGuard handshake response")) {
+    return false;
+  }
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must complete the service handshake"
+                                                           : responder.error())) {
     return false;
   }
 
@@ -399,10 +665,10 @@ bool TestConnectPreflightStats() {
   }
 
   ok &= Require(stats.value.connect_attempts == 1, "connect must increment connect_attempts");
-  ok &= Require(stats.value.successful_handshakes == 0,
-                "connect must not claim a successful handshake before transport integration exists");
+  ok &= Require(stats.value.successful_handshakes == 1,
+                "connect must record a successful WireGuard handshake after response validation");
   ok &= Require(status.value.state == swg::TunnelState::Connected,
-                "validated placeholder engine should keep the existing connected UX for now");
+                "validated handshake should move the control service into connected state");
   return ok;
 }
 
@@ -481,8 +747,14 @@ bool TestMoonlightRoutePlanning() {
   std::error_code filesystem_error;
   std::filesystem::remove_all(runtime_root, filesystem_error);
 
+  LocalHandshakeResponder responder;
+  if (!Require(responder.ready(), "local handshake responder must start for Moonlight planning")) {
+    return false;
+  }
+
   swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
-  if (!Require(client.SaveConfig(MakeValidConfig()).ok(), "valid config must save before Moonlight planning")) {
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before Moonlight planning")) {
     return false;
   }
 
@@ -511,6 +783,8 @@ bool TestMoonlightRoutePlanning() {
                 "control traffic should be denied until the tunnel is connected");
 
   ok &= Require(client.Connect().ok(), "service connect must succeed for Moonlight planning");
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the Moonlight handshake"
+                                                            : responder.error());
 
   const auto dns = session.PlanNetwork(swg::MakeMoonlightDnsPlan("vpn.example.test"));
   ok &= Require(dns.ok(), "dns plan must succeed after connect");
@@ -536,19 +810,20 @@ int main() {
   const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
   const bool wg_crypto_ok = TestWireGuardCrypto();
+  const bool wg_handshake_ok = TestWireGuardHandshakeRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
   const bool tunnel_session_ok = TestTunnelSessionPreparation();
   const bool endpoint_resolution_ok = TestTunnelEndpointResolution();
-  const bool udp_scaffold_ok = TestTunnelEngineUdpScaffold();
+  const bool engine_handshake_ok = TestTunnelEngineHandshake();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
-  const bool connect_preflight_ok = TestConnectPreflightStats();
+  const bool connect_handshake_ok = TestConnectHandshakeStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-        return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_validation_ok && tunnel_session_ok &&
-          endpoint_resolution_ok && udp_scaffold_ok && state_ok && client_ok && connect_preflight_ok &&
-          invalid_connect_ok && codec_ok && moonlight_ok)
+  return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
+          tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && state_ok && client_ok &&
+          connect_handshake_ok && invalid_connect_ok && codec_ok && moonlight_ok)
              ? 0
              : 1;
 }

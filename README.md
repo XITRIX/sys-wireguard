@@ -11,11 +11,12 @@ Current scope:
 - A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
 - Real X25519-based WireGuard cryptographic preflight using mbedTLS PSA, including local public-key derivation and static peer shared-secret validation.
+- A real one-shot WireGuard handshake path that builds an initiation packet, sends it over the connected UDP socket, validates the response, and only then reports `Connected`.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
 - Tesla UI wiring, deferred from Phase A.
-- Full WireGuard Noise handshake and transport packet engine.
+- WireGuard cookie replies, retries/rekeys, and transport data packets.
 - Transparent routing or MITM paths.
 
 ## Repository layout
@@ -37,6 +38,32 @@ cmake --preset host-debug
 cmake --build --preset host-debug
 ctest --preset host-debug
 ```
+
+Manual live host handshake probe against a real config and server:
+
+```sh
+./build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"
+```
+
+That probe loads a real config file, stages it into an isolated host runtime root, and runs the normal `swg:ctl` host `Connect()` path against the configured endpoint. It is intentionally not part of the default `ctest` suite because it depends on external network reachability and server state.
+
+Deterministic initiation dump and packet comparison:
+
+```sh
+./build/host-debug/tests/swg_live_handshake_probe \
+	--config "$PWD/docs/config.ini" \
+	--dump-initiation "$PWD/test-runtime-live-handshake/initiation.hex" \
+	--no-connect
+```
+
+```sh
+./build/host-debug/tests/swg_live_handshake_probe \
+	--config "$PWD/docs/config.ini" \
+	--compare-initiation /path/to/reference-initiation.hex \
+	--no-connect
+```
+
+The comparison mode generates a deterministic initiation packet with fixed sender index, ephemeral private key, and timestamp so exact byte comparison is meaningful. The reference file can be a raw 148-byte packet or a hex dump with whitespace.
 
 Switch-target configuration slice:
 
@@ -72,8 +99,8 @@ Right now, the Switch manager can read and use an existing config, but it cannot
 The practical way to try the current connect path is to manually create `sdmc:/config/swg/config.ini` using the example in [docs/sample-config.ini](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/sample-config.ini).
 
 Current constraints:
-- `Connect()` now validates real X25519 key material, derives the local public key, validates the peer public key by computing the static shared secret, then starts the stub tunnel-engine boundary.
-- It still does not perform a real Noise handshake or establish live tunnel traffic yet.
+- `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet, waits for a response, and validates that response before the service enters `Connected`.
+- It still does not implement cookie replies, retransmits, rekeying, or transport data packets yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
@@ -89,9 +116,12 @@ After a host build:
 ./build/host-debug/manager/swg_manager_stub sample-profile
 ./build/host-debug/overlay/swg_overlay_stub status
 ./build/host-debug/overlay/swg_overlay_stub connect
+./build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"
 ```
 
 The host runtime creates files under `build/host-debug/runtime/` when executed from the build directory, or `runtime/` from the current working directory.
+The live handshake probe uses its own isolated runtime root, prints the derived local and configured peer public keys before connect, and is useful for separating host-side protocol behavior from Switch BSD or connectivity issues.
+It can also emit a deterministic initiation packet dump for side-by-side comparison with a reference client or server capture.
 
 ## Phase A status
 
@@ -124,6 +154,6 @@ This keeps the sysmodule consumer API aligned with Moonlight-Switch's current ar
 
 Next:
 - manager UX expansion
-- WireGuard handshake packet assembly and transport wiring on top of the current crypto preflight
+- WireGuard cookie reply handling, retries/rekeys, and first data-packet / keepalive support on top of the new handshake path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

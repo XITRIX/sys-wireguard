@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -31,9 +32,17 @@ extern "C" {
 namespace swg::sysmodule {
 namespace {
 
+bool IsTimeoutErrno(int error_number) {
+  return error_number == EAGAIN || error_number == EWOULDBLOCK || error_number == ETIMEDOUT;
+}
+
 #if !defined(SWG_PLATFORM_SWITCH)
 std::string DescribeErrno(const char* operation) {
   return std::string(operation) + " failed: " + std::strerror(errno);
+}
+
+std::string DescribeErrnoValue(const char* operation, int error_number) {
+  return std::string(operation) + " failed: " + std::strerror(error_number);
 }
 #endif
 
@@ -357,14 +366,9 @@ bool BsdSocketRuntime::IsStarted() const {
   return started_;
 }
 
-Result<int> BsdSocketRuntime::OpenConnectedUdpSocket(const PreparedTunnelEndpoint& endpoint) const {
+Result<int> BsdSocketRuntime::OpenUdpSocket() const {
   if (!started_) {
     return MakeFailure<int>(ErrorCode::InvalidState, "socket runtime is not initialized");
-  }
-
-  if (endpoint.state != PreparedEndpointState::Ready) {
-    return MakeFailure<int>(ErrorCode::InvalidState,
-                            "prepared endpoint must be resolved before opening a UDP socket");
   }
 
 #if defined(SWG_PLATFORM_SWITCH)
@@ -378,6 +382,25 @@ Result<int> BsdSocketRuntime::OpenConnectedUdpSocket(const PreparedTunnelEndpoin
     return MakeFailure<int>(ErrorCode::IoError, DescribeErrno("socket"));
   }
 #endif
+
+  return MakeSuccess(socket_fd);
+}
+
+Result<int> BsdSocketRuntime::OpenConnectedUdpSocket(const PreparedTunnelEndpoint& endpoint) const {
+  if (!started_) {
+    return MakeFailure<int>(ErrorCode::InvalidState, "socket runtime is not initialized");
+  }
+
+  if (endpoint.state != PreparedEndpointState::Ready) {
+    return MakeFailure<int>(ErrorCode::InvalidState,
+                            "prepared endpoint must be resolved before opening a UDP socket");
+  }
+
+  const Result<int> socket_result = OpenUdpSocket();
+  if (!socket_result.ok()) {
+    return socket_result;
+  }
+  int socket_fd = socket_result.value;
 
   sockaddr_in remote{};
   remote.sin_family = AF_INET;
@@ -404,6 +427,194 @@ Result<int> BsdSocketRuntime::OpenConnectedUdpSocket(const PreparedTunnelEndpoin
   }
 
   return MakeSuccess(socket_fd);
+}
+
+Result<std::size_t> BsdSocketRuntime::SendTo(int socket_fd,
+                                             const PreparedTunnelEndpoint& endpoint,
+                                             const std::uint8_t* buffer,
+                                             std::size_t size) const {
+  if (!started_) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime is not initialized");
+  }
+  if (socket_fd < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime requires a valid UDP socket");
+  }
+  if (endpoint.state != PreparedEndpointState::Ready) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState,
+                                    "prepared endpoint must be resolved before sending a UDP datagram");
+  }
+
+  sockaddr_in remote{};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(endpoint.port);
+  std::memcpy(&remote.sin_addr, endpoint.ipv4.data(), endpoint.ipv4.size());
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const ssize_t bytes_sent = bsdSendTo(socket_fd, buffer, size, 0,
+                                       reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+  if (bytes_sent < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeBsdFailure("bsdSendTo"));
+  }
+#else
+  const ssize_t bytes_sent = ::sendto(socket_fd, buffer, size, 0,
+                                      reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+  if (bytes_sent < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeErrno("sendto"));
+  }
+#endif
+
+  return MakeSuccess(static_cast<std::size_t>(bytes_sent));
+}
+
+Result<std::size_t> BsdSocketRuntime::Send(int socket_fd, const std::uint8_t* buffer, std::size_t size) const {
+  if (!started_) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime is not initialized");
+  }
+  if (socket_fd < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime requires a valid UDP socket");
+  }
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const ssize_t bytes_sent = bsdSend(socket_fd, buffer, size, 0);
+  if (bytes_sent < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeBsdFailure("bsdSend"));
+  }
+#else
+  const ssize_t bytes_sent = ::send(socket_fd, buffer, size, 0);
+  if (bytes_sent < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeErrno("send"));
+  }
+#endif
+
+  return MakeSuccess(static_cast<std::size_t>(bytes_sent));
+}
+
+Result<ReceivedUdpDatagram> BsdSocketRuntime::ReceiveFrom(int socket_fd,
+                                                          std::uint8_t* buffer,
+                                                          std::size_t size,
+                                                          std::uint32_t timeout_ms) const {
+  if (!started_) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::InvalidState, "socket runtime is not initialized");
+  }
+  if (socket_fd < 0) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::InvalidState,
+                                            "socket runtime requires a valid UDP socket");
+  }
+
+  pollfd descriptor{};
+  descriptor.fd = socket_fd;
+  descriptor.events = POLLIN;
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const int poll_result = bsdPoll(&descriptor, 1, static_cast<int>(timeout_ms));
+  if (poll_result < 0) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError, DescribeBsdFailure("bsdPoll"));
+  }
+#else
+  const int poll_result = ::poll(&descriptor, 1, static_cast<int>(timeout_ms));
+  if (poll_result < 0) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError, DescribeErrno("poll"));
+  }
+#endif
+
+  if (poll_result == 0) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError,
+                                            "recv timed out after " + std::to_string(timeout_ms) + "ms");
+  }
+  if ((descriptor.revents & POLLIN) == 0) {
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError,
+                                            "poll returned without readable WireGuard UDP data");
+  }
+
+  sockaddr_in source{};
+  socklen_t source_length = sizeof(source);
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const ssize_t bytes_received = bsdRecvFrom(socket_fd, buffer, size, 0,
+                                             reinterpret_cast<sockaddr*>(&source), &source_length);
+  if (bytes_received < 0) {
+    if (IsTimeoutErrno(g_bsdErrno)) {
+      return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError,
+                                              "recv timed out after " + std::to_string(timeout_ms) + "ms");
+    }
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError, DescribeBsdFailure("bsdRecvFrom"));
+  }
+#else
+  const ssize_t bytes_received = ::recvfrom(socket_fd, buffer, size, 0,
+                                            reinterpret_cast<sockaddr*>(&source), &source_length);
+  if (bytes_received < 0) {
+    if (IsTimeoutErrno(errno)) {
+      return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError,
+                                              "recv timed out after " + std::to_string(timeout_ms) + "ms");
+    }
+    return MakeFailure<ReceivedUdpDatagram>(ErrorCode::IoError, DescribeErrnoValue("recvfrom", errno));
+  }
+#endif
+
+  ReceivedUdpDatagram datagram{};
+  datagram.size = static_cast<std::size_t>(bytes_received);
+  std::memcpy(datagram.source_ipv4.data(), &source.sin_addr, datagram.source_ipv4.size());
+  datagram.source_port = ntohs(source.sin_port);
+  return MakeSuccess(datagram);
+}
+
+Result<std::size_t> BsdSocketRuntime::Receive(int socket_fd,
+                                              std::uint8_t* buffer,
+                                              std::size_t size,
+                                              std::uint32_t timeout_ms) const {
+  if (!started_) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime is not initialized");
+  }
+  if (socket_fd < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::InvalidState, "socket runtime requires a valid UDP socket");
+  }
+
+  pollfd descriptor{};
+  descriptor.fd = socket_fd;
+  descriptor.events = POLLIN;
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const int poll_result = bsdPoll(&descriptor, 1, static_cast<int>(timeout_ms));
+  if (poll_result < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeBsdFailure("bsdPoll"));
+  }
+#else
+  const int poll_result = ::poll(&descriptor, 1, static_cast<int>(timeout_ms));
+  if (poll_result < 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeErrno("poll"));
+  }
+#endif
+
+  if (poll_result == 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError,
+                                    "recv timed out after " + std::to_string(timeout_ms) + "ms");
+  }
+  if ((descriptor.revents & POLLIN) == 0) {
+    return MakeFailure<std::size_t>(ErrorCode::IoError,
+                                    "poll returned without readable WireGuard UDP data");
+  }
+
+#if defined(SWG_PLATFORM_SWITCH)
+  const ssize_t bytes_received = bsdRecv(socket_fd, buffer, size, 0);
+  if (bytes_received < 0) {
+    if (IsTimeoutErrno(g_bsdErrno)) {
+      return MakeFailure<std::size_t>(ErrorCode::IoError,
+                                      "recv timed out after " + std::to_string(timeout_ms) + "ms");
+    }
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeBsdFailure("bsdRecv"));
+  }
+#else
+  const ssize_t bytes_received = ::recv(socket_fd, buffer, size, 0);
+  if (bytes_received < 0) {
+    if (IsTimeoutErrno(errno)) {
+      return MakeFailure<std::size_t>(ErrorCode::IoError,
+                                      "recv timed out after " + std::to_string(timeout_ms) + "ms");
+    }
+    return MakeFailure<std::size_t>(ErrorCode::IoError, DescribeErrnoValue("recv", errno));
+  }
+#endif
+
+  return MakeSuccess(static_cast<std::size_t>(bytes_received));
 }
 
 void BsdSocketRuntime::CloseSocket(int socket_fd) const {
