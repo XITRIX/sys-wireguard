@@ -9,7 +9,7 @@ Current implementation boundaries:
 - `swg_common` also owns the request/response codec and command dispatcher used by the current `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
 - `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
-- `swg::AppSession`: an app-facing lifecycle wrapper for route planning and future per-app tunnel control.
+- `swg::AppSession`: an app-facing lifecycle wrapper for route planning, receive-side packet drains, and future per-app tunnel control.
 - `swg_overlay_stub`: a host-side stand-in for the future Tesla overlay.
 - `swg_manager_stub`: a host-side config-management CLI.
 - `swg_manager_switch`: a Switch homebrew NRO that talks to `swg:ctl` over the same SDK transport as future device-side frontends.
@@ -30,9 +30,10 @@ Current implementation boundaries:
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
-- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, and accepts authenticated inbound transport packets from the validated peer endpoint into a bounded internal receive queue.
+- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, and accepts authenticated inbound transport packets from the validated peer endpoint into a bounded receive queue.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
 - Control-service stats now merge live engine counters while connected so manager and future overlay consumers can observe keepalive traffic without disconnecting first.
+- The control plane now exposes queued inbound payloads through `swg:ctl::RecvPacket`, which is currently gated by an open app session on the active connected profile.
 
 ## Runtime paths
 
@@ -69,11 +70,12 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 - local discovery and Wake-on-LAN can stay direct
 - remote stream traffic can be marked tunnel-required
 - DNS can be marked tunnel-preferred
+- validated inbound payload packets can be drained through the same `swg::AppSession`
 - future transparent routing can replace some of those explicit decisions later without changing the service contract
 
 ## What is intentionally deferred
 
 - Tesla overlay parity, rendering, and input handling
-- WireGuard cookie handling, rekeys, exposing queued transport payloads through the control/API surface, and a general packet loop
+- WireGuard cookie handling, send-side packet APIs, rekeys, and a general packet loop
 - DNS-over-tunnel and MITM logic
 - policy-driven transparent routing

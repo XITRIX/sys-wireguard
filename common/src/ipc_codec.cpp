@@ -53,6 +53,11 @@ class BufferWriter {
     }
   }
 
+  void WriteByteVector(const std::vector<std::uint8_t>& value) {
+    WritePod<std::uint32_t>(static_cast<std::uint32_t>(value.size()));
+    buffer_.insert(buffer_.end(), value.begin(), value.end());
+  }
+
   ByteBuffer Finish() && {
     return std::move(buffer_);
   }
@@ -129,6 +134,22 @@ class BufferReader {
     }
 
     return MakeSuccess(std::move(values));
+  }
+
+  Result<std::vector<std::uint8_t>> ReadByteVector() {
+    const Result<std::uint32_t> count = ReadPod<std::uint32_t>();
+    if (!count.ok()) {
+      return MakeFailure<std::vector<std::uint8_t>>(count.error.code, count.error.message);
+    }
+
+    if (Remaining() < count.value) {
+      return MakeFailure<std::vector<std::uint8_t>>(ErrorCode::ParseError, "byte vector payload truncated");
+    }
+
+    std::vector<std::uint8_t> value(buffer_.begin() + static_cast<std::ptrdiff_t>(offset_),
+                                    buffer_.begin() + static_cast<std::ptrdiff_t>(offset_ + count.value));
+    offset_ += count.value;
+    return MakeSuccess(std::move(value));
   }
 
   [[nodiscard]] bool fully_consumed() const {
@@ -1029,6 +1050,44 @@ Result<NetworkPlan> DecodeNetworkPlanPayload(const ByteBuffer& payload) {
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const TunnelPacket& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.counter);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelPacket> DecodeTunnelPacketPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelPacket value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelPacket>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> counter = reader.ReadPod<std::uint64_t>();
+  if (!counter.ok()) {
+    return MakeFailure<TunnelPacket>(counter.error.code, counter.error.message);
+  }
+  value.counter = counter.value;
+
+  const Result<std::vector<std::uint8_t>> bytes = reader.ReadByteVector();
+  if (!bytes.ok()) {
+    return MakeFailure<TunnelPacket>(bytes.error.code, bytes.error.message);
+  }
+  value.payload = bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelPacket>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request) {
   RequestHeaderWire header{};
   header.abi_version = request.abi_version;
@@ -1205,6 +1264,13 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(plan_request.error);
       }
       return EncodeResponseFromResult(service.GetNetworkPlan(plan_request.value));
+    }
+    case ServiceCommandId::RecvPacket: {
+      const Result<std::uint64_t> session_id = DecodeU64Payload(request.value.payload);
+      if (!session_id.ok()) {
+        return EncodeResponseFromError(session_id.error);
+      }
+      return EncodeResponseFromResult(service.RecvPacket(session_id.value));
     }
   }
 

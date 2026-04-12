@@ -48,4 +48,12 @@ Result<NetworkPlan> AppSession::PlanNetwork(const NetworkPlanRequest& request) c
   return client_.GetNetworkPlan(scoped_request);
 }
 
+Result<TunnelPacket> AppSession::ReceivePacket() const {
+  if (!is_open()) {
+    return MakeFailure<TunnelPacket>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.RecvPacket(session_id_);
+}
+
 }  // namespace swg

@@ -41,6 +41,7 @@ enum class ServiceCommandId : std::uint32_t {
   OpenAppSession,
   CloseAppSession,
   GetNetworkPlan,
+  RecvPacket,
 };
 
 enum class TunnelState : std::uint32_t {
@@ -197,6 +198,12 @@ struct NetworkPlan {
   bool local_bypass = false;
   std::string profile_name;
   std::string reason;
+};
+
+struct TunnelPacket {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t counter = 0;
+  std::vector<std::uint8_t> payload;
 };
 
 inline std::string_view ToString(TunnelState state) {

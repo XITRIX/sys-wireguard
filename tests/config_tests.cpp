@@ -1095,6 +1095,89 @@ bool TestIpcCodecRoundTrip() {
   ok &= Require(decoded_config.value.profiles.at("default").endpoint_host ==
                     expected_config.profiles.at("default").endpoint_host,
                 "config payload must preserve endpoint host");
+
+  const swg::TunnelPacket expected_packet{swg::kAbiVersion, 7, {0x41, 0x42, 0x43}};
+  const swg::Result<swg::ByteBuffer> packet_payload = swg::EncodePayload(expected_packet);
+  ok &= Require(packet_payload.ok(), "tunnel packet payload encoding must succeed");
+  if (!packet_payload.ok()) {
+    return false;
+  }
+
+  const swg::Result<swg::TunnelPacket> decoded_packet = swg::DecodeTunnelPacketPayload(packet_payload.value);
+  ok &= Require(decoded_packet.ok(), "tunnel packet payload decoding must succeed");
+  if (!decoded_packet.ok()) {
+    return false;
+  }
+
+  ok &= Require(decoded_packet.value.abi_version == expected_packet.abi_version,
+                "tunnel packet payload must preserve abi version");
+  ok &= Require(decoded_packet.value.counter == expected_packet.counter,
+                "tunnel packet payload must preserve the transport counter");
+  ok &= Require(decoded_packet.value.payload == expected_packet.payload,
+                "tunnel packet payload must preserve the authenticated payload bytes");
+  return ok;
+}
+
+bool TestAppSessionReceivePacket() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-app-session-recv";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  const std::vector<std::uint8_t> payload = {0x50, 0x4b, 0x54, 0x01};
+  LocalHandshakeResponder responder(0, 0, payload);
+  if (!Require(responder.ready(), "local handshake responder must start for app-session receive test")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before app-session receive test")) {
+    return false;
+  }
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  if (!Require(opened.ok(), "app session must open before receiving tunnel packets")) {
+    return false;
+  }
+
+  if (!Require(client.Connect().ok(), "connect must succeed before app-session packet receive")) {
+    return false;
+  }
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must send one queued payload packet"
+                                                           : responder.error())) {
+    return false;
+  }
+
+  swg::Result<swg::TunnelPacket> packet =
+      swg::MakeFailure<swg::TunnelPacket>(swg::ErrorCode::NotFound, "not queued yet");
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    packet = session.ReceivePacket();
+    if (packet.ok()) {
+      break;
+    }
+    if (packet.error.code != swg::ErrorCode::NotFound) {
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  bool ok = true;
+  ok &= Require(packet.ok(), "app session must receive one queued authenticated tunnel packet through IPC");
+  if (packet.ok()) {
+    ok &= Require(packet.value.counter == 0,
+                  "app session receive must preserve the first inbound transport counter");
+    ok &= Require(packet.value.payload == payload,
+                  "app session receive must preserve the queued authenticated payload bytes");
+  }
+
+  const auto empty = session.ReceivePacket();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "app session receive must report empty after draining the queued packet");
+
+  ok &= Require(session.Close().ok(), "app session must close cleanly after packet receive test");
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after app-session receive test");
   return ok;
 }
 
@@ -1180,13 +1263,14 @@ int main() {
   const bool inbound_payload_ok = TestInboundPayloadStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
+  const bool app_session_recv_ok = TestAppSessionReceivePacket();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
-          codec_ok && moonlight_ok)
+          codec_ok && app_session_recv_ok && moonlight_ok)
              ? 0
              : 1;
 }

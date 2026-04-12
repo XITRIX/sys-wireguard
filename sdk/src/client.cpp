@@ -291,4 +291,20 @@ Result<NetworkPlan> Client::GetNetworkPlan(const NetworkPlanRequest& request) co
       DecodeNetworkPlanPayload);
 }
 
+Result<TunnelPacket> Client::RecvPacket(std::uint64_t session_id) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->RecvPacket(session_id);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(session_id);
+  if (!payload.ok()) {
+    return MakeFailure<TunnelPacket>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::RecvPacket, payload.value}),
+      DecodeTunnelPacketPayload);
+}
+
 }  // namespace swg

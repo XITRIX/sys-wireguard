@@ -21,7 +21,8 @@ The better fit is:
 Core pieces:
 - `swg::Client` for service calls
 - `swg::AppSession` for app-scoped lifecycle
-- `Client::OpenAppSession()` / `CloseAppSession()` / `GetNetworkPlan()`
+- `Client::OpenAppSession()` / `CloseAppSession()` / `GetNetworkPlan()` / `RecvPacket()`
+- `AppSession::ReceivePacket()` for draining validated inbound payloads once tunnel traffic is flowing
 
 Moonlight helpers:
 - `MakeMoonlightSessionRequest()`
@@ -65,9 +66,11 @@ auto video = session.PlanNetwork(swg::MakeMoonlightVideoPlan("pc.example.net", 4
 
 Moonlight can keep using its own sockets and libcurl. The sysmodule decides whether that traffic should go direct, require the tunnel, or wait for the tunnel to come up.
 
+The new receive-side packet API is intentionally narrow: it gives a Moonlight-side shim one place to pull validated inbound tunnel payloads without requiring transparent routing first, but it does not replace Moonlight's existing outbound sockets yet.
+
 ## Next steps for real integration
 
-- add real IPC packing for the new app-session commands
+- add a matching send-side packet API so compatibility shims can move more traffic through `swg:ctl`
 - add tunnel-aware DNS resolution responses instead of route guidance only
 - add per-title policy so Moonlight NSP forwarders can opt into the tunnel automatically
 - add transparent DNS and later `bsd:u` interception as an optional fast path

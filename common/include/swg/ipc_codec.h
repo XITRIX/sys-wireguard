@@ -36,6 +36,7 @@ Result<ByteBuffer> EncodePayload(const AppSessionInfo& value);
 Result<ByteBuffer> EncodePayload(std::uint64_t value);
 Result<ByteBuffer> EncodePayload(const NetworkPlanRequest& value);
 Result<ByteBuffer> EncodePayload(const NetworkPlan& value);
+Result<ByteBuffer> EncodePayload(const TunnelPacket& value);
 
 Result<VersionInfo> DecodeVersionInfoPayload(const ByteBuffer& payload);
 Result<ServiceStatus> DecodeServiceStatusPayload(const ByteBuffer& payload);
@@ -50,6 +51,7 @@ Result<AppSessionInfo> DecodeAppSessionInfoPayload(const ByteBuffer& payload);
 Result<std::uint64_t> DecodeU64Payload(const ByteBuffer& payload);
 Result<NetworkPlanRequest> DecodeNetworkPlanRequestPayload(const ByteBuffer& payload);
 Result<NetworkPlan> DecodeNetworkPlanPayload(const ByteBuffer& payload);
+Result<TunnelPacket> DecodeTunnelPacketPayload(const ByteBuffer& payload);
 
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request);
 Result<IpcRequestMessage> DecodeRequestMessage(const ByteBuffer& bytes);

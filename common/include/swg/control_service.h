@@ -29,6 +29,7 @@ class IControlService {
   virtual Result<AppSessionInfo> OpenAppSession(const AppTunnelRequest& request) = 0;
   virtual Error CloseAppSession(std::uint64_t session_id) = 0;
   virtual Result<NetworkPlan> GetNetworkPlan(const NetworkPlanRequest& request) const = 0;
+  virtual Result<TunnelPacket> RecvPacket(std::uint64_t session_id) = 0;
 };
 
 }  // namespace swg

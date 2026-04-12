@@ -498,6 +498,38 @@ class LocalControlService final : public IControlService {
     return MakeSuccess(std::move(plan));
   }
 
+  Result<TunnelPacket> RecvPacket(std::uint64_t session_id) override {
+    std::scoped_lock lock(mutex_);
+
+    const auto session_it = app_sessions_.find(session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<TunnelPacket>(ErrorCode::NotFound,
+                                       "app session not found: " + std::to_string(session_id));
+    }
+
+    const AppSessionRecord& session = session_it->second;
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (snapshot.state != TunnelState::Connected || !tunnel_engine_->IsRunning()) {
+      return MakeFailure<TunnelPacket>(ErrorCode::InvalidState,
+                                       "tunnel is not connected for packet receive");
+    }
+
+    if (session.selected_profile.empty() || snapshot.active_profile != session.selected_profile) {
+      return MakeFailure<TunnelPacket>(ErrorCode::InvalidState,
+                                       "app session profile is not active on the connected tunnel");
+    }
+
+    const Result<WireGuardConsumedTransportPacket> packet = tunnel_engine_->ReceivePacket();
+    if (!packet.ok()) {
+      return MakeFailure<TunnelPacket>(packet.error.code, packet.error.message);
+    }
+
+    TunnelPacket received{};
+    received.counter = packet.value.counter;
+    received.payload = std::move(packet.value.payload);
+    return MakeSuccess(std::move(received));
+  }
+
  private:
   Error Initialize() {
     const Error logger_error = Logger::Instance().Initialize(paths_.log_file);

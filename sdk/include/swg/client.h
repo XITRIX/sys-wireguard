@@ -34,6 +34,7 @@ class Client {
   Result<AppSessionInfo> OpenAppSession(const AppTunnelRequest& request) const;
   Error CloseAppSession(std::uint64_t session_id) const;
   Result<NetworkPlan> GetNetworkPlan(const NetworkPlanRequest& request) const;
+  Result<TunnelPacket> RecvPacket(std::uint64_t session_id) const;
 
  private:
   std::shared_ptr<IControlService> ResolveService() const;
