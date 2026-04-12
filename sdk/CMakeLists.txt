@@ -1,6 +1,7 @@
 add_library(swg_sdk STATIC
   src/app_session.cpp
   src/client.cpp
+  src/session_socket.cpp
   src/switch_transport.cpp
 )
 

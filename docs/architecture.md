@@ -73,6 +73,7 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 - remote stream traffic can be marked tunnel-required
 - DNS can be marked tunnel-preferred and resolved through a policy-aware helper
 - authenticated payloads can be sent and received through the same `swg::AppSession`
+- a route-aware `SessionSocket` wrapper can collapse plan, DNS, and packet-channel selection into one app-facing transport object
 - future transparent routing can replace some of those explicit decisions later without changing the service contract
 
 ## What is intentionally deferred

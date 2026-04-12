@@ -18,6 +18,7 @@
 #include "swg/config.h"
 #include "swg/ipc_codec.h"
 #include "swg/moonlight.h"
+#include "swg/session_socket.h"
 #include "swg/state_machine.h"
 #include "swg/wg_crypto.h"
 #include "swg/wg_handshake.h"
@@ -1980,6 +1981,132 @@ bool TestAppSessionDnsResolution() {
   return ok;
 }
 
+bool TestSessionSocketAbstraction() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-session-socket";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  const std::vector<std::uint8_t> inbound_payload = {0x44, 0x4e, 0x53, 0x52, 0x45, 0x43, 0x56};
+  const std::vector<std::uint8_t> outbound_payload = {0x53, 0x4f, 0x43, 0x4b, 0x45, 0x54, 0x01};
+  LocalHandshakeResponder responder(0, 0, inbound_payload, outbound_payload);
+  if (!Require(responder.ready(), "local handshake responder must start for session socket tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before session socket tests")) {
+    return false;
+  }
+
+  bool ok = true;
+
+  swg::AppSession direct_session(client);
+  const auto direct_opened = direct_session.Open(swg::MakeMoonlightSessionRequest("default", false));
+  ok &= Require(direct_opened.ok(), "direct-fallback app session must open for session socket tests");
+  if (!direct_opened.ok()) {
+    return false;
+  }
+
+  swg::SessionSocketRequest direct_request{};
+  direct_request.remote_host = "1.1.1.1";
+  direct_request.remote_port = 47998;
+  direct_request.transport = swg::TransportProtocol::Udp;
+  direct_request.traffic_class = swg::AppTrafficClass::StreamVideo;
+  direct_request.route_preference = swg::RoutePreference::PreferTunnel;
+
+  const auto direct_socket = swg::SessionSocket::OpenDatagram(direct_session, direct_request);
+  ok &= Require(direct_socket.ok(), "direct datagram socket must open");
+  if (direct_socket.ok()) {
+    ok &= Require(direct_socket.value.uses_direct_socket(),
+                  "direct datagram socket must select direct-socket mode");
+    ok &= Require(!direct_socket.value.uses_tunnel_packets(),
+                  "direct datagram socket must not expose tunnel-packet mode");
+    ok &= Require(direct_socket.value.info().remote_addresses.size() == 1 &&
+                      direct_socket.value.info().remote_addresses.front() == "1.1.1.1",
+                  "direct datagram socket must preserve the requested IPv4 address");
+
+    const auto direct_send = direct_socket.value.Send(outbound_payload);
+    ok &= Require(!direct_send.ok() && direct_send.error.code == swg::ErrorCode::Unsupported,
+                  "direct datagram socket must reject tunnel packet send calls");
+  }
+
+  ok &= Require(direct_session.Close().ok(), "direct-fallback app session must close after session socket tests");
+
+  swg::AppSession tunnel_session(client);
+  const auto tunnel_opened = tunnel_session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(tunnel_opened.ok(), "tunnel app session must open for session socket tests");
+  if (!tunnel_opened.ok()) {
+    return false;
+  }
+
+  const auto denied_socket = swg::SessionSocket::OpenDatagram(
+      tunnel_session, swg::MakeMoonlightVideoSocketRequest("203.0.113.8", 47998));
+  ok &= Require(denied_socket.ok(), "denied datagram socket must still return a structured result");
+  if (denied_socket.ok()) {
+    ok &= Require(denied_socket.value.denied(),
+                  "tunnel-required datagram socket must deny before connect");
+  }
+
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel session socket tests");
+
+  const auto tunnel_socket = swg::SessionSocket::OpenDatagram(
+      tunnel_session, swg::MakeMoonlightVideoSocketRequest("203.0.113.8", 47998));
+  ok &= Require(tunnel_socket.ok(), "connected datagram socket must open");
+  if (tunnel_socket.ok()) {
+    ok &= Require(tunnel_socket.value.uses_tunnel_packets(),
+                  "connected datagram socket must select tunnel-packet mode");
+    ok &= Require(tunnel_socket.value.info().mode == swg::SessionSocketMode::TunnelPacket,
+                  "connected datagram socket must report tunnel-packet mode");
+
+    const auto counter = tunnel_socket.value.Send(outbound_payload);
+    ok &= Require(counter.ok(), "connected datagram socket must send through the tunnel packet path");
+    if (counter.ok()) {
+      ok &= Require(counter.value == 1,
+                    "first datagram socket tunnel send must use transport counter one");
+    }
+
+    bool received_payload = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      const auto packet = tunnel_socket.value.Receive();
+      if (packet.ok()) {
+        received_payload = true;
+        ok &= Require(packet.value.payload == inbound_payload,
+                      "connected datagram socket must receive the queued inbound payload");
+        break;
+      }
+
+      if (packet.error.code != swg::ErrorCode::NotFound) {
+        ok &= Require(false, "connected datagram socket receive must only retry on an empty queue");
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ok &= Require(received_payload,
+                  "connected datagram socket must eventually receive the queued inbound payload");
+  }
+
+  const auto stream_socket = swg::SessionSocket::OpenStream(
+      tunnel_session, swg::MakeMoonlightHttpsControlSocketRequest("vpn.example.test", 47984));
+  ok &= Require(stream_socket.ok(), "connected stream socket must open");
+  if (stream_socket.ok()) {
+    ok &= Require(stream_socket.value.uses_tunnel_packets(),
+                  "connected stream socket must surface tunnel-packet mode for framed stream payloads");
+    ok &= Require(stream_socket.value.info().used_dns_helper,
+                  "connected stream socket must consult the DNS helper for hostname targets");
+    ok &= Require(stream_socket.value.info().dns.action == swg::RouteAction::Tunnel,
+                  "connected stream socket must preserve tunnel DNS guidance for hostname targets");
+  }
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must complete the session socket handshake"
+                                                            : responder.error());
+  ok &= Require(tunnel_session.Close().ok(), "tunnel app session must close after session socket tests");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after session socket tests");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -2008,13 +2135,15 @@ int main() {
   const bool keepalive_reconnect_ok = TestEngineReconnectAfterKeepaliveFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
+  const bool session_socket_ok = TestSessionSocketAbstraction();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
-          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && dns_resolution_ok)
+          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && dns_resolution_ok &&
+          session_socket_ok)
              ? 0
              : 1;
 }

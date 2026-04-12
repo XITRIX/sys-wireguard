@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "swg/client.h"
 #include "swg/ipc_protocol.h"
 #include "swg/moonlight.h"
+#include "swg/session_socket.h"
 
 namespace {
 
@@ -29,7 +31,12 @@ struct IntegrationState {
 
   swg::AppSession session;
   swg::AppTunnelRequest session_request{};
+  std::optional<swg::SessionSocket> sample_socket;
   std::string last_action = "waiting for swg:ctl";
+  std::string last_dns_result = "not run";
+  std::vector<std::string> dns_lines;
+  std::string last_socket_result = "not run";
+  std::vector<std::string> socket_lines;
   std::string last_send_result = "not run";
   std::string last_receive_result = "not run";
   std::string last_smoke_summary = "not run";
@@ -114,6 +121,21 @@ std::string FormatHexPreview(const std::vector<std::uint8_t>& bytes) {
   return stream.str();
 }
 
+std::string FormatJoined(const std::vector<std::string>& values) {
+  if (values.empty()) {
+    return "<none>";
+  }
+
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) {
+      stream << ", ";
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
 std::string ApplyRuntimeFlags(const swg::Client& client, swg::RuntimeFlags flags) {
   const swg::Error error = client.SetRuntimeFlags(flags);
   if (error) {
@@ -175,6 +197,11 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
     }
 
     state->session_request = {};
+    state->sample_socket.reset();
+    state->last_dns_result = "not run";
+    state->dns_lines.clear();
+    state->last_socket_result = "not run";
+    state->socket_lines.clear();
     state->last_send_result = "not run";
     state->last_receive_result = "not run";
     state->last_smoke_summary = "not run";
@@ -197,8 +224,83 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
   }
 
   state->session_request = request;
+  state->sample_socket.reset();
+  state->last_dns_result = "not run";
+  state->dns_lines.clear();
+  state->last_socket_result = "not run";
+  state->socket_lines.clear();
   return "app session opened: id=" + std::to_string(opened.value.session_id) +
          " profile=" + opened.value.active_profile;
+}
+
+std::string RunDnsResolve(IntegrationState* state) {
+  if (!state->session.is_open()) {
+    return "open app session before resolving dns";
+  }
+
+  const auto dns = state->session.ResolveDns("vpn.example.test");
+  state->dns_lines.clear();
+  if (!dns.ok()) {
+    state->last_dns_result = "failed";
+    state->dns_lines.push_back(dns.error.message);
+    return "dns resolve failed";
+  }
+
+  state->last_dns_result = std::string(swg::ToString(dns.value.action)) +
+                           " resolved=" + BoolLabel(dns.value.resolved) +
+                           " tunnel_dns=" + BoolLabel(dns.value.use_tunnel_dns);
+  state->dns_lines.push_back("message: " + dns.value.message);
+  state->dns_lines.push_back("addresses: " + FormatJoined(dns.value.addresses));
+  state->dns_lines.push_back("dns servers: " + FormatJoined(dns.value.dns_servers));
+  return "dns resolve refreshed";
+}
+
+void RecordSocketSummary(const char* label,
+                         const swg::Result<swg::SessionSocket>& socket,
+                         std::vector<std::string>* lines) {
+  if (!socket.ok()) {
+    lines->push_back(std::string("FAIL ") + label + ": " + socket.error.message);
+    return;
+  }
+
+  const auto& info = socket.value.info();
+  std::string line = std::string("PASS ") + label + ": kind=" + std::string(swg::ToString(info.kind)) +
+                     " mode=" + std::string(swg::ToString(info.mode)) +
+                     " transport=" + std::string(swg::ToString(info.transport));
+  if (!info.remote_addresses.empty()) {
+    line += " addrs=" + FormatJoined(info.remote_addresses);
+  }
+  lines->push_back(std::move(line));
+  lines->push_back("  note: " + info.message);
+  if (info.used_dns_helper) {
+    lines->push_back("  dns: " + info.dns.message);
+  }
+}
+
+std::string PrepareSocketSmoke(IntegrationState* state) {
+  if (!state->session.is_open()) {
+    return "open app session before opening socket wrappers";
+  }
+
+  state->socket_lines.clear();
+
+  const auto video_socket = swg::SessionSocket::OpenDatagram(
+      state->session, swg::MakeMoonlightVideoSocketRequest("203.0.113.8", 47998));
+  RecordSocketSummary("video-datagram", video_socket, &state->socket_lines);
+
+  const auto control_socket = swg::SessionSocket::OpenStream(
+      state->session, swg::MakeMoonlightHttpsControlSocketRequest("vpn.example.test", 47984));
+  RecordSocketSummary("https-control", control_socket, &state->socket_lines);
+
+  if (video_socket.ok() && video_socket.value.uses_tunnel_packets()) {
+    state->sample_socket = video_socket.value;
+    state->last_socket_result = "video datagram socket is ready for tunnel packet I/O";
+  } else {
+    state->sample_socket.reset();
+    state->last_socket_result = "no tunnel-packet datagram socket is ready";
+  }
+
+  return "socket abstraction refreshed";
 }
 
 bool RecordPlanCheck(const char* label,
@@ -347,7 +449,8 @@ std::string SendDiagnosticPayload(IntegrationState* state) {
   const std::vector<std::uint8_t> payload = {
       0x53, 0x57, 0x47, 0x49, 0x4e, 0x54, state->payload_nonce++,
   };
-  const auto counter = state->session.SendPacket(payload);
+  const auto counter = state->sample_socket.has_value() ? state->sample_socket->Send(payload)
+                                                        : state->session.SendPacket(payload);
   if (!counter.ok()) {
     state->last_send_result = "failed: " + counter.error.message;
     return "diagnostic send failed";
@@ -364,7 +467,8 @@ std::string ReceiveDiagnosticPayload(IntegrationState* state) {
     return "open app session before reading queued payloads";
   }
 
-  const auto packet = state->session.ReceivePacket();
+  const auto packet = state->sample_socket.has_value() ? state->sample_socket->Receive()
+                                                       : state->session.ReceivePacket();
   if (!packet.ok()) {
     state->last_receive_result = packet.error.message;
     return packet.error.code == swg::ErrorCode::NotFound ? "no queued payload" : "receive failed";
@@ -435,14 +539,27 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
     std::printf("  %s\n", line.c_str());
   }
 
+  std::printf("\ndns resolve:\n");
+  std::printf("  %s\n", state.last_dns_result.c_str());
+  for (const auto& line : state.dns_lines) {
+    std::printf("  %s\n", line.c_str());
+  }
+
+  std::printf("\nsocket abstraction:\n");
+  std::printf("  %s\n", state.last_socket_result.c_str());
+  for (const auto& line : state.socket_lines) {
+    std::printf("  %s\n", line.c_str());
+  }
+
   std::printf("\ndiagnostic payload:\n");
   std::printf("  send=%s\n", state.last_send_result.c_str());
   std::printf("  recv=%s\n", state.last_receive_result.c_str());
-  std::printf("  raw send/recv is diagnostic until socket helpers land\n");
+  std::printf("  send/recv uses the sample tunnel socket when available\n");
 
   std::printf("\ncontrols:\n");
   std::printf("  A connect/disconnect   B refresh   + exit\n");
   std::printf("  X open/close session   Y run session smoke\n");
+  std::printf("  Up resolve dns         Down open socket helpers\n");
   std::printf("  Left/Right change active profile\n");
   std::printf("  ZL toggle dns flag     ZR toggle transparent flag\n");
   std::printf("  L send diagnostic payload   R poll receive queue\n");
@@ -496,6 +613,14 @@ int main(int argc, char** argv) {
 
     if ((buttons_down & HidNpadButton_Y) != 0) {
       state.last_action = RunSessionSmoke(model, &state);
+    }
+
+    if ((buttons_down & HidNpadButton_Up) != 0) {
+      state.last_action = RunDnsResolve(&state);
+    }
+
+    if ((buttons_down & HidNpadButton_Down) != 0) {
+      state.last_action = PrepareSocketSmoke(&state);
     }
 
     if ((buttons_down & HidNpadButton_Left) != 0) {

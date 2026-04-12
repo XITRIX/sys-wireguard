@@ -24,6 +24,7 @@
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | App-session DNS resolution policy | Verified | `swg_tests` now covers direct DNS fallback, fail-closed tunnel-DNS policy before connect, and connected tunnel-DNS guidance |
+| Session socket abstraction | Verified | `swg_tests` now covers direct fallback, disconnected deny, and connected tunnel-packet selection through `swg::SessionSocket` |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
 
 ## On-device
@@ -36,7 +37,7 @@
 | Switch manager build | Verified | `build/switch-debug/manager/swg_manager.nro` and staged `build/switch-debug/manager/switch/swg_manager.nro` are generated |
 | Switch integration app build | Verified | `build/switch-debug/integration/swg_integration_test.nro` and staged `build/switch-debug/integration/switch/swg_integration_test.nro` are generated |
 | Switch manager control flow | Verified | Manager now queries `swg:ctl` successfully on hardware and surfaces compatibility diagnostics |
-| Switch integration app smoke flow | Not started | Use the separate integration NRO to validate app-session open/close, route-planning checks, and diagnostic packet API behavior against a real VPN peer |
+| Switch integration app smoke flow | In progress | The separate integration NRO now exposes `ResolveDns()` and sample `SessionSocket` checks in addition to route-planning and packet diagnostics; live VPN-peer validation is still pending |
 | Milestone 3 manager frontend | Verified | Current manager implementation is sufficient to close the manager-first frontend milestone |
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |

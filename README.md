@@ -154,30 +154,35 @@ Implemented:
 
 ## App integration
 
-The SDK now exposes a generic `swg::AppSession` wrapper, a route-planning surface, and send/receive packet calls for app consumers that still use their own sockets and HTTP stack.
+The SDK now exposes a generic `swg::AppSession` wrapper, a route-planning surface, a route-aware `swg::SessionSocket` wrapper, and send/receive packet calls for app consumers that still use their own sockets and HTTP stack.
 
-For on-device validation, the Switch build now also stages `build/switch-debug/integration/switch/swg_integration_test.nro` as a separate integration harness. It exercises the live `swg::Client` and `swg::AppSession` path on hardware, runs Moonlight-style route-planning smoke checks against the active runtime state, and exposes raw send/receive packet probes as diagnostic controls.
+For on-device validation, the Switch build now also stages `build/switch-debug/integration/switch/swg_integration_test.nro` as a separate integration harness. It exercises the live `swg::Client` and `swg::AppSession` path on hardware, runs Moonlight-style route-planning smoke checks against the active runtime state, exposes `ResolveDns()` results directly, and opens sample `SessionSocket` wrappers before using the current tunnel packet path for diagnostic send/receive.
 
 Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 - open an app session with `MakeMoonlightSessionRequest()`
 - plan local discovery and Wake-on-LAN as direct bypass traffic
 - plan HTTPS control, stream-control, video, audio, and input traffic as tunnel-required
 - plan DNS through the tunnel when the profile enables it
+- build route-aware socket wrappers with `MakeMoonlight...SocketRequest()` helpers
 
 That same app session can now call `ResolveDns()` to get a policy-safe DNS result:
 - direct IPv4 answers when the session is allowed to fall back directly
 - fail-closed results when Moonlight requires tunnel DNS before connect
 - tunnel-DNS guidance plus configured profile resolvers once the selected profile is connected
 
+`swg::SessionSocket` now folds route planning, DNS helper output, and the current session packet path into one wrapper so an app can get a structured `direct_socket`, `tunnel_packet`, or `denied` result from one place.
+
+Current limitation: tunnel-backed datagram wrappers can already forward caller-managed payloads through `SendPacket()` / `ReceivePacket()`, but stream wrappers currently expose framed payload flow over the same packet channel and are not native TCP sockets.
+
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 When tunnel traffic is routed through the sysmodule, the same session can now send authenticated payloads and drain validated inbound payload packets through `swg::AppSession::SendPacket()` and `swg::AppSession::ReceivePacket()`.
 
-The raw packet controls in the Switch integration app are diagnostic only for now. They exercise the current control-plane packet API on real hardware, but they do not replace the later socket-like or DNS-aware SDK layers.
+The packet controls in the Switch integration app are still diagnostic, but they now prefer the sample tunnel-backed `SessionSocket` when the current route policy selects that mode.
 
 Next:
 - manager UX expansion
-- Milestone 6 completion work: add a concrete usage example and higher-level transport helpers on top of the new DNS resolve path
+- Milestone 6 completion work: add a concrete usage example and extend the new transport wrapper toward real Moonlight stream integration
 - WireGuard cookie reply handling and later rekey or roaming work on top of the current repeated packet path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

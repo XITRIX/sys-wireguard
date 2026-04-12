@@ -4,7 +4,7 @@
 - Tesla overlay work is intentionally deferred from Phase A; the overlay target remains a host stub.
 - Tesla live toggling now relies on `ovl-sysmodules` using `pmshellTerminateProgram()` / `pmshellLaunchProgram()`; active clients should tolerate abrupt `swg:ctl` disconnects during manual stop/start.
 - The Switch manager is the current Phase A control UI; it is text-mode and intentionally simpler than the future Tesla UX.
-- The new Switch integration app validates app-session and packet API behavior on hardware, but its raw send/receive controls are still diagnostic until the SDK grows a higher-level socket or stream abstraction.
+- The new Switch integration app now exposes `ResolveDns()` and sample `SessionSocket` checks on hardware, but its send/receive controls are still diagnostic until the SDK grows a stronger Moonlight-ready transport shim.
 - Milestone 5 implementation now covers one-shot WireGuard initiation/response, authenticated transport send/receive, repeated host-side traffic, and bounded reconnect on outbound send, receive-loop, and periodic keepalive transport failures, but cookie replies and rekeying are still not implemented.
 - The current Switch tunnel session preparation is intentionally IPv4-only: hostname endpoints are left unresolved for a later resolver/UDP slice, IPv6 endpoints are rejected, and IPv6 routes or DNS entries are only tracked as skipped metadata.
 - The live connect path now resolves IPv4 endpoints, validates the handshake, schedules authenticated keepalives, and surfaces authenticated transport send/receive through `swg:ctl`; host regression coverage now repeats multi-packet app-session traffic and scripted reconnect triggers, but there is still no endpoint roaming support.
@@ -16,5 +16,5 @@
 - DNS servers currently need to be numeric IP literals during connect preflight; hostname-based resolver configuration is not accepted yet.
 - Capability detection now probes live service reachability, but some flags still map to nearest current surfaces (`sfdnsres` for resolver reachability and `nifm:a`/`nifm:s` for network-configuration reachability) rather than final transparent-mode hooks.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
-- The app API now includes policy-safe DNS responses for direct, denied, and tunnel-guided cases, but tunnel-side DNS execution and transparent socket interception are still deferred.
+- The app API now includes policy-safe DNS responses plus a route-aware socket wrapper for direct, denied, and tunnel-guided cases, but tunnel-side DNS execution, native TCP-over-tunnel, and transparent socket interception are still deferred.
 - The sysmodule NPDM is intentionally permissive in Phase A (`service_access = ["*"]`) and should be tightened once the exact service dependencies are fixed.

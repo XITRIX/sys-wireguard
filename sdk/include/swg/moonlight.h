@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "swg/ipc_protocol.h"
+#include "swg/session_socket.h"
 
 namespace swg {
 
@@ -110,6 +111,61 @@ inline NetworkPlanRequest MakeMoonlightStunPlan(std::string remote_host = "stun.
   request.transport = TransportProtocol::Udp;
   request.traffic_class = AppTrafficClass::ExternalAddressProbe;
   request.route_preference = RoutePreference::BypassTunnel;
+  return request;
+}
+
+inline SessionSocketRequest MakeMoonlightHttpsControlSocketRequest(std::string remote_host,
+                                                                   std::uint16_t remote_port) {
+  SessionSocketRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Https;
+  request.traffic_class = AppTrafficClass::HttpsControl;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline SessionSocketRequest MakeMoonlightStreamControlSocketRequest(std::string remote_host,
+                                                                    std::uint16_t remote_port) {
+  SessionSocketRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Tcp;
+  request.traffic_class = AppTrafficClass::StreamControl;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline SessionSocketRequest MakeMoonlightVideoSocketRequest(std::string remote_host,
+                                                            std::uint16_t remote_port) {
+  SessionSocketRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Udp;
+  request.traffic_class = AppTrafficClass::StreamVideo;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline SessionSocketRequest MakeMoonlightAudioSocketRequest(std::string remote_host,
+                                                            std::uint16_t remote_port) {
+  SessionSocketRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Udp;
+  request.traffic_class = AppTrafficClass::StreamAudio;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline SessionSocketRequest MakeMoonlightInputSocketRequest(std::string remote_host,
+                                                            std::uint16_t remote_port) {
+  SessionSocketRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.transport = TransportProtocol::Udp;
+  request.traffic_class = AppTrafficClass::StreamInput;
+  request.route_preference = RoutePreference::RequireTunnel;
   return request;
 }
 
