@@ -110,7 +110,10 @@ swg::Result<swg::WireGuardResponderConfig> MakeHandshakeResponderConfig() {
 
 class LocalHandshakeResponder {
  public:
-  LocalHandshakeResponder() {
+  explicit LocalHandshakeResponder(std::uint32_t expected_additional_keepalives = 0,
+                                   std::uint32_t inbound_keepalives_to_send = 0)
+      : expected_additional_keepalives_(expected_additional_keepalives),
+        inbound_keepalives_to_send_(inbound_keepalives_to_send) {
     socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd_ < 0) {
       error_ = DescribeSocketError("socket");
@@ -168,7 +171,8 @@ class LocalHandshakeResponder {
     if (worker_.joinable()) {
       worker_.join();
     }
-    return error_.empty() && responded_ && keepalive_validated_;
+    return error_.empty() && responded_ && keepalive_validated_ &&
+           validated_additional_keepalives_ == expected_additional_keepalives_;
   }
 
   const std::string& error() const {
@@ -235,6 +239,52 @@ class LocalHandshakeResponder {
     }
 
     keepalive_validated_ = true;
+
+    for (std::uint32_t inbound_counter = 0; inbound_counter < inbound_keepalives_to_send_; ++inbound_counter) {
+      const auto inbound_keepalive = swg::CreateTransportKeepalivePacket(
+          response.value.sending_key, response.value.receiver_index, inbound_counter);
+      if (!inbound_keepalive.ok()) {
+        error_ = inbound_keepalive.error.message;
+        return;
+      }
+
+      const ssize_t inbound_sent = ::sendto(socket_fd_, inbound_keepalive.value.packet.data(),
+                                            inbound_keepalive.value.packet.size(), 0,
+                                            reinterpret_cast<const sockaddr*>(&client_address), client_length);
+      if (inbound_sent < 0) {
+        error_ = DescribeSocketError("sendto");
+        return;
+      }
+      if (static_cast<std::size_t>(inbound_sent) != inbound_keepalive.value.packet.size()) {
+        error_ = "sendto returned a short authenticated keepalive";
+        return;
+      }
+    }
+
+    for (std::uint32_t expected_counter = 1; expected_counter <= expected_additional_keepalives_; ++expected_counter) {
+      client_length = sizeof(client_address);
+      const ssize_t periodic_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                                   reinterpret_cast<sockaddr*>(&client_address), &client_length);
+      if (periodic_received < 0) {
+        error_ = DescribeSocketError("recvfrom");
+        return;
+      }
+
+      const auto periodic_keepalive = swg::ConsumeTransportKeepaliveForTest(
+          response.value.receiving_key, response.value.sender_index, buffer.data(),
+          static_cast<std::size_t>(periodic_received));
+      if (!periodic_keepalive.ok()) {
+        error_ = periodic_keepalive.error.message;
+        return;
+      }
+
+      if (periodic_keepalive.value != expected_counter) {
+        error_ = "periodic keepalive used an unexpected transport counter";
+        return;
+      }
+
+      ++validated_additional_keepalives_;
+    }
   }
 
   int socket_fd_ = -1;
@@ -242,6 +292,9 @@ class LocalHandshakeResponder {
   std::thread worker_{};
   bool responded_ = false;
   bool keepalive_validated_ = false;
+  std::uint32_t expected_additional_keepalives_ = 0;
+  std::uint32_t validated_additional_keepalives_ = 0;
+  std::uint32_t inbound_keepalives_to_send_ = 0;
   std::string error_{};
 };
 
@@ -714,6 +767,106 @@ bool TestConnectHandshakeStats() {
                 "connect must record the post-handshake keepalive packet");
   ok &= Require(status.value.state == swg::TunnelState::Connected,
                 "validated handshake should move the control service into connected state");
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after connect-handshake stats test");
+  return ok;
+}
+
+bool TestPeriodicKeepaliveStats() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-periodic-keepalive";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  LocalHandshakeResponder responder(1);
+  if (!Require(responder.ready(), "local handshake responder must start for periodic keepalive test")) {
+    return false;
+  }
+
+  swg::Config config = MakeValidConfig("127.0.0.1", responder.port());
+  config.profiles.at("default").persistent_keepalive = 1;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(),
+               "periodic keepalive config must save before connect")) {
+    return false;
+  }
+  if (!Require(client.Connect().ok(), "connect must succeed before periodic keepalive stats are sampled")) {
+    return false;
+  }
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must receive one periodic keepalive"
+                                                           : responder.error())) {
+    return false;
+  }
+
+  const auto stats = client.GetStats();
+
+  bool ok = true;
+  ok &= Require(stats.ok(), "stats query must succeed after periodic keepalive send");
+  if (!stats.ok()) {
+    return false;
+  }
+
+  ok &= Require(stats.value.successful_handshakes == 1,
+                "periodic keepalive stats must preserve the successful handshake count");
+  ok &= Require(stats.value.bytes_out >=
+                    swg::kWireGuardHandshakeInitiationSize + (2 * swg::kWireGuardTransportKeepaliveSize),
+                "periodic keepalive stats must include the extra authenticated keepalive packet");
+  ok &= Require(stats.value.packets_out >= 3,
+                "periodic keepalive stats must report at least three outbound packets");
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after periodic keepalive stats test");
+  return ok;
+}
+
+bool TestInboundKeepaliveStats() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-inbound-keepalive";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  LocalHandshakeResponder responder(0, 1);
+  if (!Require(responder.ready(), "local handshake responder must start for inbound keepalive test")) {
+    return false;
+  }
+
+  swg::Config config = MakeValidConfig("127.0.0.1", responder.port());
+  config.profiles.at("default").persistent_keepalive = 0;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(),
+               "inbound keepalive config must save before connect")) {
+    return false;
+  }
+  if (!Require(client.Connect().ok(), "connect must succeed before inbound keepalive stats are sampled")) {
+    return false;
+  }
+  if (!Require(responder.Join(), responder.error().empty() ? "local responder must send one inbound keepalive"
+                                                           : responder.error())) {
+    return false;
+  }
+
+  swg::TunnelStats observed_stats{};
+  bool inbound_observed = false;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    const auto stats = client.GetStats();
+    if (stats.ok() &&
+        stats.value.bytes_in >= swg::kWireGuardHandshakeResponseSize + swg::kWireGuardTransportKeepaliveSize &&
+        stats.value.packets_in >= 2) {
+      observed_stats = stats.value;
+      inbound_observed = true;
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  bool ok = true;
+  ok &= Require(inbound_observed, "live stats must include one inbound authenticated keepalive");
+  if (inbound_observed) {
+    ok &= Require(observed_stats.successful_handshakes == 1,
+                  "inbound keepalive stats must preserve the successful handshake count");
+    ok &= Require(observed_stats.bytes_out ==
+                      swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                  "inbound keepalive stats must not require extra outbound packets when keepalives are disabled");
+  }
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after inbound keepalive stats test");
   return ok;
 }
 
@@ -863,12 +1016,15 @@ int main() {
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
   const bool connect_handshake_ok = TestConnectHandshakeStats();
+  const bool periodic_keepalive_ok = TestPeriodicKeepaliveStats();
+  const bool inbound_keepalive_ok = TestInboundKeepaliveStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
           tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && state_ok && client_ok &&
-          connect_handshake_ok && invalid_connect_ok && codec_ok && moonlight_ok)
+          connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && invalid_connect_ok &&
+          codec_ok && moonlight_ok)
              ? 0
              : 1;
 }

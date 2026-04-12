@@ -99,6 +99,10 @@ Result<WireGuardValidatedHandshake> ConsumeHandshakeResponse(const WireGuardHand
 Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGuardKey& sending_key,
                                                                    std::uint32_t receiver_index,
                                                                    std::uint64_t counter = 0);
+Result<std::uint64_t> ConsumeTransportKeepalivePacket(const WireGuardKey& receiving_key,
+                                                      std::uint32_t expected_receiver_index,
+                                                      const std::uint8_t* packet,
+                                                      std::size_t packet_size);
 Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,
                                                        std::uint32_t expected_receiver_index,
                                                        const std::uint8_t* packet,

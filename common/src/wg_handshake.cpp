@@ -949,10 +949,10 @@ Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGua
   return MakeSuccess(keepalive);
 }
 
-Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,
-                                                       std::uint32_t expected_receiver_index,
-                                                       const std::uint8_t* packet,
-                                                       std::size_t packet_size) {
+Result<std::uint64_t> ConsumeTransportKeepalivePacket(const WireGuardKey& receiving_key,
+                                                      std::uint32_t expected_receiver_index,
+                                                      const std::uint8_t* packet,
+                                                      std::size_t packet_size) {
   if (packet_size != kWireGuardTransportKeepaliveSize) {
     return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
                                       "WireGuard transport keepalive has an unexpected size");
@@ -984,6 +984,13 @@ Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& recei
   }
 
   return MakeSuccess(counter);
+}
+
+Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,
+                                                       std::uint32_t expected_receiver_index,
+                                                       const std::uint8_t* packet,
+                                                       std::size_t packet_size) {
+  return ConsumeTransportKeepalivePacket(receiving_key, expected_receiver_index, packet, packet_size);
 }
 
 }  // namespace swg

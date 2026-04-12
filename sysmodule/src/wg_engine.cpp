@@ -1,6 +1,10 @@
 #include "swg_sysmodule/wg_engine.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include "swg_sysmodule/socket_runtime.h"
 
 #include <algorithm>
@@ -18,7 +22,9 @@ namespace {
 
 constexpr std::uint32_t kHandshakeResponseTimeoutMs = 5000;
 constexpr std::uint32_t kHandshakeRetryCount = 2;
+constexpr std::uint32_t kTransportReceiveTimeoutMs = 250;
 constexpr std::size_t kMaxHandshakeDatagramSize = 256;
+constexpr std::size_t kMaxTransportDatagramSize = 2048;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::array<std::uint8_t, 4> CopyIpv4Bytes(const ParsedIpAddress& address) {
@@ -77,6 +83,15 @@ std::string DescribeReplySource(const ReceivedUdpDatagram& datagram) {
   return FormatIpv4(datagram.source_ipv4) + ':' + std::to_string(datagram.source_port);
 }
 
+bool IsReceiveTimeout(const Error& error) {
+  return error.code == ErrorCode::IoError && error.message.find("timed out") != std::string::npos;
+}
+
+bool MatchesEndpoint(const PreparedTunnelEndpoint& endpoint, const ReceivedUdpDatagram& datagram) {
+  return endpoint.state == PreparedEndpointState::Ready && endpoint.ipv4 == datagram.source_ipv4 &&
+         endpoint.port == datagram.source_port;
+}
+
 Error MakeResolveError(int rc, std::string_view host) {
   ErrorCode code = ErrorCode::ServiceUnavailable;
   if (rc == EAI_NONAME) {
@@ -93,6 +108,12 @@ Error MakeResolveError(int rc, std::string_view host) {
 
 class WgTunnelEngine final : public IWgTunnelEngine {
  public:
+  ~WgTunnelEngine() override {
+    if (running_ || keepalive_thread_.joinable() || receive_thread_.joinable()) {
+      Stop();
+    }
+  }
+
   Error Start(const TunnelEngineStartRequest& request) override {
     if (running_) {
       return MakeError(ErrorCode::InvalidState, "WireGuard engine is already running");
@@ -282,24 +303,39 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     ++total_packets_sent;
     ++next_send_counter_;
 
-    udp_socket_ = socket_result.value;
-    active_profile_ = resolved_session.value.profile_name;
-    prepared_session_ = resolved_session.value;
-    if (resolved_response_endpoint_.state == PreparedEndpointState::Ready) {
-      prepared_session_.endpoint = resolved_response_endpoint_;
+    {
+      std::scoped_lock lock(engine_mutex_);
+      udp_socket_ = socket_result.value;
+      active_profile_ = resolved_session.value.profile_name;
+      prepared_session_ = resolved_session.value;
+      if (resolved_response_endpoint_.state == PreparedEndpointState::Ready) {
+        prepared_session_.endpoint = resolved_response_endpoint_;
+      }
+      local_sender_index_ = validated.value.local_sender_index;
+      peer_sender_index_ = validated.value.peer_sender_index;
+      sending_key_ = validated.value.sending_key;
+      receiving_key_ = validated.value.receiving_key;
+      stats_ = {};
+      stats_.bytes_out = total_bytes_sent;
+      stats_.bytes_in = final_bytes_received;
+      stats_.packets_out = total_packets_sent;
+      stats_.packets_in = 1;
+      stats_.successful_handshakes = 1;
+      next_send_counter_ = 1;
+      next_receive_counter_ = 0;
+      last_handshake_at_ = std::chrono::steady_clock::now();
+      running_ = true;
+      stop_requested_ = false;
     }
-    local_sender_index_ = validated.value.local_sender_index;
-    peer_sender_index_ = validated.value.peer_sender_index;
-    sending_key_ = validated.value.sending_key;
-    receiving_key_ = validated.value.receiving_key;
-    stats_ = {};
-    stats_.bytes_out = total_bytes_sent;
-    stats_.bytes_in = final_bytes_received;
-    stats_.packets_out = total_packets_sent;
-    stats_.packets_in = 1;
-    stats_.successful_handshakes = 1;
-    last_handshake_at_ = std::chrono::steady_clock::now();
-    running_ = true;
+
+    receive_thread_ = std::thread([this]() {
+      ReceiveLoop();
+    });
+    if (prepared_session_.persistent_keepalive != 0) {
+      keepalive_thread_ = std::thread([this]() {
+        KeepaliveLoop();
+      });
+    }
     LogInfo("wg_engine", "validated WireGuard handshake for profile " + active_profile_ +
                               ": local_index=" + std::to_string(local_sender_index_) +
                               ", peer_index=" + std::to_string(peer_sender_index_) +
@@ -308,28 +344,49 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   }
 
   Error Stop() override {
-    if (!running_) {
-      return Error::None();
+    {
+      std::scoped_lock lock(engine_mutex_);
+      if (!running_ && !keepalive_thread_.joinable() && !receive_thread_.joinable()) {
+        return Error::None();
+      }
+
+      stop_requested_ = true;
+      running_ = false;
+    }
+
+    keepalive_cv_.notify_all();
+    if (receive_thread_.joinable()) {
+      receive_thread_.join();
+    }
+    if (keepalive_thread_.joinable()) {
+      keepalive_thread_.join();
     }
 
     socket_runtime_.CloseSocket(udp_socket_);
     socket_runtime_.Stop();
-    udp_socket_ = -1;
-    running_ = false;
-    active_profile_.clear();
-    prepared_session_ = {};
-    resolved_response_endpoint_ = {};
-    stats_ = {};
-    local_sender_index_ = 0;
-    peer_sender_index_ = 0;
-    sending_key_ = {};
-    receiving_key_ = {};
-    next_send_counter_ = 0;
-    last_handshake_at_ = {};
+
+    {
+      std::scoped_lock lock(engine_mutex_);
+      udp_socket_ = -1;
+      active_profile_.clear();
+      prepared_session_ = {};
+      resolved_response_endpoint_ = {};
+      stats_ = {};
+      local_sender_index_ = 0;
+      peer_sender_index_ = 0;
+      sending_key_ = {};
+      receiving_key_ = {};
+      next_send_counter_ = 0;
+      next_receive_counter_ = 0;
+      stop_requested_ = false;
+      last_handshake_at_ = {};
+    }
+
     return Error::None();
   }
 
   TunnelStats GetStats() const override {
+    std::scoped_lock lock(engine_mutex_);
     TunnelStats stats = stats_;
     if (running_ && stats.successful_handshakes != 0) {
       stats.last_handshake_age_seconds = static_cast<std::uint64_t>(
@@ -340,11 +397,154 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   }
 
   bool IsRunning() const override {
+    std::scoped_lock lock(engine_mutex_);
     return running_;
   }
 
  private:
+  void ReceiveLoop() {
+    std::array<std::uint8_t, kMaxTransportDatagramSize> buffer{};
+
+    while (true) {
+      PreparedTunnelEndpoint endpoint{};
+      WireGuardKey receiving_key{};
+      std::uint32_t local_sender_index = 0;
+      int socket_fd = -1;
+
+      {
+        std::scoped_lock lock(engine_mutex_);
+        if (stop_requested_ || !running_) {
+          return;
+        }
+
+        endpoint = prepared_session_.endpoint;
+        receiving_key = receiving_key_;
+        local_sender_index = local_sender_index_;
+        socket_fd = udp_socket_;
+      }
+
+      const Result<ReceivedUdpDatagram> received =
+          socket_runtime_.ReceiveFrom(socket_fd, buffer.data(), buffer.size(), kTransportReceiveTimeoutMs);
+      if (!received.ok()) {
+        if (IsReceiveTimeout(received.error)) {
+          continue;
+        }
+
+        std::scoped_lock lock(engine_mutex_);
+        if (stop_requested_ || !running_) {
+          return;
+        }
+
+        LogWarning("wg_engine", "failed to receive post-handshake transport datagram: " +
+                                    received.error.message);
+        continue;
+      }
+
+      if (!MatchesEndpoint(endpoint, received.value)) {
+        LogWarning("wg_engine", "ignoring authenticated transport candidate from unexpected endpoint " +
+                                    DescribeReplySource(received.value) + "; expected " +
+                                    DescribeResolvedEndpoint(endpoint));
+        continue;
+      }
+
+      if (received.value.size == 0) {
+        LogWarning("wg_engine", "ignoring empty post-handshake transport datagram from " +
+                                    DescribeReplySource(received.value));
+        continue;
+      }
+
+      const auto message_type = static_cast<WireGuardMessageType>(buffer[0]);
+      if (message_type != WireGuardMessageType::Data) {
+        LogWarning("wg_engine", "ignoring unsupported post-handshake WireGuard message type from " +
+                                    DescribeReplySource(received.value));
+        continue;
+      }
+
+      const auto keepalive =
+          ConsumeTransportKeepalivePacket(receiving_key, local_sender_index, buffer.data(), received.value.size);
+      if (!keepalive.ok()) {
+        LogWarning("wg_engine", "failed to validate inbound authenticated keepalive from " +
+                                    DescribeReplySource(received.value) + ": " + keepalive.error.message);
+        continue;
+      }
+
+      {
+        std::scoped_lock lock(engine_mutex_);
+        if (keepalive.value < next_receive_counter_) {
+          LogWarning("wg_engine", "ignoring replayed authenticated keepalive with counter " +
+                                      std::to_string(keepalive.value));
+          continue;
+        }
+
+        next_receive_counter_ = keepalive.value + 1;
+        stats_.bytes_in += received.value.size;
+        ++stats_.packets_in;
+      }
+    }
+  }
+
+  void KeepaliveLoop() {
+    while (true) {
+      PreparedTunnelEndpoint endpoint{};
+      WireGuardKey sending_key{};
+      std::uint32_t peer_sender_index = 0;
+      std::uint64_t counter = 0;
+      std::uint16_t interval_seconds = 0;
+      int socket_fd = -1;
+
+      {
+        std::unique_lock lock(engine_mutex_);
+        if (keepalive_cv_.wait_for(lock, std::chrono::seconds(prepared_session_.persistent_keepalive), [this]() {
+              return stop_requested_ || !running_;
+            })) {
+          return;
+        }
+
+        if (stop_requested_ || !running_) {
+          return;
+        }
+
+        endpoint = prepared_session_.endpoint;
+        sending_key = sending_key_;
+        peer_sender_index = peer_sender_index_;
+        counter = next_send_counter_;
+        interval_seconds = prepared_session_.persistent_keepalive;
+        socket_fd = udp_socket_;
+      }
+
+      const Result<WireGuardTransportKeepalive> keepalive =
+          CreateTransportKeepalivePacket(sending_key, peer_sender_index, counter);
+      if (!keepalive.ok()) {
+        LogWarning("wg_engine", "failed to build periodic keepalive packet: " + keepalive.error.message);
+        continue;
+      }
+
+      const Result<std::size_t> bytes_sent =
+          socket_runtime_.SendTo(socket_fd, endpoint, keepalive.value.packet.data(), keepalive.value.packet.size());
+      if (!bytes_sent.ok()) {
+        LogWarning("wg_engine", "failed to send periodic keepalive after " + std::to_string(interval_seconds) +
+                                    "s: " + bytes_sent.error.message);
+        continue;
+      }
+      if (bytes_sent.value != keepalive.value.packet.size()) {
+        LogWarning("wg_engine", "periodic keepalive send returned a short datagram");
+        continue;
+      }
+
+      {
+        std::scoped_lock lock(engine_mutex_);
+        stats_.bytes_out += bytes_sent.value;
+        ++stats_.packets_out;
+        ++next_send_counter_;
+      }
+    }
+  }
+
   BsdSocketRuntime socket_runtime_{};
+  mutable std::mutex engine_mutex_{};
+  std::condition_variable keepalive_cv_{};
+  std::thread keepalive_thread_{};
+  std::thread receive_thread_{};
   std::string active_profile_;
   PreparedTunnelSession prepared_session_{};
   PreparedTunnelEndpoint resolved_response_endpoint_{};
@@ -355,6 +555,8 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   WireGuardKey sending_key_{};
   WireGuardKey receiving_key_{};
   std::uint64_t next_send_counter_ = 0;
+  std::uint64_t next_receive_counter_ = 0;
+  bool stop_requested_ = false;
   std::chrono::steady_clock::time_point last_handshake_at_{};
   bool running_ = false;
 };

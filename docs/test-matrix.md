@@ -11,6 +11,8 @@
 | IPC codec round-trip | Verified | Covered by `swg_tests` using request/response encoding helpers |
 | SDK client host binding | Verified | Regression-covered in `swg_tests` |
 | WireGuard handshake round-trip | Verified | `swg_tests` now covers initiation build, responder processing, and initiator response validation in-process |
+| WireGuard keepalive scheduling | Verified | `swg_tests` now validates the immediate post-handshake keepalive plus one scheduled keepalive and checks live stats growth |
+| Inbound authenticated keepalive stats | Verified | `swg_tests` now sends one responder-side authenticated keepalive after connect and waits for live `GetStats()` counters to reflect it |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
@@ -28,4 +30,4 @@
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |
 | Overlay queries status | Deferred | Tesla overlay is intentionally outside the current Phase A scope |
-| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, sends one authenticated keepalive, and only then reports `Connected`; broader sustained transport traffic is the next on-device check |
+| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, sends an authenticated keepalive, and can schedule periodic keepalives; broader sustained transport traffic is the next on-device check |

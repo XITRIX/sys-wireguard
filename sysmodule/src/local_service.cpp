@@ -278,8 +278,6 @@ class LocalControlService final : public IControlService {
       return mark_error;
     }
 
-    state_machine_.UpdateStats(MergeEngineStats(state_machine_.snapshot().stats, tunnel_engine_->GetStats()));
-
     LogInfo("sysmodule", "connect requested with prepared session: " +
                             DescribePreparedTunnelSession(prepared_session.value) +
                             " (WireGuard response validated)");
@@ -294,6 +292,8 @@ class LocalControlService final : public IControlService {
       return disconnect_error;
     }
 
+    const TunnelStats final_engine_stats = tunnel_engine_->GetStats();
+
     const Error engine_error = tunnel_engine_->Stop();
     if (engine_error) {
       state_machine_.MarkConnectFailed(engine_error.message);
@@ -305,13 +305,21 @@ class LocalControlService final : public IControlService {
       return mark_error;
     }
 
+    state_machine_.UpdateStats(MergeEngineStats(state_machine_.snapshot().stats, final_engine_stats));
+
     LogInfo("sysmodule", "disconnect requested");
     return Error::None();
   }
 
   Result<TunnelStats> GetStats() const override {
     std::scoped_lock lock(mutex_);
-    return MakeSuccess(state_machine_.snapshot().stats);
+
+    TunnelStats stats = state_machine_.snapshot().stats;
+    if (tunnel_engine_->IsRunning()) {
+      stats = MergeEngineStats(stats, tunnel_engine_->GetStats());
+    }
+
+    return MakeSuccess(std::move(stats));
   }
 
   Error SetRuntimeFlags(RuntimeFlags flags) override {
