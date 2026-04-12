@@ -1237,6 +1237,263 @@ Result<DnsResolveResult> DecodeDnsResolveResultPayload(const ByteBuffer& payload
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const TunnelDatagramOpenRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteString(value.remote_host);
+  writer.WritePod<std::uint16_t>(value.remote_port);
+  writer.WriteEnum(value.traffic_class);
+  writer.WriteEnum(value.route_preference);
+  writer.WriteBool(value.local_network_hint);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagramOpenRequest> DecodeTunnelDatagramOpenRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagramOpenRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<std::string> remote_host = reader.ReadString();
+  if (!remote_host.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(remote_host.error.code, remote_host.error.message);
+  }
+  value.remote_host = remote_host.value;
+
+  const Result<std::uint16_t> remote_port = reader.ReadPod<std::uint16_t>();
+  if (!remote_port.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(remote_port.error.code, remote_port.error.message);
+  }
+  value.remote_port = remote_port.value;
+
+  const Result<AppTrafficClass> traffic_class = reader.ReadEnum<AppTrafficClass>();
+  if (!traffic_class.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(traffic_class.error.code, traffic_class.error.message);
+  }
+  value.traffic_class = traffic_class.value;
+
+  const Result<RoutePreference> route_preference = reader.ReadEnum<RoutePreference>();
+  if (!route_preference.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(route_preference.error.code, route_preference.error.message);
+  }
+  value.route_preference = route_preference.value;
+
+  const Result<bool> local_network_hint = reader.ReadBool();
+  if (!local_network_hint.ok()) {
+    return MakeFailure<TunnelDatagramOpenRequest>(local_network_hint.error.code, local_network_hint.error.message);
+  }
+  value.local_network_hint = local_network_hint.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagramOpenRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelDatagramInfo& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.datagram_id);
+  writer.WritePod<std::uint64_t>(value.session_id);
+  writer.WriteEnum(value.traffic_class);
+  writer.WriteString(value.profile_name);
+  writer.WriteString(value.remote_host);
+  writer.WriteString(value.remote_address);
+  writer.WritePod<std::uint16_t>(value.remote_port);
+  writer.WriteString(value.local_address);
+  writer.WritePod<std::uint16_t>(value.local_port);
+  writer.WriteString(value.message);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagramInfo> DecodeTunnelDatagramInfoPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagramInfo value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> datagram_id = reader.ReadPod<std::uint64_t>();
+  if (!datagram_id.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(datagram_id.error.code, datagram_id.error.message);
+  }
+  value.datagram_id = datagram_id.value;
+
+  const Result<std::uint64_t> session_id = reader.ReadPod<std::uint64_t>();
+  if (!session_id.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(session_id.error.code, session_id.error.message);
+  }
+  value.session_id = session_id.value;
+
+  const Result<AppTrafficClass> traffic_class = reader.ReadEnum<AppTrafficClass>();
+  if (!traffic_class.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(traffic_class.error.code, traffic_class.error.message);
+  }
+  value.traffic_class = traffic_class.value;
+
+  const Result<std::string> profile_name = reader.ReadString();
+  if (!profile_name.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(profile_name.error.code, profile_name.error.message);
+  }
+  value.profile_name = profile_name.value;
+
+  const Result<std::string> remote_host = reader.ReadString();
+  if (!remote_host.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(remote_host.error.code, remote_host.error.message);
+  }
+  value.remote_host = remote_host.value;
+
+  const Result<std::string> remote_address = reader.ReadString();
+  if (!remote_address.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(remote_address.error.code, remote_address.error.message);
+  }
+  value.remote_address = remote_address.value;
+
+  const Result<std::uint16_t> remote_port = reader.ReadPod<std::uint16_t>();
+  if (!remote_port.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(remote_port.error.code, remote_port.error.message);
+  }
+  value.remote_port = remote_port.value;
+
+  const Result<std::string> local_address = reader.ReadString();
+  if (!local_address.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(local_address.error.code, local_address.error.message);
+  }
+  value.local_address = local_address.value;
+
+  const Result<std::uint16_t> local_port = reader.ReadPod<std::uint16_t>();
+  if (!local_port.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(local_port.error.code, local_port.error.message);
+  }
+  value.local_port = local_port.value;
+
+  const Result<std::string> message = reader.ReadString();
+  if (!message.ok()) {
+    return MakeFailure<TunnelDatagramInfo>(message.error.code, message.error.message);
+  }
+  value.message = message.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagramInfo>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelDatagramSendRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.datagram_id);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagramSendRequest> DecodeTunnelDatagramSendRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagramSendRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagramSendRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> datagram_id = reader.ReadPod<std::uint64_t>();
+  if (!datagram_id.ok()) {
+    return MakeFailure<TunnelDatagramSendRequest>(datagram_id.error.code, datagram_id.error.message);
+  }
+  value.datagram_id = datagram_id.value;
+
+  const Result<std::vector<std::uint8_t>> payload_bytes = reader.ReadByteVector();
+  if (!payload_bytes.ok()) {
+    return MakeFailure<TunnelDatagramSendRequest>(payload_bytes.error.code, payload_bytes.error.message);
+  }
+  value.payload = payload_bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagramSendRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelDatagram& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.datagram_id);
+  writer.WritePod<std::uint64_t>(value.counter);
+  writer.WriteString(value.remote_address);
+  writer.WritePod<std::uint16_t>(value.remote_port);
+  writer.WriteByteVector(value.payload);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagram> DecodeTunnelDatagramPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagram value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagram>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> datagram_id = reader.ReadPod<std::uint64_t>();
+  if (!datagram_id.ok()) {
+    return MakeFailure<TunnelDatagram>(datagram_id.error.code, datagram_id.error.message);
+  }
+  value.datagram_id = datagram_id.value;
+
+  const Result<std::uint64_t> counter = reader.ReadPod<std::uint64_t>();
+  if (!counter.ok()) {
+    return MakeFailure<TunnelDatagram>(counter.error.code, counter.error.message);
+  }
+  value.counter = counter.value;
+
+  const Result<std::string> remote_address = reader.ReadString();
+  if (!remote_address.ok()) {
+    return MakeFailure<TunnelDatagram>(remote_address.error.code, remote_address.error.message);
+  }
+  value.remote_address = remote_address.value;
+
+  const Result<std::uint16_t> remote_port = reader.ReadPod<std::uint16_t>();
+  if (!remote_port.ok()) {
+    return MakeFailure<TunnelDatagram>(remote_port.error.code, remote_port.error.message);
+  }
+  value.remote_port = remote_port.value;
+
+  const Result<std::vector<std::uint8_t>> payload_bytes = reader.ReadByteVector();
+  if (!payload_bytes.ok()) {
+    return MakeFailure<TunnelDatagram>(payload_bytes.error.code, payload_bytes.error.message);
+  }
+  value.payload = payload_bytes.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagram>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodeRequestMessage(const IpcRequestMessage& request) {
   RequestHeaderWire header{};
   header.abi_version = request.abi_version;
@@ -1434,6 +1691,36 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(send_request.error);
       }
       return EncodeResponseFromResult(service.SendPacket(send_request.value));
+    }
+    case ServiceCommandId::OpenTunnelDatagram: {
+      const Result<TunnelDatagramOpenRequest> open_request =
+          DecodeTunnelDatagramOpenRequestPayload(request.value.payload);
+      if (!open_request.ok()) {
+        return EncodeResponseFromError(open_request.error);
+      }
+      return EncodeResponseFromResult(service.OpenTunnelDatagram(open_request.value));
+    }
+    case ServiceCommandId::CloseTunnelDatagram: {
+      const Result<std::uint64_t> datagram_id = DecodeU64Payload(request.value.payload);
+      if (!datagram_id.ok()) {
+        return EncodeResponseFromError(datagram_id.error);
+      }
+      return EncodeResponseFromConfigMutation(service.CloseTunnelDatagram(datagram_id.value));
+    }
+    case ServiceCommandId::RecvTunnelDatagram: {
+      const Result<std::uint64_t> datagram_id = DecodeU64Payload(request.value.payload);
+      if (!datagram_id.ok()) {
+        return EncodeResponseFromError(datagram_id.error);
+      }
+      return EncodeResponseFromResult(service.RecvTunnelDatagram(datagram_id.value));
+    }
+    case ServiceCommandId::SendTunnelDatagram: {
+      const Result<TunnelDatagramSendRequest> send_request =
+          DecodeTunnelDatagramSendRequestPayload(request.value.payload);
+      if (!send_request.ok()) {
+        return EncodeResponseFromError(send_request.error);
+      }
+      return EncodeResponseFromResult(service.SendTunnelDatagram(send_request.value));
     }
   }
 

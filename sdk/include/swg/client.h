@@ -37,6 +37,10 @@ class Client {
   Result<DnsResolveResult> ResolveDns(const DnsResolveRequest& request) const;
   Result<std::uint64_t> SendPacket(std::uint64_t session_id, const std::vector<std::uint8_t>& payload) const;
   Result<TunnelPacket> RecvPacket(std::uint64_t session_id) const;
+  Result<TunnelDatagramInfo> OpenTunnelDatagram(const TunnelDatagramOpenRequest& request) const;
+  Error CloseTunnelDatagram(std::uint64_t datagram_id) const;
+  Result<std::uint64_t> SendTunnelDatagram(const TunnelDatagramSendRequest& request) const;
+  Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) const;
 
  private:
   std::shared_ptr<IControlService> ResolveService() const;

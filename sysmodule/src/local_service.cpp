@@ -1,6 +1,7 @@
 #include "swg_sysmodule/local_service.h"
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <cctype>
 #include <chrono>
@@ -34,6 +35,20 @@ struct AppSessionRecord {
   std::string selected_profile;
 };
 
+struct TunnelDatagramHandleRecord {
+  std::uint64_t datagram_id = 0;
+  std::uint64_t session_id = 0;
+  AppTrafficClass traffic_class = AppTrafficClass::Generic;
+  std::string selected_profile;
+  std::string remote_host;
+  std::string remote_address;
+  std::uint16_t remote_port = 0;
+  std::string local_address;
+  std::uint16_t local_port = 0;
+  std::array<std::uint8_t, 4> remote_ipv4{};
+  std::array<std::uint8_t, 4> local_ipv4{};
+};
+
 struct TunnelDnsLookupResult {
   bool resolved = false;
   std::vector<std::string> addresses;
@@ -44,6 +59,8 @@ struct TunnelDnsLookupResult {
 constexpr std::uint16_t kTunnelDnsSourcePortBase = 40000;
 constexpr std::uint16_t kTunnelDnsSourcePortSpan = 20000;
 constexpr std::uint16_t kTunnelDnsDestinationPort = 53;
+constexpr std::uint16_t kTunnelDatagramSourcePortBase = 20000;
+constexpr std::uint16_t kTunnelDatagramSourcePortSpan = 10000;
 constexpr std::chrono::milliseconds kTunnelDnsPollInterval(25);
 constexpr int kTunnelDnsPollAttemptsPerServer = 40;
 
@@ -579,6 +596,7 @@ class LocalControlService final : public IControlService {
       return MakeError(ErrorCode::NotFound, "app session not found: " + std::to_string(session_id));
     }
 
+    RemoveTunnelDatagramsForSessionLocked(session_id);
     app_sessions_.erase(it);
     LogInfo("sysmodule", "closed app session " + std::to_string(session_id));
     return Error::None();
@@ -667,13 +685,8 @@ class LocalControlService final : public IControlService {
                                              "selected profile not found for app session DNS resolve");
       }
 
-      const Result<ValidatedWireGuardProfile> validated = ValidateWireGuardProfileForConnect(selected_profile);
-      if (!validated.ok()) {
-        return MakeFailure<DnsResolveResult>(validated.error.code, validated.error.message);
-      }
-
       const Result<PreparedTunnelSession> prepared_session =
-          PrepareTunnelSession(session.selected_profile, validated.value, active_runtime_flags);
+          PrepareSelectedTunnelSession(session.selected_profile, selected_profile, active_runtime_flags);
       if (!prepared_session.ok()) {
         return MakeFailure<DnsResolveResult>(prepared_session.error.code, prepared_session.error.message);
       }
@@ -705,6 +718,192 @@ class LocalControlService final : public IControlService {
     }
 
     return MakeSuccess(std::move(result));
+  }
+
+  Result<TunnelDatagramInfo> OpenTunnelDatagram(const TunnelDatagramOpenRequest& request) override {
+    if (request.remote_host.empty()) {
+      return MakeFailure<TunnelDatagramInfo>(ErrorCode::ParseError, "remote_host must not be empty");
+    }
+    if (request.remote_port == 0) {
+      return MakeFailure<TunnelDatagramInfo>(ErrorCode::ParseError, "remote_port must not be zero");
+    }
+
+    AppSessionRecord session{};
+    StateSnapshot snapshot{};
+    RuntimeFlags granted_flags = 0;
+    RuntimeFlags active_runtime_flags = 0;
+    ProfileConfig selected_profile{};
+    bool have_selected_profile = false;
+    {
+      std::scoped_lock lock(mutex_);
+      const auto session_it = app_sessions_.find(request.session_id);
+      if (session_it == app_sessions_.end()) {
+        return MakeFailure<TunnelDatagramInfo>(ErrorCode::NotFound,
+                                               "app session not found: " + std::to_string(request.session_id));
+      }
+
+      session = session_it->second;
+      snapshot = state_machine_.snapshot();
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      active_runtime_flags = config_.runtime_flags;
+
+      const auto profile_it = config_.profiles.find(session.selected_profile);
+      if (profile_it != config_.profiles.end()) {
+        selected_profile = profile_it->second;
+        have_selected_profile = true;
+      }
+    }
+
+    NetworkPlanRequest plan_request{};
+    plan_request.session_id = request.session_id;
+    plan_request.remote_host = request.remote_host;
+    plan_request.remote_port = request.remote_port;
+    plan_request.transport = TransportProtocol::Udp;
+    plan_request.traffic_class = request.traffic_class;
+    plan_request.route_preference = request.route_preference;
+    plan_request.local_network_hint = request.local_network_hint;
+
+    const NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, plan_request);
+    if (plan.action != RouteAction::Tunnel) {
+      return MakeFailure<TunnelDatagramInfo>(ErrorCode::Unsupported,
+                                             "tunnel UDP datagram requires a tunnel route: " + plan.reason);
+    }
+
+    if (!have_selected_profile) {
+      return MakeFailure<TunnelDatagramInfo>(ErrorCode::NotFound,
+                                             "selected profile not found for tunnel datagram open");
+    }
+
+    const Result<PreparedTunnelSession> prepared_session =
+        PrepareSelectedTunnelSession(session.selected_profile, selected_profile, active_runtime_flags);
+    if (!prepared_session.ok()) {
+      return MakeFailure<TunnelDatagramInfo>(prepared_session.error.code, prepared_session.error.message);
+    }
+
+    const Result<std::array<std::uint8_t, 4>> remote_ipv4 =
+        ResolveTunnelRemoteIpv4(request.session_id, prepared_session.value, request.remote_host);
+    if (!remote_ipv4.ok()) {
+      return MakeFailure<TunnelDatagramInfo>(remote_ipv4.error.code, remote_ipv4.error.message);
+    }
+
+    TunnelDatagramInfo info{};
+    {
+      std::scoped_lock lock(mutex_);
+      const auto session_it = app_sessions_.find(request.session_id);
+      if (session_it == app_sessions_.end()) {
+        return MakeFailure<TunnelDatagramInfo>(ErrorCode::NotFound,
+                                               "app session not found during tunnel datagram open");
+      }
+
+      const StateSnapshot live_snapshot = state_machine_.snapshot();
+      if (!SessionUsesActiveTunnelLocked(session_it->second, live_snapshot)) {
+        return MakeFailure<TunnelDatagramInfo>(ErrorCode::InvalidState,
+                                               "tunnel is not connected for tunnel datagram open");
+      }
+
+      TunnelDatagramHandleRecord record{};
+      record.datagram_id = next_tunnel_datagram_id_++;
+      record.session_id = request.session_id;
+      record.traffic_class = request.traffic_class;
+      record.selected_profile = session_it->second.selected_profile;
+      record.remote_host = request.remote_host;
+      record.remote_address = FormatIpv4Address(remote_ipv4.value);
+      record.remote_port = request.remote_port;
+      record.local_address = FormatIpv4Address(prepared_session.value.interface_ipv4_addresses.front().address);
+      record.local_port = ReserveTunnelDatagramSourcePortLocked();
+      record.remote_ipv4 = remote_ipv4.value;
+      record.local_ipv4 = prepared_session.value.interface_ipv4_addresses.front().address;
+
+      info.datagram_id = record.datagram_id;
+      info.session_id = record.session_id;
+      info.traffic_class = record.traffic_class;
+      info.profile_name = record.selected_profile;
+      info.remote_host = record.remote_host;
+      info.remote_address = record.remote_address;
+      info.remote_port = record.remote_port;
+      info.local_address = record.local_address;
+      info.local_port = record.local_port;
+      info.message = plan.reason + "; forward UDP payloads through this tunnel datagram handle";
+
+      tunnel_datagrams_[record.datagram_id] = record;
+    }
+
+    return MakeSuccess(std::move(info));
+  }
+
+  Error CloseTunnelDatagram(std::uint64_t datagram_id) override {
+    std::scoped_lock lock(mutex_);
+
+    const auto it = tunnel_datagrams_.find(datagram_id);
+    if (it == tunnel_datagrams_.end()) {
+      return MakeError(ErrorCode::NotFound, "tunnel datagram not found: " + std::to_string(datagram_id));
+    }
+
+    tunnel_datagrams_.erase(it);
+    return Error::None();
+  }
+
+  Result<std::uint64_t> SendTunnelDatagram(const TunnelDatagramSendRequest& request) override {
+    std::scoped_lock lock(mutex_);
+
+    if (request.payload.empty()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "tunnel datagram payload must not be empty");
+    }
+
+    const auto datagram_it = tunnel_datagrams_.find(request.datagram_id);
+    if (datagram_it == tunnel_datagrams_.end()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::NotFound,
+                                        "tunnel datagram not found: " + std::to_string(request.datagram_id));
+    }
+
+    const auto session_it = app_sessions_.find(datagram_it->second.session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::NotFound,
+                                        "app session not found for tunnel datagram send");
+    }
+
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+      return MakeFailure<std::uint64_t>(ErrorCode::InvalidState,
+                                        "tunnel is not connected for tunnel datagram send");
+    }
+
+    Ipv4UdpPacketEndpoint endpoint{};
+    endpoint.source_ipv4 = datagram_it->second.local_ipv4;
+    endpoint.destination_ipv4 = datagram_it->second.remote_ipv4;
+    endpoint.source_port = datagram_it->second.local_port;
+    endpoint.destination_port = datagram_it->second.remote_port;
+
+    const Result<std::vector<std::uint8_t>> packet = BuildIpv4UdpPacket(endpoint, request.payload);
+    if (!packet.ok()) {
+      return MakeFailure<std::uint64_t>(packet.error.code, packet.error.message);
+    }
+
+    return tunnel_engine_->SendPacket(packet.value);
+  }
+
+  Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) override {
+    std::scoped_lock lock(mutex_);
+
+    const auto datagram_it = tunnel_datagrams_.find(datagram_id);
+    if (datagram_it == tunnel_datagrams_.end()) {
+      return MakeFailure<TunnelDatagram>(ErrorCode::NotFound,
+                                         "tunnel datagram not found: " + std::to_string(datagram_id));
+    }
+
+    const auto session_it = app_sessions_.find(datagram_it->second.session_id);
+    if (session_it == app_sessions_.end()) {
+      return MakeFailure<TunnelDatagram>(ErrorCode::NotFound,
+                                         "app session not found for tunnel datagram receive");
+    }
+
+    const StateSnapshot snapshot = state_machine_.snapshot();
+    if (!SessionUsesActiveTunnelLocked(session_it->second, snapshot)) {
+      return MakeFailure<TunnelDatagram>(ErrorCode::InvalidState,
+                                         "tunnel is not connected for tunnel datagram receive");
+    }
+
+    return PopTunnelDatagramLocked(datagram_it->second);
   }
 
   Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) override {
@@ -798,6 +997,136 @@ class LocalControlService final : public IControlService {
     }
 
     return next_dns_query_id_++;
+  }
+
+  std::uint16_t ReserveTunnelDatagramSourcePortLocked() const {
+    if (next_tunnel_datagram_source_port_ < kTunnelDatagramSourcePortBase ||
+        next_tunnel_datagram_source_port_ >= kTunnelDatagramSourcePortBase + kTunnelDatagramSourcePortSpan) {
+      next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
+    }
+
+    return next_tunnel_datagram_source_port_++;
+  }
+
+  void RemoveTunnelDatagramsForSessionLocked(std::uint64_t session_id) {
+    for (auto it = tunnel_datagrams_.begin(); it != tunnel_datagrams_.end();) {
+      if (it->second.session_id == session_id) {
+        it = tunnel_datagrams_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  Result<PreparedTunnelSession> PrepareSelectedTunnelSession(std::string_view profile_name,
+                                                             const ProfileConfig& selected_profile,
+                                                             RuntimeFlags active_runtime_flags) const {
+    const Result<ValidatedWireGuardProfile> validated = ValidateWireGuardProfileForConnect(selected_profile);
+    if (!validated.ok()) {
+      return MakeFailure<PreparedTunnelSession>(validated.error.code, validated.error.message);
+    }
+
+    return PrepareTunnelSession(profile_name, validated.value, active_runtime_flags);
+  }
+
+  Result<std::array<std::uint8_t, 4>> ResolveTunnelRemoteIpv4(std::uint64_t session_id,
+                                                              const PreparedTunnelSession& prepared_session,
+                                                              std::string_view remote_host) const {
+    const Result<ParsedIpAddress> parsed_remote = ParseIpAddress(remote_host, "remote_host");
+    if (parsed_remote.ok()) {
+      if (parsed_remote.value.family != ParsedIpFamily::IPv4) {
+        return MakeFailure<std::array<std::uint8_t, 4>>(ErrorCode::Unsupported,
+                                                        "tunnel datagram currently supports only IPv4 remote hosts");
+      }
+
+      std::array<std::uint8_t, 4> remote_ipv4{};
+      std::copy_n(parsed_remote.value.bytes.begin(), 4, remote_ipv4.begin());
+      return MakeSuccess(std::move(remote_ipv4));
+    }
+
+    const Result<TunnelDnsLookupResult> resolved = ResolveTunnelDns(session_id, prepared_session, remote_host);
+    if (!resolved.ok()) {
+      return MakeFailure<std::array<std::uint8_t, 4>>(resolved.error.code, resolved.error.message);
+    }
+    if (!resolved.value.resolved || resolved.value.addresses.empty()) {
+      return MakeFailure<std::array<std::uint8_t, 4>>(
+          ErrorCode::NotFound,
+          resolved.value.message.empty() ? "hostname did not resolve to an IPv4 tunnel destination"
+                                         : resolved.value.message);
+    }
+
+    const Result<ParsedIpAddress> resolved_address =
+        ParseIpAddress(resolved.value.addresses.front(), "resolved_remote_host");
+    if (!resolved_address.ok()) {
+      return MakeFailure<std::array<std::uint8_t, 4>>(resolved_address.error.code, resolved_address.error.message);
+    }
+    if (resolved_address.value.family != ParsedIpFamily::IPv4) {
+      return MakeFailure<std::array<std::uint8_t, 4>>(ErrorCode::Unsupported,
+                                                      "tunnel datagram currently supports only IPv4 resolved hosts");
+    }
+
+    std::array<std::uint8_t, 4> remote_ipv4{};
+    std::copy_n(resolved_address.value.bytes.begin(), 4, remote_ipv4.begin());
+    return MakeSuccess(std::move(remote_ipv4));
+  }
+
+  bool TryMatchTunnelDatagramPacket(const TunnelDatagramHandleRecord& datagram,
+                                    const TunnelPacket& packet,
+                                    TunnelDatagram* matched) const {
+    const Result<Ipv4UdpPacket> parsed = ParseIpv4UdpPacket(packet.payload);
+    if (!parsed.ok()) {
+      return false;
+    }
+
+    if (parsed.value.endpoint.source_ipv4 != datagram.remote_ipv4 ||
+        parsed.value.endpoint.destination_ipv4 != datagram.local_ipv4 ||
+        parsed.value.endpoint.source_port != datagram.remote_port ||
+        parsed.value.endpoint.destination_port != datagram.local_port) {
+      return false;
+    }
+
+    matched->datagram_id = datagram.datagram_id;
+    matched->counter = packet.counter;
+    matched->remote_address = FormatIpv4Address(parsed.value.endpoint.source_ipv4);
+    matched->remote_port = parsed.value.endpoint.source_port;
+    matched->payload = parsed.value.payload;
+    return true;
+  }
+
+  Result<TunnelDatagram> PopTunnelDatagramLocked(const TunnelDatagramHandleRecord& datagram) const {
+    std::deque<TunnelPacket> unmatched_deferred;
+    while (!deferred_packets_.empty()) {
+      TunnelPacket packet = std::move(deferred_packets_.front());
+      deferred_packets_.pop_front();
+
+      TunnelDatagram matched{};
+      if (TryMatchTunnelDatagramPacket(datagram, packet, &matched)) {
+        for (TunnelPacket& deferred : unmatched_deferred) {
+          deferred_packets_.push_back(std::move(deferred));
+        }
+        return MakeSuccess(std::move(matched));
+      }
+
+      unmatched_deferred.push_back(std::move(packet));
+    }
+
+    for (TunnelPacket& deferred : unmatched_deferred) {
+      deferred_packets_.push_back(std::move(deferred));
+    }
+
+    while (true) {
+      const Result<TunnelPacket> packet = PopEnginePacketLocked();
+      if (!packet.ok()) {
+        return MakeFailure<TunnelDatagram>(packet.error.code, packet.error.message);
+      }
+
+      TunnelDatagram matched{};
+      if (TryMatchTunnelDatagramPacket(datagram, packet.value, &matched)) {
+        return MakeSuccess(std::move(matched));
+      }
+
+      DeferPacketLocked(packet.value);
+    }
   }
 
   Result<TunnelDnsLookupResult> ResolveTunnelDns(std::uint64_t session_id,
@@ -990,9 +1319,12 @@ class LocalControlService final : public IControlService {
   std::unique_ptr<IWgTunnelEngine> tunnel_engine_ = CreateWgTunnelEngine();
   Error initialization_error_{};
   std::uint64_t next_session_id_ = 1;
+  mutable std::uint64_t next_tunnel_datagram_id_ = 1;
   mutable std::deque<TunnelPacket> deferred_packets_{};
   mutable std::uint16_t next_dns_query_id_ = 1;
+  mutable std::uint16_t next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};
+  mutable std::unordered_map<std::uint64_t, TunnelDatagramHandleRecord> tunnel_datagrams_{};
 };
 
 }  // namespace

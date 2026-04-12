@@ -23,6 +23,7 @@ Core pieces:
 - `swg::AppSession` for app-scoped lifecycle
 - `Client::OpenAppSession()` / `CloseAppSession()` / `GetNetworkPlan()` / `ResolveDns()` / `SendPacket()` / `RecvPacket()`
 - `AppSession::ResolveDns()` / `SendPacket()` / `ReceivePacket()` for DNS policy checks plus authenticated payload movement once tunnel traffic is flowing
+- `swg::TunnelDatagramSocket` for real UDP payload movement over the active tunnel with per-handle remote endpoint metadata
 - `swg::SessionSocket` for a route-aware wrapper that collapses plan + DNS + packet-channel usage into one SDK object
 
 Moonlight helpers:
@@ -57,6 +58,12 @@ For a Moonlight session:
 - when policy selects `Tunnel`, it exposes the current session packet channel for caller-managed datagram payloads and framed stream payloads
 - when policy selects `Deny`, it preserves the reason as a structured SDK result instead of forcing the caller to manually combine route and DNS calls
 
+`TunnelDatagramSocket` now behaves like this:
+- it opens only when the app session, active profile, and route policy all agree that the UDP flow must use the connected tunnel
+- it resolves hostname targets to one IPv4 address before opening and binds a stable tunnel-side source UDP port for the handle lifetime
+- `Send()` wraps caller payloads as inner IPv4/UDP packets and forwards them through WireGuard
+- `Receive()` filters the inbound WireGuard payload queue and returns only UDP packets that match the handle's remote IPv4/port and local source port
+
 If Moonlight opens a session that requires the tunnel, remote traffic will fail closed until the selected profile is connected.
 
 ## Example usage
@@ -77,6 +84,8 @@ auto control = session.PlanNetwork(swg::MakeMoonlightHttpsControlPlan("pc.exampl
 auto video = session.PlanNetwork(swg::MakeMoonlightVideoPlan("pc.example.net", 47998));
 auto video_socket = swg::SessionSocket::OpenDatagram(
   session, swg::MakeMoonlightVideoSocketRequest("203.0.113.8", 47998));
+auto video_tunnel = swg::TunnelDatagramSocket::Open(
+  session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", 47998));
 auto control_socket = swg::SessionSocket::OpenStream(
   session, swg::MakeMoonlightHttpsControlSocketRequest("pc.example.net", 47984));
 ```
@@ -84,6 +93,11 @@ auto control_socket = swg::SessionSocket::OpenStream(
 Moonlight can keep using its own sockets and libcurl. The sysmodule decides whether that traffic should go direct, require the tunnel, or wait for the tunnel to come up.
 
 The packet API is intentionally narrow: it gives a Moonlight-side shim one place to push and pull authenticated tunnel payloads without requiring transparent routing first, but it still does not replace Moonlight's existing socket semantics by itself.
+
+For Moonlight adoption, the intended split is now:
+- discovery, Wake-on-LAN, and STUN stay on Moonlight's native direct sockets
+- video, audio, and input can move onto `TunnelDatagramSocket`
+- HTTPS control and TCP control still need a stronger stream/TCP transport than the current framed packet wrapper
 
 The DNS helper is still intentionally narrow: it now executes IPv4 A-record DNS queries through the tunnel transport, but it does not yet cover AAAA lookups, TCP fallback, caching, or transparent resolver interception.
 
@@ -93,7 +107,8 @@ The stream wrapper is intentionally staged too: in tunnel mode it exposes framed
 
 ## Next steps for real integration
 
-- harden the new socket wrapper into a Moonlight-ready transport shim
+- wire Moonlight video/audio/input UDP paths to `TunnelDatagramSocket`
+- add the TCP/HTTPS control transport needed for pairing, app launch, and stream-control flows
 - expand tunnel DNS beyond the current IPv4 A-record path
 - add per-title policy so Moonlight NSP forwarders can opt into the tunnel automatically
 - add transparent DNS and later `bsd:u` interception as an optional fast path

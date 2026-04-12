@@ -6,6 +6,7 @@
 
 #include "swg/ipc_protocol.h"
 #include "swg/session_socket.h"
+#include "swg/tunnel_datagram.h"
 
 namespace swg {
 
@@ -164,6 +165,36 @@ inline SessionSocketRequest MakeMoonlightInputSocketRequest(std::string remote_h
   request.remote_host = std::move(remote_host);
   request.remote_port = remote_port;
   request.transport = TransportProtocol::Udp;
+  request.traffic_class = AppTrafficClass::StreamInput;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline TunnelDatagramOpenRequest MakeMoonlightVideoDatagramRequest(std::string remote_host,
+                                                                   std::uint16_t remote_port) {
+  TunnelDatagramOpenRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.traffic_class = AppTrafficClass::StreamVideo;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline TunnelDatagramOpenRequest MakeMoonlightAudioDatagramRequest(std::string remote_host,
+                                                                   std::uint16_t remote_port) {
+  TunnelDatagramOpenRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
+  request.traffic_class = AppTrafficClass::StreamAudio;
+  request.route_preference = RoutePreference::RequireTunnel;
+  return request;
+}
+
+inline TunnelDatagramOpenRequest MakeMoonlightInputDatagramRequest(std::string remote_host,
+                                                                   std::uint16_t remote_port) {
+  TunnelDatagramOpenRequest request{};
+  request.remote_host = std::move(remote_host);
+  request.remote_port = remote_port;
   request.traffic_class = AppTrafficClass::StreamInput;
   request.route_preference = RoutePreference::RequireTunnel;
   return request;

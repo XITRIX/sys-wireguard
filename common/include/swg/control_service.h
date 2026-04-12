@@ -32,6 +32,10 @@ class IControlService {
   virtual Result<DnsResolveResult> ResolveDns(const DnsResolveRequest& request) const = 0;
   virtual Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) = 0;
   virtual Result<TunnelPacket> RecvPacket(std::uint64_t session_id) = 0;
+  virtual Result<TunnelDatagramInfo> OpenTunnelDatagram(const TunnelDatagramOpenRequest& request) = 0;
+  virtual Error CloseTunnelDatagram(std::uint64_t datagram_id) = 0;
+  virtual Result<std::uint64_t> SendTunnelDatagram(const TunnelDatagramSendRequest& request) = 0;
+  virtual Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) = 0;
 };
 
 }  // namespace swg

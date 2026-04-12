@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "swg/ipv4_udp.h"
 #include "swg/result.h"
 
 namespace swg {
@@ -28,7 +29,6 @@ struct TunnelDnsResponse {
   std::vector<std::string> ipv4_addresses;
 };
 
-std::string FormatIpv4Address(const std::array<std::uint8_t, 4>& ipv4);
 Result<std::vector<std::uint8_t>> BuildTunnelDnsQueryPacket(const TunnelDnsPacketEndpoint& endpoint,
                                                             std::string_view hostname,
                                                             std::uint16_t query_id);

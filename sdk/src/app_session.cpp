@@ -75,4 +75,42 @@ Result<TunnelPacket> AppSession::ReceivePacket() const {
   return client_.RecvPacket(session_id_);
 }
 
+Result<TunnelDatagramInfo> AppSession::OpenTunnelDatagram(const TunnelDatagramOpenRequest& request) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelDatagramInfo>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  TunnelDatagramOpenRequest scoped_request = request;
+  scoped_request.session_id = session_id_;
+  return client_.OpenTunnelDatagram(scoped_request);
+}
+
+Error AppSession::CloseTunnelDatagram(std::uint64_t datagram_id) const {
+  if (!is_open()) {
+    return MakeError(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.CloseTunnelDatagram(datagram_id);
+}
+
+Result<std::uint64_t> AppSession::SendTunnelDatagram(std::uint64_t datagram_id,
+                                                     const std::vector<std::uint8_t>& payload) const {
+  if (!is_open()) {
+    return MakeFailure<std::uint64_t>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  TunnelDatagramSendRequest request{};
+  request.datagram_id = datagram_id;
+  request.payload = payload;
+  return client_.SendTunnelDatagram(request);
+}
+
+Result<TunnelDatagram> AppSession::ReceiveTunnelDatagram(std::uint64_t datagram_id) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelDatagram>(ErrorCode::InvalidState, "app session is not open");
+  }
+
+  return client_.RecvTunnelDatagram(datagram_id);
+}
+
 }  // namespace swg

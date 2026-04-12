@@ -20,6 +20,7 @@
 #include "swg/moonlight.h"
 #include "swg/session_socket.h"
 #include "swg/state_machine.h"
+#include "swg/tunnel_datagram.h"
 #include "swg/tunnel_dns.h"
 #include "swg/wg_crypto.h"
 #include "swg/wg_handshake.h"
@@ -2187,6 +2188,107 @@ bool TestSessionSocketAbstraction() {
   return ok;
 }
 
+bool TestTunnelDatagramSocket() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-tunnel-datagram";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelDatagramSourcePort = 20000;
+  constexpr std::uint16_t kMoonlightVideoPort = 47998;
+  const std::vector<std::uint8_t> outbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x01};
+  const std::vector<std::uint8_t> inbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x52, 0x45, 0x43, 0x56};
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.8", "remote_address");
+  if (!Require(local_address.ok(), "tunnel datagram local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "tunnel datagram remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4UdpPacketEndpoint outbound_endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, outbound_endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, outbound_endpoint.destination_ipv4.begin());
+  outbound_endpoint.source_port = kExpectedFirstTunnelDatagramSourcePort;
+  outbound_endpoint.destination_port = kMoonlightVideoPort;
+
+  swg::Ipv4UdpPacketEndpoint inbound_endpoint{};
+  inbound_endpoint.source_ipv4 = outbound_endpoint.destination_ipv4;
+  inbound_endpoint.destination_ipv4 = outbound_endpoint.source_ipv4;
+  inbound_endpoint.source_port = outbound_endpoint.destination_port;
+  inbound_endpoint.destination_port = outbound_endpoint.source_port;
+
+  const auto expected_outbound_packet = swg::BuildIpv4UdpPacket(outbound_endpoint, outbound_payload);
+  const auto inbound_packet = swg::BuildIpv4UdpPacket(inbound_endpoint, inbound_payload);
+  if (!Require(expected_outbound_packet.ok(), "expected tunnel datagram packet must build") ||
+      !Require(inbound_packet.ok(), "inbound tunnel datagram packet must build")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(0, 0, inbound_packet.value, expected_outbound_packet.value);
+  if (!Require(responder.ready(), "local handshake responder must start for tunnel datagram tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before tunnel datagram tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel datagram tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "tunnel datagram app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto local_bypass = session.OpenTunnelDatagram(swg::MakeMoonlightVideoDatagramRequest("192.168.1.50", kMoonlightVideoPort));
+  ok &= Require(!local_bypass.ok(), "local-network video traffic should not open a tunnel datagram handle");
+
+  const auto video_socket = swg::TunnelDatagramSocket::Open(
+      session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", kMoonlightVideoPort));
+  ok &= Require(video_socket.ok(), "Moonlight video tunnel datagram socket must open");
+  if (!video_socket.ok()) {
+    return false;
+  }
+
+  ok &= Require(video_socket.value.info().local_port == kExpectedFirstTunnelDatagramSourcePort,
+                "first tunnel datagram handle must use the expected deterministic local UDP source port");
+  ok &= Require(video_socket.value.info().remote_address == "203.0.113.8",
+                "tunnel datagram info must report the resolved remote IPv4 address");
+
+  const auto send_counter = video_socket.value.Send(outbound_payload);
+  ok &= Require(send_counter.ok(), "tunnel datagram send must succeed");
+  if (send_counter.ok()) {
+    ok &= Require(send_counter.value == 1,
+                  "first outbound tunnel datagram must use the first post-keepalive transport counter");
+  }
+
+  const auto received = video_socket.value.Receive();
+  ok &= Require(received.ok(), "tunnel datagram receive must return the queued inbound UDP payload");
+  if (received.ok()) {
+    ok &= Require(received.value.remote_address == "203.0.113.8",
+                  "tunnel datagram receive must preserve the remote IPv4 address");
+    ok &= Require(received.value.remote_port == kMoonlightVideoPort,
+                  "tunnel datagram receive must preserve the remote UDP port");
+    ok &= Require(received.value.payload == inbound_payload,
+                  "tunnel datagram receive must return the inner UDP payload bytes");
+  }
+
+  const auto empty = video_socket.value.Receive();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "tunnel datagram receive must report an empty queue after consuming the queued payload");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "local responder must validate the tunnel datagram exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "tunnel datagram app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after tunnel datagram tests");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -2217,6 +2319,7 @@ int main() {
   const bool tunnel_dns_codec_ok = TestTunnelDnsPacketCodec();
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
+  const bool tunnel_datagram_ok = TestTunnelDatagramSocket();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
@@ -2224,7 +2327,7 @@ int main() {
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && tunnel_dns_codec_ok && dns_resolution_ok &&
-          session_socket_ok)
+          session_socket_ok && tunnel_datagram_ok)
              ? 0
              : 1;
 }

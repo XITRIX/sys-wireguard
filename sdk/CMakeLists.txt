@@ -3,6 +3,7 @@ add_library(swg_sdk STATIC
   src/client.cpp
   src/session_socket.cpp
   src/switch_transport.cpp
+  src/tunnel_datagram.cpp
 )
 
 target_include_directories(swg_sdk
