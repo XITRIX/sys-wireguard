@@ -27,6 +27,7 @@ Current implementation boundaries:
 - Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
 - The manager app, not Tesla, is the current Phase A device control surface.
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
+- `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
 - The current engine scaffold now owns a small BSD socket runtime boundary and opens one connected IPv4 UDP socket per active tunnel session, without claiming any WireGuard handshake or packet-processing support yet.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.

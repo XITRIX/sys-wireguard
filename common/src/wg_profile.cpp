@@ -1,5 +1,7 @@
 #include "swg/wg_profile.h"
 
+#include "swg/wg_crypto.h"
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -285,10 +287,29 @@ Result<ValidatedWireGuardProfile> ValidateWireGuardProfileForConnect(const Profi
                                                   "profile '" + profile.name + "': " + public_key.error.message);
   }
 
+  const Result<WireGuardKey> local_public_key = DeriveWireGuardPublicKey(private_key.value);
+  if (!local_public_key.ok()) {
+    return MakeFailure<ValidatedWireGuardProfile>(local_public_key.error.code,
+                                                  "profile '" + profile.name +
+                                                      "': failed to derive local public key: " +
+                                                      local_public_key.error.message);
+  }
+
+  const Result<WireGuardKey> static_shared_secret =
+      ComputeWireGuardSharedSecret(private_key.value, public_key.value);
+  if (!static_shared_secret.ok()) {
+    return MakeFailure<ValidatedWireGuardProfile>(static_shared_secret.error.code,
+                                                  "profile '" + profile.name +
+                                                      "': peer public_key is not usable for X25519: " +
+                                                      static_shared_secret.error.message);
+  }
+
   ValidatedWireGuardProfile validated{};
   validated.name = profile.name;
   validated.private_key = private_key.value;
+  validated.local_public_key = local_public_key.value;
   validated.public_key = public_key.value;
+  validated.static_shared_secret = static_shared_secret.value;
   validated.persistent_keepalive = profile.persistent_keepalive;
 
   if (!profile.preshared_key.empty()) {

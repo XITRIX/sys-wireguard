@@ -43,7 +43,9 @@ struct PreparedTunnelSession {
   RuntimeFlags runtime_flags = 0;
   bool has_preshared_key = false;
   WireGuardKey private_key{};
+  WireGuardKey local_public_key{};
   WireGuardKey public_key{};
+  WireGuardKey static_shared_secret{};
   WireGuardKey preshared_key{};
 };
 

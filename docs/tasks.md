@@ -16,6 +16,7 @@
 - Real HOS and service reachability probes added to the compatibility report used by the manager and control API.
 - Initial Milestone 4 slice added: WireGuard profile preflight validation plus a tunnel-engine integration boundary behind `Connect()`.
 - Current Milestone 4 preflight now parses endpoint literals, CIDR networks, interface addresses, and numeric DNS servers into prepared session data.
+- WireGuard profile preflight now performs real X25519 cryptographic validation: local public-key derivation plus static peer shared-secret validation via mbedTLS PSA.
 - The tunnel-engine seam now prepares an explicit IPv4-only session plan for current Switch transport, keeps hostname endpoints resolution-pending, and records skipped IPv6-only inputs instead of pretending they are usable on-device.
 - Prepared tunnel sessions now have an IPv4 endpoint-resolution helper for future transport wiring, with host tests covering both numeric and `localhost` endpoint resolution without changing current connect behavior.
 - The engine scaffold now initializes a bounded BSD socket runtime and opens a connected IPv4 UDP socket for the resolved endpoint, giving Milestone 4 a real transport lifecycle without yet attempting a WireGuard handshake.
@@ -30,6 +31,7 @@
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Replace the stub tunnel-engine backend with real WireGuard handshake and transport integration.
+- Add BLAKE2s, HKDF/mix helpers, and handshake packet assembly on top of the new X25519 cryptographic preflight.
 - Feed packets through the connected UDP socket and add bounded TX/RX buffers for the future handshake loop.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Add real tunnel-aware DNS resolution results for app consumers.

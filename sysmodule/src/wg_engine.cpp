@@ -120,7 +120,9 @@ Result<PreparedTunnelSession> PrepareTunnelSession(std::string_view profile_name
   session.persistent_keepalive = profile.persistent_keepalive;
   session.has_preshared_key = profile.has_preshared_key;
   session.private_key = profile.private_key;
+  session.local_public_key = profile.local_public_key;
   session.public_key = profile.public_key;
+  session.static_shared_secret = profile.static_shared_secret;
   session.preshared_key = profile.preshared_key;
   session.endpoint.host = profile.endpoint.host;
   session.endpoint.port = profile.endpoint.port;

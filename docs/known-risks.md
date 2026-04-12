@@ -5,6 +5,7 @@
 - Tesla live toggling now relies on `ovl-sysmodules` using `pmshellTerminateProgram()` / `pmshellLaunchProgram()`; active clients should tolerate abrupt `swg:ctl` disconnects during manual stop/start.
 - The Switch manager is the current Phase A control UI; it is text-mode and intentionally simpler than the future Tesla UX.
 - The current Milestone 4 slice only validates WireGuard profile material and starts a stub tunnel-engine boundary; it does not perform a real handshake or UDP transport yet.
+- WireGuard preflight now validates real X25519 key material, but the Noise handshake transcript, cookie logic, rekeying, and data-packet encryption are still not implemented.
 - The current Switch tunnel session preparation is intentionally IPv4-only: hostname endpoints are left unresolved for a later resolver/UDP slice, IPv6 endpoints are rejected, and IPv6 routes or DNS entries are only tracked as skipped metadata.
 - A host-tested IPv4 endpoint resolver now exists for prepared sessions, but the live Switch connect path still does not invoke it until BSD init, timeout policy, and UDP lifecycle handling are wired into the real transport backend.
 - The live engine path now opens a connected IPv4 UDP socket, but it still has no packet loop, no keepalive scheduling, no handshake state, and no on-device validation yet for socket initialization or endpoint resolution through Horizon networking services.

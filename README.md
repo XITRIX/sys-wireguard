@@ -10,11 +10,12 @@ Current scope:
 - A Switch-side manager NRO that can query `swg:ctl`, change the active profile, toggle runtime flags, and issue connect/disconnect requests on hardware.
 - A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
+- Real X25519-based WireGuard cryptographic preflight using mbedTLS PSA, including local public-key derivation and static peer shared-secret validation.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
 - Tesla UI wiring, deferred from Phase A.
-- WireGuard protocol engine.
+- Full WireGuard Noise handshake and transport packet engine.
 - Transparent routing or MITM paths.
 
 ## Repository layout
@@ -71,9 +72,9 @@ Right now, the Switch manager can read and use an existing config, but it cannot
 The practical way to try the current connect path is to manually create `sdmc:/config/swg/config.ini` using the example in [docs/sample-config.ini](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/sample-config.ini).
 
 Current constraints:
-- `Connect()` validates WireGuard key format and endpoint fields, then starts the stub tunnel-engine boundary.
-- It does not perform a real handshake or establish live tunnel traffic yet.
-- The keys in the sample file are syntactically valid test keys, not a real peer configuration.
+- `Connect()` now validates real X25519 key material, derives the local public key, validates the peer public key by computing the static shared secret, then starts the stub tunnel-engine boundary.
+- It still does not perform a real Noise handshake or establish live tunnel traffic yet.
+- The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
 
@@ -123,6 +124,6 @@ This keeps the sysmodule consumer API aligned with Moonlight-Switch's current ar
 
 Next:
 - manager UX expansion
-- WireGuard protocol boundary, key validation, and endpoint handling
+- WireGuard handshake packet assembly and transport wiring on top of the current crypto preflight
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

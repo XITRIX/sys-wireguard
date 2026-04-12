@@ -8,6 +8,7 @@
 #include "swg/ipc_codec.h"
 #include "swg/moonlight.h"
 #include "swg/state_machine.h"
+#include "swg/wg_crypto.h"
 #include "swg/wg_profile.h"
 #include "swg_sysmodule/wg_engine.h"
 #include "swg_sysmodule/host_transport.h"
@@ -23,9 +24,55 @@ bool Require(bool condition, const std::string& message) {
   return true;
 }
 
-constexpr const char* kSamplePrivateKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-constexpr const char* kSamplePublicKey = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+constexpr const char* kSamplePrivateKey = "oP1+wj0r1k+4bqyOp9QKF77GZaPGTzlvzCm/44vR63E=";
+constexpr const char* kSamplePublicKey = "Kx666j8fvAMhWmqVQsmtmXeljBNvf0vB1SEHaUa2iAI=";
+constexpr const char* kSamplePeerPrivateKey = "mJTpfsnklx/WSF8AEbdbvB8pimF17uoRX69FYVxs2F4=";
+constexpr const char* kSampleLocalPublicKey = "qsqG0CFCWMI/D34HIRhM9ZdXpmhvrKJK/FNQ5Q1egRo=";
 constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
+bool TestWireGuardCrypto() {
+  bool ok = true;
+
+  const auto local_private = swg::ParseWireGuardKey(kSamplePrivateKey, "private_key");
+  const auto peer_private = swg::ParseWireGuardKey(kSamplePeerPrivateKey, "private_key");
+  const auto peer_public = swg::ParseWireGuardKey(kSamplePublicKey, "public_key");
+  const auto expected_local_public = swg::ParseWireGuardKey(kSampleLocalPublicKey, "local_public_key");
+
+  ok &= Require(local_private.ok(), "sample local private key must parse");
+  ok &= Require(peer_private.ok(), "sample peer private key must parse");
+  ok &= Require(peer_public.ok(), "sample peer public key must parse");
+  ok &= Require(expected_local_public.ok(), "expected local public key must parse");
+  if (!local_private.ok() || !peer_private.ok() || !peer_public.ok() || !expected_local_public.ok()) {
+    return false;
+  }
+
+  const auto derived_local_public = swg::DeriveWireGuardPublicKey(local_private.value);
+  ok &= Require(derived_local_public.ok(), "derived local public key must succeed");
+  if (derived_local_public.ok()) {
+    ok &= Require(derived_local_public.value.bytes == expected_local_public.value.bytes,
+                  "derived local public key must match the expected X25519 public key");
+  }
+
+  const auto derived_peer_public = swg::DeriveWireGuardPublicKey(peer_private.value);
+  ok &= Require(derived_peer_public.ok(), "derived peer public key must succeed");
+
+  const auto shared_a = swg::ComputeWireGuardSharedSecret(local_private.value, peer_public.value);
+  ok &= Require(shared_a.ok(), "static shared secret must derive for the sample peer public key");
+
+  if (derived_peer_public.ok()) {
+    const auto shared_b = swg::ComputeWireGuardSharedSecret(peer_private.value, expected_local_public.value);
+    ok &= Require(shared_b.ok(), "static shared secret must be symmetric across both peers");
+    if (shared_a.ok() && shared_b.ok()) {
+      ok &= Require(shared_a.value.bytes == shared_b.value.bytes,
+                    "static shared secret must match across both peers");
+    }
+  }
+
+  swg::WireGuardKey zero_public_key{};
+  const auto invalid_shared = swg::ComputeWireGuardSharedSecret(local_private.value, zero_public_key);
+  ok &= Require(!invalid_shared.ok(), "zero peer public key must be rejected for shared secret derivation");
+  return ok;
+}
 
 bool TestEndpointAndNetworkParsing() {
   bool ok = true;
@@ -86,9 +133,11 @@ swg::Config MakeValidConfig() {
 bool TestWireGuardProfileValidation() {
   const swg::Config valid_config = MakeValidConfig();
   const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+  const auto expected_local_public = swg::ParseWireGuardKey(kSampleLocalPublicKey, "local_public_key");
 
   bool ok = true;
   ok &= Require(validated.ok(), "valid WireGuard profile must pass connect validation");
+  ok &= Require(expected_local_public.ok(), "expected local public key must parse");
   if (!validated.ok()) {
     return false;
   }
@@ -100,6 +149,12 @@ bool TestWireGuardProfileValidation() {
   ok &= Require(validated.value.allowed_ips.size() == 2, "validated profile must parse allowed ip networks");
   ok &= Require(validated.value.addresses.size() == 1, "validated profile must parse interface addresses");
   ok &= Require(validated.value.dns_servers.size() == 2, "validated profile must parse dns servers");
+  if (expected_local_public.ok()) {
+    ok &= Require(validated.value.local_public_key.bytes == expected_local_public.value.bytes,
+                  "validated profile must derive the local X25519 public key");
+  }
+  ok &= Require(validated.value.static_shared_secret.bytes != swg::WireGuardKey{}.bytes,
+                "validated profile must compute a non-zero static shared secret");
   ok &= Require(validated.value.persistent_keepalive == 25,
                 "validated profile must preserve keepalive interval");
 
@@ -138,6 +193,10 @@ bool TestTunnelSessionPreparation() {
                 "only IPv4 allowed_ips entries should be kept for the current transport");
   ok &= Require(prepared.value.ignored_ipv6_allowed_ips == 1,
                 "IPv6 allowed_ips entries should be recorded as ignored for the current transport");
+  ok &= Require(prepared.value.local_public_key.bytes != swg::WireGuardKey{}.bytes,
+                "prepared session must carry the derived local public key");
+  ok &= Require(prepared.value.static_shared_secret.bytes != swg::WireGuardKey{}.bytes,
+                "prepared session must carry the static peer shared secret");
   ok &= Require(prepared.value.interface_ipv4_addresses.size() == 1,
                 "IPv4 interface addresses should be retained for the current transport");
   ok &= Require(prepared.value.dns_servers.size() == 2,
@@ -476,6 +535,7 @@ bool TestMoonlightRoutePlanning() {
 int main() {
   const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
+  const bool wg_crypto_ok = TestWireGuardCrypto();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
   const bool tunnel_session_ok = TestTunnelSessionPreparation();
   const bool endpoint_resolution_ok = TestTunnelEndpointResolution();
@@ -486,9 +546,9 @@ int main() {
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
-        return (endpoint_parser_ok && config_ok && wg_validation_ok && tunnel_session_ok && endpoint_resolution_ok &&
-          udp_scaffold_ok && state_ok && client_ok && connect_preflight_ok && invalid_connect_ok && codec_ok &&
-          moonlight_ok)
+        return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_validation_ok && tunnel_session_ok &&
+          endpoint_resolution_ok && udp_scaffold_ok && state_ok && client_ok && connect_preflight_ok &&
+          invalid_connect_ok && codec_ok && moonlight_ok)
              ? 0
              : 1;
 }

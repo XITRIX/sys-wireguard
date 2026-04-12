@@ -9,8 +9,8 @@
 
 namespace {
 
-constexpr const char* kSamplePrivateKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-constexpr const char* kSamplePublicKey = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+constexpr const char* kSamplePrivateKey = "oP1+wj0r1k+4bqyOp9QKF77GZaPGTzlvzCm/44vR63E=";
+constexpr const char* kSamplePublicKey = "Kx666j8fvAMhWmqVQsmtmXeljBNvf0vB1SEHaUa2iAI=";
 constexpr const char* kSamplePresharedKey = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 
 void PrintUsage() {
