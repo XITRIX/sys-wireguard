@@ -433,7 +433,6 @@ class LocalControlService final : public IControlService {
     const bool local_bypass = session.request.allow_local_network_bypass &&
                               (request.local_network_hint || request.traffic_class == AppTrafficClass::Discovery ||
                                request.traffic_class == AppTrafficClass::WakeOnLan ||
-                               request.traffic_class == AppTrafficClass::ExternalAddressProbe ||
                                LooksLocalHost(request.remote_host));
 
     if (explicit_bypass || local_bypass) {

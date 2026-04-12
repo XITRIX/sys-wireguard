@@ -31,6 +31,7 @@ add_subdirectory(sdk)
 add_subdirectory(sysmodule)
 add_subdirectory(overlay)
 add_subdirectory(manager)
+add_subdirectory(integration)
 
 if(SWG_BUILD_TESTS AND BUILD_TESTING)
   add_subdirectory(tests)

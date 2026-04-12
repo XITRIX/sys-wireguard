@@ -33,7 +33,9 @@
 | Switch shared-code build | Verified | `cmake --build --preset switch-debug` succeeds for the current libraries, sysmodule package, and manager NRO |
 | Sysmodule boot | Verified | Current boot2 package reaches the main loop and emits logs on hardware |
 | Switch manager build | Verified | `build/switch-debug/manager/swg_manager.nro` and staged `build/switch-debug/manager/switch/swg_manager.nro` are generated |
+| Switch integration app build | Verified | `build/switch-debug/integration/swg_integration_test.nro` and staged `build/switch-debug/integration/switch/swg_integration_test.nro` are generated |
 | Switch manager control flow | Verified | Manager now queries `swg:ctl` successfully on hardware and surfaces compatibility diagnostics |
+| Switch integration app smoke flow | Not started | Use the separate integration NRO to validate app-session open/close, route-planning checks, and diagnostic packet API behavior against a real VPN peer |
 | Milestone 3 manager frontend | Verified | Current manager implementation is sufficient to close the manager-first frontend milestone |
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |

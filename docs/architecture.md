@@ -10,6 +10,7 @@ Current implementation boundaries:
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
 - `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning, send/receive packet calls, and future per-app tunnel control.
+- `swg_integration_switch`: a dedicated Switch-side integration harness that exercises the app-facing SDK path separately from the manager UI.
 - `swg_overlay_stub`: a host-side stand-in for the future Tesla overlay.
 - `swg_manager_stub`: a host-side config-management CLI.
 - `swg_manager_switch`: a Switch homebrew NRO that talks to `swg:ctl` over the same SDK transport as future device-side frontends.
@@ -27,6 +28,7 @@ Current implementation boundaries:
 - Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
 - Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
 - The manager app, not Tesla, is the current Phase A device control surface.
+- The new Switch integration app is the current device-side SDK validation surface; it is intentionally separate from the manager so operator controls and app-consumer scenarios do not collapse into one UI.
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.

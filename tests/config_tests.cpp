@@ -1831,6 +1831,13 @@ bool TestMoonlightRoutePlanning() {
   const auto wake = session.PlanNetwork(swg::MakeMoonlightWakeOnLanPlan("192.168.1.20"));
   ok &= Require(wake.ok(), "wake-on-lan plan must succeed");
   ok &= Require(wake.value.action == swg::RouteAction::Direct, "wake-on-lan must bypass the tunnel");
+  ok &= Require(wake.value.local_bypass, "wake-on-lan must be marked as local bypass");
+
+  const auto stun = session.PlanNetwork(swg::MakeMoonlightStunPlan());
+  ok &= Require(stun.ok(), "stun plan must succeed");
+  ok &= Require(stun.value.action == swg::RouteAction::Direct, "stun must bypass the tunnel");
+  ok &= Require(!stun.value.local_bypass,
+                "stun bypass must remain explicit and must not be mislabeled as local bypass");
 
   const auto control_before_connect = session.PlanNetwork(swg::MakeMoonlightHttpsControlPlan("vpn.example.test", 47984));
   ok &= Require(control_before_connect.ok(), "control plan must succeed before connect");

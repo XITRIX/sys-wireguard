@@ -150,10 +150,13 @@ Implemented:
 - session-scoped send/receive of authenticated transport payload packets through `swg:ctl`
 - repeated app-session authenticated packet traffic validated on the host regression path
 - bounded reconnect with backoff on outbound sends plus receive-side and periodic-keepalive transport failures
+- a separate Switch integration app for on-device SDK and app-session validation without overloading the manager UI
 
 ## App integration
 
 The SDK now exposes a generic `swg::AppSession` wrapper, a route-planning surface, and send/receive packet calls for app consumers that still use their own sockets and HTTP stack.
+
+For on-device validation, the Switch build now also stages `build/switch-debug/integration/switch/swg_integration_test.nro` as a separate integration harness. It exercises the live `swg::Client` and `swg::AppSession` path on hardware, runs Moonlight-style route-planning smoke checks against the active runtime state, and exposes raw send/receive packet probes as diagnostic controls.
 
 Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 - open an app session with `MakeMoonlightSessionRequest()`
@@ -164,6 +167,8 @@ Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 This keeps the sysmodule consumer API aligned with Moonlight-Switch's current architecture, where libcurl and direct sockets remain in the app while the sysmodule decides whether traffic should use the tunnel, bypass it, or fail closed.
 
 When tunnel traffic is routed through the sysmodule, the same session can now send authenticated payloads and drain validated inbound payload packets through `swg::AppSession::SendPacket()` and `swg::AppSession::ReceivePacket()`.
+
+The raw packet controls in the Switch integration app are diagnostic only for now. They exercise the current control-plane packet API on real hardware, but they do not replace the later socket-like or DNS-aware SDK layers.
 
 Next:
 - manager UX expansion
