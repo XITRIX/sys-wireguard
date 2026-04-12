@@ -28,4 +28,4 @@
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |
 | Overlay queries status | Deferred | Tesla overlay is intentionally outside the current Phase A scope |
-| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, and only then reports `Connected`; real hardware peer-response validation is the next on-device check |
+| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, sends one authenticated keepalive, and only then reports `Connected`; broader sustained transport traffic is the next on-device check |

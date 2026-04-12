@@ -243,6 +243,45 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       return last_timeout_error;
     }
 
+    const PreparedTunnelEndpoint authenticated_endpoint =
+        resolved_response_endpoint_.state == PreparedEndpointState::Ready ? resolved_response_endpoint_
+                                                                          : resolved_session.value.endpoint;
+    const Result<WireGuardTransportKeepalive> keepalive =
+        CreateTransportKeepalivePacket(validated.value.sending_key, validated.value.peer_sender_index,
+                                       next_send_counter_);
+    if (!keepalive.ok()) {
+      socket_runtime_.CloseSocket(socket_result.value);
+      socket_runtime_.Stop();
+      return MakeError(keepalive.error.code,
+                       "failed to build post-handshake keepalive packet: " + keepalive.error.message);
+    }
+
+    LogInfo("wg_engine", "sending post-handshake keepalive: receiver_index=" +
+                              std::to_string(validated.value.peer_sender_index) +
+                              ", counter=" + std::to_string(next_send_counter_) +
+                              ", endpoint=" + DescribeResolvedEndpoint(authenticated_endpoint));
+
+    const Result<std::size_t> keepalive_bytes_sent =
+        socket_runtime_.SendTo(socket_result.value, authenticated_endpoint,
+                               keepalive.value.packet.data(), keepalive.value.packet.size());
+    if (!keepalive_bytes_sent.ok()) {
+      socket_runtime_.CloseSocket(socket_result.value);
+      socket_runtime_.Stop();
+      return MakeError(keepalive_bytes_sent.error.code,
+                       "failed to send post-handshake keepalive packet: " + keepalive_bytes_sent.error.message);
+    }
+    if (keepalive_bytes_sent.value != keepalive.value.packet.size()) {
+      socket_runtime_.CloseSocket(socket_result.value);
+      socket_runtime_.Stop();
+      return MakeError(ErrorCode::IoError,
+                       "post-handshake keepalive send returned a short datagram for endpoint " +
+                           DescribeResolvedEndpoint(authenticated_endpoint));
+    }
+
+    total_bytes_sent += keepalive_bytes_sent.value;
+    ++total_packets_sent;
+    ++next_send_counter_;
+
     udp_socket_ = socket_result.value;
     active_profile_ = resolved_session.value.profile_name;
     prepared_session_ = resolved_session.value;
@@ -285,6 +324,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     peer_sender_index_ = 0;
     sending_key_ = {};
     receiving_key_ = {};
+    next_send_counter_ = 0;
     last_handshake_at_ = {};
     return Error::None();
   }
@@ -314,6 +354,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   std::uint32_t peer_sender_index_ = 0;
   WireGuardKey sending_key_{};
   WireGuardKey receiving_key_{};
+  std::uint64_t next_send_counter_ = 0;
   std::chrono::steady_clock::time_point last_handshake_at_{};
   bool running_ = false;
 };

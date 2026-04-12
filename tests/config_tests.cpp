@@ -168,7 +168,7 @@ class LocalHandshakeResponder {
     if (worker_.joinable()) {
       worker_.join();
     }
-    return error_.empty() && responded_;
+    return error_.empty() && responded_ && keepalive_validated_;
   }
 
   const std::string& error() const {
@@ -212,12 +212,36 @@ class LocalHandshakeResponder {
     }
 
     responded_ = true;
+
+    client_length = sizeof(client_address);
+    const ssize_t keepalive_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                                  reinterpret_cast<sockaddr*>(&client_address), &client_length);
+    if (keepalive_received < 0) {
+      error_ = DescribeSocketError("recvfrom");
+      return;
+    }
+
+    const auto keepalive = swg::ConsumeTransportKeepaliveForTest(
+        response.value.receiving_key, response.value.sender_index, buffer.data(),
+        static_cast<std::size_t>(keepalive_received));
+    if (!keepalive.ok()) {
+      error_ = keepalive.error.message;
+      return;
+    }
+
+    if (keepalive.value != 0) {
+      error_ = "post-handshake keepalive used an unexpected transport counter";
+      return;
+    }
+
+    keepalive_validated_ = true;
   }
 
   int socket_fd_ = -1;
   std::uint16_t port_ = 0;
   std::thread worker_{};
   bool responded_ = false;
+  bool keepalive_validated_ = false;
   std::string error_{};
 };
 
@@ -304,6 +328,19 @@ bool TestWireGuardHandshakeRoundTrip() {
                 "initiator sending key must match responder receiving key");
   ok &= Require(validated.value.receiving_key.bytes == response.value.sending_key.bytes,
                 "initiator receiving key must match responder sending key");
+
+  const auto keepalive =
+      swg::CreateTransportKeepalivePacket(validated.value.sending_key, validated.value.peer_sender_index, 0);
+  ok &= Require(keepalive.ok(), "initiator must build a post-handshake keepalive packet");
+  if (keepalive.ok()) {
+    const auto consumed = swg::ConsumeTransportKeepaliveForTest(
+        response.value.receiving_key, response.value.sender_index, keepalive.value.packet.data(),
+        keepalive.value.packet.size());
+    ok &= Require(consumed.ok(), "responder must validate the initiator post-handshake keepalive");
+    if (consumed.ok()) {
+      ok &= Require(consumed.value == 0, "first post-handshake keepalive must use transport counter zero");
+    }
+  }
   return ok;
 }
 
@@ -562,10 +599,13 @@ bool TestTunnelEngineHandshake() {
     const swg::TunnelStats stats = engine->GetStats();
     ok &= Require(stats.successful_handshakes == 1,
                   "engine handshake must record one successful handshake");
-    ok &= Require(stats.bytes_out == swg::kWireGuardHandshakeInitiationSize,
-                  "engine handshake must send one initiation packet");
+    ok &= Require(stats.bytes_out ==
+                      swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                  "engine handshake must send the initiation plus one keepalive packet");
     ok &= Require(stats.bytes_in == swg::kWireGuardHandshakeResponseSize,
                   "engine handshake must receive one response packet");
+    ok &= Require(stats.packets_out == 2,
+                  "engine handshake must send one initiation packet and one keepalive packet");
   }
   ok &= Require(engine->Stop().ok(), "engine stop must close the handshake socket cleanly");
   ok &= Require(!engine->IsRunning(), "engine must report stopped after shutdown");
@@ -667,6 +707,11 @@ bool TestConnectHandshakeStats() {
   ok &= Require(stats.value.connect_attempts == 1, "connect must increment connect_attempts");
   ok &= Require(stats.value.successful_handshakes == 1,
                 "connect must record a successful WireGuard handshake after response validation");
+  ok &= Require(stats.value.bytes_out ==
+                    swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                "connect must send the initiation plus one keepalive packet");
+  ok &= Require(stats.value.packets_out == 2,
+                "connect must record the post-handshake keepalive packet");
   ok &= Require(status.value.state == swg::TunnelState::Connected,
                 "validated handshake should move the control service into connected state");
   return ok;

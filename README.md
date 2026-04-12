@@ -11,12 +11,12 @@ Current scope:
 - A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
 - Real X25519-based WireGuard cryptographic preflight using mbedTLS PSA, including local public-key derivation and static peer shared-secret validation.
-- A real one-shot WireGuard handshake path that builds an initiation packet, sends it over the connected UDP socket, validates the response, and only then reports `Connected`.
+- A real WireGuard handshake path that builds an initiation packet, exchanges the handshake response over UDP, sends one authenticated post-handshake keepalive, and only then reports `Connected`.
 - An app-facing session and route-planning API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
 - Tesla UI wiring, deferred from Phase A.
-- WireGuard cookie replies, retries/rekeys, and transport data packets.
+- WireGuard cookie replies, retries/rekeys, and a persistent transport packet loop.
 - Transparent routing or MITM paths.
 
 ## Repository layout
@@ -99,8 +99,8 @@ Right now, the Switch manager can read and use an existing config, but it cannot
 The practical way to try the current connect path is to manually create `sdmc:/config/swg/config.ini` using the example in [docs/sample-config.ini](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/sample-config.ini).
 
 Current constraints:
-- `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet, waits for a response, and validates that response before the service enters `Connected`.
-- It still does not implement cookie replies, retransmits, rekeying, or transport data packets yet.
+- `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet, validates the response, and then sends one authenticated keepalive before the service enters `Connected`.
+- It still does not implement cookie replies, retransmits, rekeying, or a persistent transport packet loop yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
@@ -154,6 +154,6 @@ This keeps the sysmodule consumer API aligned with Moonlight-Switch's current ar
 
 Next:
 - manager UX expansion
-- WireGuard cookie reply handling, retries/rekeys, and first data-packet / keepalive support on top of the new handshake path
+- WireGuard cookie reply handling, retries/rekeys, and a persistent transport packet loop on top of the new handshake plus keepalive path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

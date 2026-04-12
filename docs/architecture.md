@@ -30,7 +30,7 @@ Current implementation boundaries:
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
-- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a one-shot WireGuard initiation packet, and validates the handshake response before exposing `Connected`.
+- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends one authenticated post-handshake keepalive, and then exposes `Connected`.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
 
 ## Runtime paths

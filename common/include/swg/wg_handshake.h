@@ -13,6 +13,8 @@ namespace swg {
 inline constexpr std::size_t kWireGuardHandshakeInitiationSize = 148;
 inline constexpr std::size_t kWireGuardHandshakeResponseSize = 92;
 inline constexpr std::size_t kWireGuardCookieReplySize = 64;
+inline constexpr std::size_t kWireGuardTransportHeaderSize = 16;
+inline constexpr std::size_t kWireGuardTransportKeepaliveSize = 32;
 
 enum class WireGuardMessageType : std::uint8_t {
   HandshakeInitiation = 1,
@@ -76,6 +78,12 @@ struct WireGuardValidatedHandshake {
   WireGuardKey receiving_key{};
 };
 
+struct WireGuardTransportKeepalive {
+  std::array<std::uint8_t, kWireGuardTransportKeepaliveSize> packet{};
+  std::uint32_t receiver_index = 0;
+  std::uint64_t counter = 0;
+};
+
 Result<WireGuardHandshakeInitiation> CreateHandshakeInitiation(
     const WireGuardHandshakeConfig& config,
     const WireGuardHandshakeInitiationOptions& options = {});
@@ -88,5 +96,12 @@ Result<WireGuardValidatedHandshake> ConsumeHandshakeResponse(const WireGuardHand
                                                              const WireGuardInitiationState& state,
                                                              const std::uint8_t* packet,
                                                              std::size_t packet_size);
+Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGuardKey& sending_key,
+                                                                   std::uint32_t receiver_index,
+                                                                   std::uint64_t counter = 0);
+Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,
+                                                       std::uint32_t expected_receiver_index,
+                                                       const std::uint8_t* packet,
+                                                       std::size_t packet_size);
 
 }  // namespace swg

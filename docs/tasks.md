@@ -19,7 +19,7 @@
 - WireGuard profile preflight now performs real X25519 cryptographic validation: local public-key derivation plus static peer shared-secret validation via mbedTLS PSA.
 - The tunnel-engine seam now prepares an explicit IPv4-only session plan for current Switch transport, keeps hostname endpoints resolution-pending, and records skipped IPv6-only inputs instead of pretending they are usable on-device.
 - Prepared tunnel sessions now have an IPv4 endpoint-resolution helper for future transport wiring, with host tests covering both numeric and `localhost` endpoint resolution without changing current connect behavior.
-- The engine now initializes a bounded BSD socket runtime, opens a connected IPv4 UDP socket, sends a real WireGuard initiation packet, validates the handshake response, and only then reports `Connected`.
+- The engine now initializes a bounded BSD socket runtime, sends a real WireGuard initiation packet over UDP, validates the handshake response, sends one authenticated post-handshake keepalive, and only then reports `Connected`.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -32,7 +32,6 @@
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Add WireGuard cookie reply handling and a bounded retry policy on top of the current one-shot handshake path.
-- Add post-handshake keepalive / first data-packet support so the responder gets explicit key confirmation.
 - Add a persistent packet loop and bounded TX/RX buffers for transport traffic after the initial handshake.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Add real tunnel-aware DNS resolution results for app consumers.

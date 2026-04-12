@@ -29,9 +29,9 @@ The logger currently flushes every line. On Switch builds it now closes the file
 
 ## Current connect semantics
 
-At the current Milestone 4 slice, `Connected` means the sysmodule validated the active profile, completed X25519 cryptographic preflight, resolved the IPv4 endpoint if needed, started BSD successfully, sent a real WireGuard initiation packet, and validated the responder's handshake response.
+At the current Milestone 4 slice, `Connected` means the sysmodule validated the active profile, completed X25519 cryptographic preflight, resolved the IPv4 endpoint if needed, started BSD successfully, sent a real WireGuard initiation packet, validated the responder's handshake response, and sent one authenticated post-handshake keepalive packet.
 
-It still does not mean the full transport path is implemented. Cookie replies, retry logic, rekeys, and transport data packets are not wired yet, so a server that requires cookie handling or a post-handshake keepalive/data confirmation can still fail even though the initial initiation/response exchange now works.
+It still does not mean the full transport path is implemented. Cookie replies, retry logic, rekeys, and a persistent transport packet loop are not wired yet, so a server that requires cookie handling or sustained data traffic can still fail even though the initial initiation/response exchange now works and one keepalive is sent.
 
 An offline VPN server, a wrong endpoint, or a peer that never replies should now leave `Connect()` in `Error` instead of reporting `Connected`.
 

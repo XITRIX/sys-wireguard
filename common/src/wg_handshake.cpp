@@ -42,6 +42,10 @@ constexpr std::size_t kResponseEphemeralOffset = 12;
 constexpr std::size_t kResponseEncryptedNothingOffset = 44;
 constexpr std::size_t kResponseEncryptedNothingSize = kAeadTagSize;
 constexpr std::size_t kResponseMac1Offset = kResponseEncryptedNothingOffset + kResponseEncryptedNothingSize;
+constexpr std::size_t kTransportReceiverIndexOffset = 4;
+constexpr std::size_t kTransportCounterOffset = 8;
+constexpr std::size_t kTransportEncryptedPayloadOffset = kWireGuardTransportHeaderSize;
+constexpr std::size_t kTransportEncryptedPayloadSize = kWireGuardTransportKeepaliveSize - kWireGuardTransportHeaderSize;
 constexpr std::uint64_t kTai64Base = 0x400000000000000aULL;
 constexpr char kWireGuardConstruction[] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 constexpr char kWireGuardIdentifier[] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -123,6 +127,20 @@ void Store32Be(std::uint8_t* output, std::uint32_t value) {
   output[1] = static_cast<std::uint8_t>((value >> 16) & 0xFFu);
   output[2] = static_cast<std::uint8_t>((value >> 8) & 0xFFu);
   output[3] = static_cast<std::uint8_t>(value & 0xFFu);
+}
+
+std::uint64_t Load64Le(const std::uint8_t* input) {
+  std::uint64_t value = 0;
+  for (std::size_t index = 0; index < 8; ++index) {
+    value |= static_cast<std::uint64_t>(input[index]) << (index * 8);
+  }
+  return value;
+}
+
+void Store64Le(std::uint8_t* output, std::uint64_t value) {
+  for (std::size_t index = 0; index < 8; ++index) {
+    output[index] = static_cast<std::uint8_t>((value >> (index * 8)) & 0xFFu);
+  }
 }
 
 void Store64Be(std::uint8_t* output, std::uint64_t value) {
@@ -362,16 +380,17 @@ Result<std::array<std::uint8_t, PlaintextSize + kAeadTagSize>> EncryptAead(
     const WireGuardKey& key,
     std::uint64_t counter,
     const std::array<std::uint8_t, PlaintextSize>& plaintext,
-    const Blake2sHash& aad) {
+    const ByteSlice aad) {
   std::array<std::uint8_t, PlaintextSize + kAeadTagSize> encrypted{};
   const std::array<std::uint8_t, 12> nonce = MakeAeadNonce(counter);
+  const std::uint8_t* aad_data = aad.size == 0 ? nullptr : aad.data;
 
   mbedtls_chachapoly_context context;
   mbedtls_chachapoly_init(&context);
 
   int rc = mbedtls_chachapoly_setkey(&context, key.bytes.data());
   if (rc == 0) {
-    rc = mbedtls_chachapoly_encrypt_and_tag(&context, plaintext.size(), nonce.data(), aad.data(), aad.size(),
+    rc = mbedtls_chachapoly_encrypt_and_tag(&context, plaintext.size(), nonce.data(), aad_data, aad.size,
                                             plaintext.data(), encrypted.data(),
                                             encrypted.data() + static_cast<std::ptrdiff_t>(plaintext.size()));
   }
@@ -386,12 +405,21 @@ Result<std::array<std::uint8_t, PlaintextSize + kAeadTagSize>> EncryptAead(
 }
 
 template <std::size_t PlaintextSize>
+Result<std::array<std::uint8_t, PlaintextSize + kAeadTagSize>> EncryptAead(
+    const WireGuardKey& key,
+    std::uint64_t counter,
+    const std::array<std::uint8_t, PlaintextSize>& plaintext,
+    const Blake2sHash& aad) {
+  return EncryptAead<PlaintextSize>(key, counter, plaintext, MakeSlice(aad));
+}
+
+template <std::size_t PlaintextSize>
 Result<std::array<std::uint8_t, PlaintextSize>> DecryptAead(
     const WireGuardKey& key,
     std::uint64_t counter,
     const std::uint8_t* ciphertext,
     std::size_t ciphertext_size,
-    const Blake2sHash& aad,
+    const ByteSlice aad,
     std::string_view field_name) {
   if (ciphertext_size != PlaintextSize + kAeadTagSize) {
     return MakeFailure<std::array<std::uint8_t, PlaintextSize>>(ErrorCode::ParseError,
@@ -401,13 +429,14 @@ Result<std::array<std::uint8_t, PlaintextSize>> DecryptAead(
 
   std::array<std::uint8_t, PlaintextSize> plaintext{};
   const std::array<std::uint8_t, 12> nonce = MakeAeadNonce(counter);
+  const std::uint8_t* aad_data = aad.size == 0 ? nullptr : aad.data;
 
   mbedtls_chachapoly_context context;
   mbedtls_chachapoly_init(&context);
 
   int rc = mbedtls_chachapoly_setkey(&context, key.bytes.data());
   if (rc == 0) {
-    rc = mbedtls_chachapoly_auth_decrypt(&context, PlaintextSize, nonce.data(), aad.data(), aad.size(),
+    rc = mbedtls_chachapoly_auth_decrypt(&context, PlaintextSize, nonce.data(), aad_data, aad.size,
                                          ciphertext + static_cast<std::ptrdiff_t>(PlaintextSize), ciphertext,
                                          plaintext.data());
   }
@@ -420,6 +449,17 @@ Result<std::array<std::uint8_t, PlaintextSize>> DecryptAead(
   }
 
   return MakeSuccess(plaintext);
+}
+
+template <std::size_t PlaintextSize>
+Result<std::array<std::uint8_t, PlaintextSize>> DecryptAead(
+    const WireGuardKey& key,
+    std::uint64_t counter,
+    const std::uint8_t* ciphertext,
+    std::size_t ciphertext_size,
+    const Blake2sHash& aad,
+    std::string_view field_name) {
+  return DecryptAead<PlaintextSize>(key, counter, ciphertext, ciphertext_size, MakeSlice(aad), field_name);
 }
 
 Blake2sHash ComputeInitialChainKey() {
@@ -886,6 +926,64 @@ Result<WireGuardValidatedHandshake> ConsumeHandshakeResponse(const WireGuardHand
   handshake.sending_key = sending_key;
   handshake.receiving_key = receiving_key;
   return MakeSuccess(handshake);
+}
+
+Result<WireGuardTransportKeepalive> CreateTransportKeepalivePacket(const WireGuardKey& sending_key,
+                                                                   std::uint32_t receiver_index,
+                                                                   std::uint64_t counter) {
+  WireGuardTransportKeepalive keepalive{};
+  keepalive.receiver_index = receiver_index;
+  keepalive.counter = counter;
+  keepalive.packet[0] = static_cast<std::uint8_t>(WireGuardMessageType::Data);
+  Store32Le(keepalive.packet.data() + kTransportReceiverIndexOffset, receiver_index);
+  Store64Le(keepalive.packet.data() + kTransportCounterOffset, counter);
+
+  const std::array<std::uint8_t, 0> empty_plaintext{};
+  const auto encrypted_empty = EncryptAead<0>(sending_key, counter, empty_plaintext, MakeSlice(nullptr, 0));
+  if (!encrypted_empty.ok()) {
+    return MakeFailure<WireGuardTransportKeepalive>(encrypted_empty.error.code, encrypted_empty.error.message);
+  }
+
+  std::copy(encrypted_empty.value.begin(), encrypted_empty.value.end(),
+            keepalive.packet.begin() + static_cast<std::ptrdiff_t>(kTransportEncryptedPayloadOffset));
+  return MakeSuccess(keepalive);
+}
+
+Result<std::uint64_t> ConsumeTransportKeepaliveForTest(const WireGuardKey& receiving_key,
+                                                       std::uint32_t expected_receiver_index,
+                                                       const std::uint8_t* packet,
+                                                       std::size_t packet_size) {
+  if (packet_size != kWireGuardTransportKeepaliveSize) {
+    return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
+                                      "WireGuard transport keepalive has an unexpected size");
+  }
+  if (packet[0] != static_cast<std::uint8_t>(WireGuardMessageType::Data)) {
+    return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
+                                      "WireGuard transport keepalive uses an unexpected message type");
+  }
+
+  const Error reserved_error = ValidateReservedZero(packet, packet_size);
+  if (reserved_error) {
+    return Result<std::uint64_t>::Failure(reserved_error);
+  }
+
+  const std::uint32_t receiver_index = Load32Le(packet + kTransportReceiverIndexOffset);
+  if (receiver_index != expected_receiver_index) {
+    return MakeFailure<std::uint64_t>(ErrorCode::ParseError,
+                                      "WireGuard transport keepalive receiver index did not match the expected peer index");
+  }
+
+  const std::uint64_t counter = Load64Le(packet + kTransportCounterOffset);
+  const auto decrypted = DecryptAead<0>(receiving_key, counter,
+                                        packet + kTransportEncryptedPayloadOffset,
+                                        kTransportEncryptedPayloadSize,
+                                        MakeSlice(nullptr, 0),
+                                        "transport_keepalive");
+  if (!decrypted.ok()) {
+    return MakeFailure<std::uint64_t>(decrypted.error.code, decrypted.error.message);
+  }
+
+  return MakeSuccess(counter);
 }
 
 }  // namespace swg
