@@ -69,6 +69,7 @@ class IWgTunnelEngine {
 
   virtual Error Start(const TunnelEngineStartRequest& request) = 0;
   virtual Error Stop() = 0;
+  virtual Error RecoverTransport(std::string_view reason) = 0;
   [[nodiscard]] virtual Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) = 0;
   [[nodiscard]] virtual Result<WireGuardConsumedTransportPacket> ReceivePacket() = 0;
   [[nodiscard]] virtual TunnelStats GetStats() const = 0;

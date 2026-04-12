@@ -2,8 +2,10 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -385,6 +387,227 @@ class LocalHandshakeResponder {
   std::string error_{};
 };
 
+class DelayedTunnelStreamSynAckResponder {
+ public:
+  DelayedTunnelStreamSynAckResponder(std::vector<std::uint8_t> expected_syn_payload,
+                                     std::vector<std::uint8_t> inbound_synack_payload,
+                                     std::vector<std::uint8_t> expected_ack_payload,
+                                     std::chrono::milliseconds synack_delay)
+      : expected_syn_payload_(std::move(expected_syn_payload)),
+        inbound_synack_payload_(std::move(inbound_synack_payload)),
+        expected_ack_payload_(std::move(expected_ack_payload)),
+        synack_delay_(synack_delay) {
+    socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd_ < 0) {
+      error_ = DescribeSocketError("socket");
+      return;
+    }
+
+    timeval timeout{};
+    timeout.tv_sec = 4;
+    timeout.tv_usec = 0;
+    if (::setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+      error_ = DescribeSocketError("setsockopt");
+      return;
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(socket_fd_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+      error_ = DescribeSocketError("bind");
+      return;
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(socket_fd_, reinterpret_cast<sockaddr*>(&address), &address_length) != 0) {
+      error_ = DescribeSocketError("getsockname");
+      return;
+    }
+
+    port_ = ntohs(address.sin_port);
+    worker_ = std::thread([this]() {
+      Run();
+    });
+  }
+
+  DelayedTunnelStreamSynAckResponder(const DelayedTunnelStreamSynAckResponder&) = delete;
+  DelayedTunnelStreamSynAckResponder& operator=(const DelayedTunnelStreamSynAckResponder&) = delete;
+
+  ~DelayedTunnelStreamSynAckResponder() {
+    Join();
+    if (socket_fd_ >= 0) {
+      ::close(socket_fd_);
+    }
+  }
+
+  bool ready() const {
+    return error_.empty() && socket_fd_ >= 0 && port_ != 0;
+  }
+
+  std::uint16_t port() const {
+    return port_;
+  }
+
+  bool Join() {
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    return error_.empty() && responded_ && keepalive_validated_ && saw_syn_ && saw_ack_;
+  }
+
+  const std::string& error() const {
+    return error_;
+  }
+
+ private:
+  void Run() {
+    const auto responder_config = MakeHandshakeResponderConfig();
+    if (!responder_config.ok()) {
+      error_ = responder_config.error.message;
+      return;
+    }
+
+    std::array<std::uint8_t, 256> buffer{};
+    sockaddr_in client_address{};
+    socklen_t client_length = sizeof(client_address);
+    const ssize_t received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                        reinterpret_cast<sockaddr*>(&client_address), &client_length);
+    if (received < 0) {
+      error_ = DescribeSocketError("recvfrom");
+      return;
+    }
+
+    const auto response = swg::RespondToHandshakeInitiationForTest(
+        responder_config.value, buffer.data(), static_cast<std::size_t>(received));
+    if (!response.ok()) {
+      error_ = response.error.message;
+      return;
+    }
+
+    const ssize_t sent = ::sendto(socket_fd_, response.value.packet.data(), response.value.packet.size(), 0,
+                                  reinterpret_cast<const sockaddr*>(&client_address), client_length);
+    if (sent < 0) {
+      error_ = DescribeSocketError("sendto");
+      return;
+    }
+    if (static_cast<std::size_t>(sent) != response.value.packet.size()) {
+      error_ = "sendto returned a short WireGuard response";
+      return;
+    }
+
+    responded_ = true;
+
+    client_length = sizeof(client_address);
+    const ssize_t keepalive_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                                  reinterpret_cast<sockaddr*>(&client_address), &client_length);
+    if (keepalive_received < 0) {
+      error_ = DescribeSocketError("recvfrom");
+      return;
+    }
+
+    const auto keepalive = swg::ConsumeTransportKeepaliveForTest(
+        response.value.receiving_key, response.value.sender_index, buffer.data(),
+        static_cast<std::size_t>(keepalive_received));
+    if (!keepalive.ok()) {
+      error_ = keepalive.error.message;
+      return;
+    }
+
+    if (keepalive.value != 0) {
+      error_ = "post-handshake keepalive used an unexpected transport counter";
+      return;
+    }
+
+    keepalive_validated_ = true;
+
+    client_length = sizeof(client_address);
+    const ssize_t syn_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                            reinterpret_cast<sockaddr*>(&client_address), &client_length);
+    if (syn_received < 0) {
+      error_ = DescribeSocketError("recvfrom");
+      return;
+    }
+
+    const auto outbound_syn = swg::ConsumeTransportPacket(
+        response.value.receiving_key, response.value.sender_index, buffer.data(),
+        static_cast<std::size_t>(syn_received));
+    if (!outbound_syn.ok()) {
+      error_ = outbound_syn.error.message;
+      return;
+    }
+    if (outbound_syn.value.payload != expected_syn_payload_) {
+      error_ = "first outbound tunnel stream packet was not the expected SYN";
+      return;
+    }
+
+    saw_syn_ = true;
+    std::this_thread::sleep_for(synack_delay_);
+
+    const auto inbound_synack = swg::CreateTransportPacket(
+        response.value.sending_key, response.value.receiver_index, inbound_synack_payload_, 0);
+    if (!inbound_synack.ok()) {
+      error_ = inbound_synack.error.message;
+      return;
+    }
+
+    const ssize_t synack_sent = ::sendto(socket_fd_, inbound_synack.value.packet.data(), inbound_synack.value.packet.size(),
+                                         0, reinterpret_cast<const sockaddr*>(&client_address), client_length);
+    if (synack_sent < 0) {
+      error_ = DescribeSocketError("sendto");
+      return;
+    }
+    if (static_cast<std::size_t>(synack_sent) != inbound_synack.value.packet.size()) {
+      error_ = "sendto returned a short authenticated SYN-ACK payload";
+      return;
+    }
+
+    for (;;) {
+      client_length = sizeof(client_address);
+      const ssize_t outbound_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
+                                                   reinterpret_cast<sockaddr*>(&client_address), &client_length);
+      if (outbound_received < 0) {
+        error_ = DescribeSocketError("recvfrom");
+        return;
+      }
+
+      const auto outbound_transport = swg::ConsumeTransportPacket(
+          response.value.receiving_key, response.value.sender_index, buffer.data(),
+          static_cast<std::size_t>(outbound_received));
+      if (!outbound_transport.ok()) {
+        error_ = outbound_transport.error.message;
+        return;
+      }
+
+      if (outbound_transport.value.payload == expected_syn_payload_) {
+        continue;
+      }
+
+      if (outbound_transport.value.payload != expected_ack_payload_) {
+        error_ = "outbound tunnel stream packet after delayed SYN-ACK was not the expected ACK";
+        return;
+      }
+
+      saw_ack_ = true;
+      return;
+    }
+  }
+
+  int socket_fd_ = -1;
+  std::uint16_t port_ = 0;
+  std::thread worker_{};
+  std::vector<std::uint8_t> expected_syn_payload_{};
+  std::vector<std::uint8_t> inbound_synack_payload_{};
+  std::vector<std::uint8_t> expected_ack_payload_{};
+  std::chrono::milliseconds synack_delay_{};
+  bool responded_ = false;
+  bool keepalive_validated_ = false;
+  bool saw_syn_ = false;
+  bool saw_ack_ = false;
+  std::string error_{};
+};
+
 class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRuntime {
  public:
   enum class FailureMode : std::uint32_t {
@@ -611,6 +834,189 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
   mutable bool receive_failure_triggered_ = false;
   mutable bool keepalive_send_failure_triggered_ = false;
   mutable bool outbound_payload_validated_ = false;
+};
+
+class RecoveringTunnelStreamEngine final : public swg::sysmodule::IWgTunnelEngine {
+ public:
+  swg::Error Start(const swg::sysmodule::TunnelEngineStartRequest& request) override {
+    std::scoped_lock lock(mutex_);
+    running_ = true;
+    prepared_session_ = request.session;
+    queued_packets_.clear();
+    stats_ = {};
+    stats_.successful_handshakes = 1;
+    next_send_counter_ = 1;
+    next_receive_counter_ = 1;
+    recovery_count_ = 0;
+    saw_blackholed_syn_ = false;
+    saw_post_recovery_syn_ = false;
+    saw_post_recovery_ack_ = false;
+    queued_post_recovery_synack_ = false;
+    last_error_.clear();
+    last_recovery_reason_.clear();
+    return swg::Error::None();
+  }
+
+  swg::Error Stop() override {
+    std::scoped_lock lock(mutex_);
+    running_ = false;
+    queued_packets_.clear();
+    return swg::Error::None();
+  }
+
+  swg::Error RecoverTransport(std::string_view reason) override {
+    std::scoped_lock lock(mutex_);
+    if (!running_) {
+      last_error_ = "recover requested while the scripted tunnel engine is stopped";
+      return swg::MakeError(swg::ErrorCode::InvalidState, last_error_);
+    }
+
+    ++recovery_count_;
+    ++stats_.reconnects;
+    ++stats_.successful_handshakes;
+    next_send_counter_ = 1;
+    queued_packets_.clear();
+    queued_post_recovery_synack_ = false;
+    last_recovery_reason_ = std::string(reason);
+    last_error_.clear();
+    return swg::Error::None();
+  }
+
+  swg::Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) override {
+    std::scoped_lock lock(mutex_);
+    if (!running_) {
+      return swg::MakeFailure<std::uint64_t>(swg::ErrorCode::InvalidState,
+                                             "scripted tunnel engine is not running");
+    }
+
+    const auto parsed = swg::ParseIpv4TcpPacket(payload);
+    if (!parsed.ok()) {
+      return swg::MakeFailure<std::uint64_t>(parsed.error.code, parsed.error.message);
+    }
+
+    const std::uint64_t counter = next_send_counter_++;
+    stats_.bytes_out += payload.size();
+    ++stats_.packets_out;
+
+    const swg::Ipv4TcpPacket& segment = parsed.value;
+    if (swg::HasFlag(segment.flags, swg::TcpControlFlag::Syn) &&
+        !swg::HasFlag(segment.flags, swg::TcpControlFlag::Ack)) {
+      if (recovery_count_ == 0) {
+        saw_blackholed_syn_ = true;
+        return swg::MakeSuccess(counter);
+      }
+
+      saw_post_recovery_syn_ = true;
+      if (!queued_post_recovery_synack_) {
+        const auto synack_payload = BuildSynAck(segment);
+        if (!synack_payload.ok()) {
+          return swg::MakeFailure<std::uint64_t>(synack_payload.error.code, synack_payload.error.message);
+        }
+
+        queued_packets_.push_back(swg::WireGuardConsumedTransportPacket{next_receive_counter_++, synack_payload.value});
+        stats_.bytes_in += synack_payload.value.size();
+        ++stats_.packets_in;
+        queued_post_recovery_synack_ = true;
+      }
+      return swg::MakeSuccess(counter);
+    }
+
+    if (recovery_count_ != 0 && queued_post_recovery_synack_ &&
+        swg::HasFlag(segment.flags, swg::TcpControlFlag::Ack) &&
+        !swg::HasFlag(segment.flags, swg::TcpControlFlag::Syn) && segment.payload.empty() &&
+        segment.acknowledgment_number == kRemoteInitialSequence + 1u) {
+      saw_post_recovery_ack_ = true;
+    }
+
+    return swg::MakeSuccess(counter);
+  }
+
+  swg::Result<swg::WireGuardConsumedTransportPacket> ReceivePacket() override {
+    std::scoped_lock lock(mutex_);
+    if (!running_) {
+      return swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::InvalidState,
+                                                                     "scripted tunnel engine is not running");
+    }
+
+    if (queued_packets_.empty()) {
+      return swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::NotFound,
+                                                                     "no scripted transport packets are queued");
+    }
+
+    swg::WireGuardConsumedTransportPacket packet = std::move(queued_packets_.front());
+    queued_packets_.pop_front();
+    return swg::MakeSuccess(std::move(packet));
+  }
+
+  swg::TunnelStats GetStats() const override {
+    std::scoped_lock lock(mutex_);
+    return stats_;
+  }
+
+  std::string GetLastError() const override {
+    std::scoped_lock lock(mutex_);
+    return last_error_;
+  }
+
+  bool IsRunning() const override {
+    std::scoped_lock lock(mutex_);
+    return running_;
+  }
+
+  [[nodiscard]] std::uint32_t recovery_count() const {
+    std::scoped_lock lock(mutex_);
+    return recovery_count_;
+  }
+
+  [[nodiscard]] bool saw_blackholed_syn() const {
+    std::scoped_lock lock(mutex_);
+    return saw_blackholed_syn_;
+  }
+
+  [[nodiscard]] bool saw_post_recovery_syn() const {
+    std::scoped_lock lock(mutex_);
+    return saw_post_recovery_syn_;
+  }
+
+  [[nodiscard]] bool saw_post_recovery_ack() const {
+    std::scoped_lock lock(mutex_);
+    return saw_post_recovery_ack_;
+  }
+
+  [[nodiscard]] std::string last_recovery_reason() const {
+    std::scoped_lock lock(mutex_);
+    return last_recovery_reason_;
+  }
+
+ private:
+  swg::Result<std::vector<std::uint8_t>> BuildSynAck(const swg::Ipv4TcpPacket& syn) const {
+    swg::Ipv4TcpPacket synack{};
+    synack.endpoint.source_ipv4 = syn.endpoint.destination_ipv4;
+    synack.endpoint.destination_ipv4 = syn.endpoint.source_ipv4;
+    synack.endpoint.source_port = syn.endpoint.destination_port;
+    synack.endpoint.destination_port = syn.endpoint.source_port;
+    synack.sequence_number = kRemoteInitialSequence;
+    synack.acknowledgment_number = syn.sequence_number + 1u;
+    synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+    return swg::BuildIpv4TcpPacket(synack);
+  }
+
+  static constexpr std::uint32_t kRemoteInitialSequence = 0x45000000u;
+
+  mutable std::mutex mutex_{};
+  bool running_ = false;
+  swg::sysmodule::PreparedTunnelSession prepared_session_{};
+  std::deque<swg::WireGuardConsumedTransportPacket> queued_packets_{};
+  swg::TunnelStats stats_{};
+  std::uint64_t next_send_counter_ = 1;
+  std::uint64_t next_receive_counter_ = 1;
+  std::uint32_t recovery_count_ = 0;
+  bool saw_blackholed_syn_ = false;
+  bool saw_post_recovery_syn_ = false;
+  bool saw_post_recovery_ack_ = false;
+  bool queued_post_recovery_synack_ = false;
+  std::string last_error_{};
+  std::string last_recovery_reason_{};
 };
 
 bool TestWireGuardCrypto() {
@@ -2440,6 +2846,422 @@ bool TestTunnelStreamSocket() {
   return ok;
 }
 
+bool TestTunnelStreamSocketOutOfOrder() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-tunnel-stream-out-of-order";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelStreamSourcePort = 30000;
+  constexpr std::uint16_t kMoonlightHttpsPort = 47984;
+  constexpr std::uint32_t kExpectedFirstTunnelStreamInitialSequence = 0x53570000u;
+  constexpr std::uint32_t kRemoteInitialSequence = 0x40000000u;
+
+  const std::vector<std::uint8_t> request_payload = {'G', 'E', 'T', ' ', '/', 'a', 'p', 'p', 's'};
+  const std::vector<std::uint8_t> response_payload = {'G', 'A', 'M', 'E', 'S', ':', 'A', ',', 'B', ',', 'C'};
+  const std::vector<std::uint8_t> response_payload_a(response_payload.begin(), response_payload.begin() + 5);
+  const std::vector<std::uint8_t> response_payload_b(response_payload.begin() + 5, response_payload.end());
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.44", "remote_address");
+  if (!Require(local_address.ok(), "out-of-order tunnel stream local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "out-of-order tunnel stream remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4TcpPacketEndpoint endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, endpoint.destination_ipv4.begin());
+  endpoint.source_port = kExpectedFirstTunnelStreamSourcePort;
+  endpoint.destination_port = kMoonlightHttpsPort;
+
+  swg::Ipv4TcpPacket syn{};
+  syn.endpoint = endpoint;
+  syn.sequence_number = kExpectedFirstTunnelStreamInitialSequence;
+  syn.flags = swg::ToFlags(swg::TcpControlFlag::Syn);
+
+  swg::Ipv4TcpPacket synack{};
+  synack.endpoint.source_ipv4 = endpoint.destination_ipv4;
+  synack.endpoint.destination_ipv4 = endpoint.source_ipv4;
+  synack.endpoint.source_port = endpoint.destination_port;
+  synack.endpoint.destination_port = endpoint.source_port;
+  synack.sequence_number = kRemoteInitialSequence;
+  synack.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket ack{};
+  ack.endpoint = endpoint;
+  ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket request{};
+  request.endpoint = endpoint;
+  request.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  request.acknowledgment_number = kRemoteInitialSequence + 1u;
+  request.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  request.payload = request_payload;
+
+  swg::Ipv4TcpPacket response_a{};
+  response_a.endpoint = synack.endpoint;
+  response_a.sequence_number = kRemoteInitialSequence + 1u;
+  response_a.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u +
+                                     static_cast<std::uint32_t>(request_payload.size());
+  response_a.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  response_a.payload = response_payload_a;
+
+  swg::Ipv4TcpPacket response_b{};
+  response_b.endpoint = synack.endpoint;
+  response_b.sequence_number = response_a.sequence_number + static_cast<std::uint32_t>(response_payload_a.size());
+  response_b.acknowledgment_number = response_a.acknowledgment_number;
+  response_b.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  response_b.payload = response_payload_b;
+
+  swg::Ipv4TcpPacket duplicate_ack{};
+  duplicate_ack.endpoint = endpoint;
+  duplicate_ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u +
+                                  static_cast<std::uint32_t>(request_payload.size());
+  duplicate_ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  duplicate_ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket response_ack{};
+  response_ack.endpoint = endpoint;
+  response_ack.sequence_number = duplicate_ack.sequence_number;
+  response_ack.acknowledgment_number = kRemoteInitialSequence + 1u +
+                                       static_cast<std::uint32_t>(response_payload.size());
+  response_ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  const auto syn_packet = swg::BuildIpv4TcpPacket(syn);
+  const auto synack_packet = swg::BuildIpv4TcpPacket(synack);
+  const auto ack_packet = swg::BuildIpv4TcpPacket(ack);
+  const auto request_packet = swg::BuildIpv4TcpPacket(request);
+  const auto response_a_packet = swg::BuildIpv4TcpPacket(response_a);
+  const auto response_b_packet = swg::BuildIpv4TcpPacket(response_b);
+  const auto duplicate_ack_packet = swg::BuildIpv4TcpPacket(duplicate_ack);
+  const auto response_ack_packet = swg::BuildIpv4TcpPacket(response_ack);
+  if (!Require(syn_packet.ok(), "out-of-order tunnel stream SYN packet must build") ||
+      !Require(synack_packet.ok(), "out-of-order tunnel stream SYN-ACK packet must build") ||
+      !Require(ack_packet.ok(), "out-of-order tunnel stream ACK packet must build") ||
+      !Require(request_packet.ok(), "out-of-order tunnel stream request packet must build") ||
+      !Require(response_a_packet.ok(), "out-of-order tunnel stream response A packet must build") ||
+      !Require(response_b_packet.ok(), "out-of-order tunnel stream response B packet must build") ||
+      !Require(duplicate_ack_packet.ok(), "out-of-order tunnel stream duplicate ACK packet must build") ||
+      !Require(response_ack_packet.ok(), "out-of-order tunnel stream response ACK packet must build")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(
+      0, 0,
+      std::vector<std::vector<std::uint8_t>>{synack_packet.value, response_b_packet.value, response_a_packet.value},
+      std::vector<std::vector<std::uint8_t>>{syn_packet.value, ack_packet.value, request_packet.value,
+                                             duplicate_ack_packet.value, response_ack_packet.value});
+  if (!Require(responder.ready(), "out-of-order tunnel stream responder must start")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before out-of-order tunnel stream tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before out-of-order tunnel stream tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "out-of-order tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto control_stream = swg::TunnelStreamSocket::Open(
+      session, swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", kMoonlightHttpsPort));
+  ok &= Require(control_stream.ok(), "out-of-order Moonlight HTTPS control tunnel stream must open");
+  if (!control_stream.ok()) {
+    return false;
+  }
+
+  ok &= Require(control_stream.value.info().local_port == kExpectedFirstTunnelStreamSourcePort,
+                "out-of-order tunnel stream must use the expected deterministic local TCP source port");
+
+  const auto send_counter = control_stream.value.Send(request_payload);
+  ok &= Require(send_counter.ok(), "out-of-order tunnel stream send must succeed");
+  if (send_counter.ok()) {
+    ok &= Require(send_counter.value == 3,
+                  "out-of-order stream payload must still follow the SYN and ACK transport packets");
+  }
+
+  const auto received = control_stream.value.Receive();
+  ok &= Require(received.ok(), "out-of-order tunnel stream receive must succeed");
+  if (received.ok()) {
+    ok &= Require(received.value.payload == response_payload,
+                  "out-of-order tunnel stream receive must reassemble contiguous buffered TCP payload");
+    ok &= Require(!received.value.peer_closed,
+                  "out-of-order tunnel stream response should keep the peer connection open");
+  }
+
+  const auto empty = control_stream.value.Receive();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "out-of-order tunnel stream receive must drain the buffered response payload completely");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "out-of-order responder must validate the tunnel stream exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "out-of-order tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after out-of-order tunnel stream tests");
+  return ok;
+}
+
+bool TestTunnelStreamSocketDelayedSynAck() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-tunnel-stream-delayed-synack";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelStreamSourcePort = 30000;
+  constexpr std::uint16_t kMoonlightRtspPort = 48010;
+  constexpr std::uint32_t kExpectedFirstTunnelStreamInitialSequence = 0x53570000u;
+  constexpr std::uint32_t kRemoteInitialSequence = 0x40000000u;
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.44", "remote_address");
+  if (!Require(local_address.ok(), "delayed SYN-ACK tunnel stream local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "delayed SYN-ACK tunnel stream remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4TcpPacketEndpoint endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, endpoint.destination_ipv4.begin());
+  endpoint.source_port = kExpectedFirstTunnelStreamSourcePort;
+  endpoint.destination_port = kMoonlightRtspPort;
+
+  swg::Ipv4TcpPacket syn{};
+  syn.endpoint = endpoint;
+  syn.sequence_number = kExpectedFirstTunnelStreamInitialSequence;
+  syn.flags = swg::ToFlags(swg::TcpControlFlag::Syn);
+
+  swg::Ipv4TcpPacket synack{};
+  synack.endpoint.source_ipv4 = endpoint.destination_ipv4;
+  synack.endpoint.destination_ipv4 = endpoint.source_ipv4;
+  synack.endpoint.source_port = endpoint.destination_port;
+  synack.endpoint.destination_port = endpoint.source_port;
+  synack.sequence_number = kRemoteInitialSequence;
+  synack.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket ack{};
+  ack.endpoint = endpoint;
+  ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  const auto syn_packet = swg::BuildIpv4TcpPacket(syn);
+  const auto synack_packet = swg::BuildIpv4TcpPacket(synack);
+  const auto ack_packet = swg::BuildIpv4TcpPacket(ack);
+  if (!Require(syn_packet.ok(), "delayed SYN-ACK tunnel stream SYN packet must build") ||
+      !Require(synack_packet.ok(), "delayed SYN-ACK tunnel stream SYN-ACK packet must build") ||
+      !Require(ack_packet.ok(), "delayed SYN-ACK tunnel stream ACK packet must build")) {
+    return false;
+  }
+
+  DelayedTunnelStreamSynAckResponder responder(
+      syn_packet.value, synack_packet.value, ack_packet.value, std::chrono::milliseconds(1100));
+  if (!Require(responder.ready(), "delayed SYN-ACK responder must start for tunnel stream tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before delayed SYN-ACK tunnel stream tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before delayed SYN-ACK tunnel stream tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "delayed SYN-ACK tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto control_stream = swg::TunnelStreamSocket::Open(
+      session, swg::MakeMoonlightStreamControlStreamRequest("203.0.113.44", kMoonlightRtspPort));
+  ok &= Require(control_stream.ok(), "tunnel stream open must survive a delayed SYN-ACK with retransmission");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "delayed SYN-ACK responder must validate the tunnel stream exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "delayed SYN-ACK tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after delayed SYN-ACK tunnel stream tests");
+  return ok;
+}
+
+bool TestTunnelStreamSocketUsesDeferredSynAck() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-tunnel-stream-deferred-synack";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelStreamSourcePort = 30000;
+  constexpr std::uint16_t kMoonlightHttpsPort = 47984;
+  constexpr std::uint32_t kExpectedFirstTunnelStreamInitialSequence = 0x53570000u;
+  constexpr std::uint32_t kRemoteInitialSequence = 0x40000000u;
+
+  swg::TunnelDnsPacketEndpoint dns_endpoint{};
+  dns_endpoint.source_ipv4 = {10, 0, 0, 2};
+  dns_endpoint.destination_ipv4 = {1, 1, 1, 1};
+  dns_endpoint.source_port = 40001;
+  dns_endpoint.destination_port = 53;
+
+  const auto expected_dns_query = swg::BuildTunnelDnsQueryPacket(dns_endpoint, "vpn.example.test", 1);
+  const auto inbound_dns_response =
+      swg::BuildTunnelDnsResponsePacket(dns_endpoint, "vpn.example.test", 1, {"203.0.113.44"});
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.44", "remote_address");
+  if (!Require(expected_dns_query.ok(), "expected tunnel DNS query packet must build for deferred SYN-ACK tests") ||
+      !Require(inbound_dns_response.ok(), "expected tunnel DNS response packet must build for deferred SYN-ACK tests") ||
+      !Require(local_address.ok(), "deferred SYN-ACK tunnel stream local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "deferred SYN-ACK tunnel stream remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4TcpPacketEndpoint endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, endpoint.destination_ipv4.begin());
+  endpoint.source_port = kExpectedFirstTunnelStreamSourcePort;
+  endpoint.destination_port = kMoonlightHttpsPort;
+
+  swg::Ipv4TcpPacket syn{};
+  syn.endpoint = endpoint;
+  syn.sequence_number = kExpectedFirstTunnelStreamInitialSequence;
+  syn.flags = swg::ToFlags(swg::TcpControlFlag::Syn);
+
+  swg::Ipv4TcpPacket synack{};
+  synack.endpoint.source_ipv4 = endpoint.destination_ipv4;
+  synack.endpoint.destination_ipv4 = endpoint.source_ipv4;
+  synack.endpoint.source_port = endpoint.destination_port;
+  synack.endpoint.destination_port = endpoint.source_port;
+  synack.sequence_number = kRemoteInitialSequence;
+  synack.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket ack{};
+  ack.endpoint = endpoint;
+  ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  const auto syn_packet = swg::BuildIpv4TcpPacket(syn);
+  const auto synack_packet = swg::BuildIpv4TcpPacket(synack);
+  const auto ack_packet = swg::BuildIpv4TcpPacket(ack);
+  if (!Require(syn_packet.ok(), "deferred SYN-ACK tunnel stream SYN packet must build") ||
+      !Require(synack_packet.ok(), "deferred SYN-ACK tunnel stream SYN-ACK packet must build") ||
+      !Require(ack_packet.ok(), "deferred SYN-ACK tunnel stream ACK packet must build")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(
+      0,
+      0,
+      std::vector<std::vector<std::uint8_t>>{synack_packet.value, inbound_dns_response.value},
+      std::vector<std::vector<std::uint8_t>>{expected_dns_query.value, syn_packet.value, ack_packet.value});
+  if (!Require(responder.ready(), "deferred SYN-ACK responder must start for tunnel stream tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before deferred SYN-ACK tunnel stream tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before deferred SYN-ACK tunnel stream tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "deferred SYN-ACK tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto resolved = session.ResolveDns("vpn.example.test");
+  ok &= Require(resolved.ok(), "tunnel DNS resolve must succeed before deferred SYN-ACK stream open");
+  if (resolved.ok()) {
+    ok &= Require(resolved.value.resolved,
+                  "tunnel DNS resolve must produce an address while deferring the future stream SYN-ACK");
+  }
+
+  const auto control_stream = swg::TunnelStreamSocket::Open(
+      session, swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", kMoonlightHttpsPort));
+  ok &= Require(control_stream.ok(), "tunnel stream open must consume a matching SYN-ACK already queued in deferred packets");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "deferred SYN-ACK responder must validate the tunnel DNS plus stream exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "deferred SYN-ACK tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after deferred SYN-ACK tunnel stream tests");
+  return ok;
+}
+
+bool TestTunnelStreamSocketRecoversAfterIdleTimeout() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-stream-idle-recovery";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  auto engine = std::make_unique<RecoveringTunnelStreamEngine>();
+  RecoveringTunnelStreamEngine* engine_ptr = engine.get();
+  const auto service = swg::sysmodule::CreateLocalControlServiceForTest(std::move(engine), runtime_root);
+  swg::Client client(swg::sysmodule::CreateHostInProcessTransport(service));
+
+  bool ok = true;
+  ok &= Require(client.SaveConfig(MakeValidConfig("127.0.0.1", 51820)).ok(),
+                "valid config must save before tunnel stream idle-recovery test");
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel stream idle-recovery test");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "tunnel stream idle-recovery app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto control_stream =
+      session.OpenTunnelStream(swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", 47984));
+  ok &= Require(control_stream.ok(), "tunnel stream open must recover once after an idle timeout");
+  if (control_stream.ok()) {
+    ok &= Require(control_stream.value.local_port == 30000,
+                  "idle-recovery tunnel stream must preserve the deterministic first local TCP source port");
+    ok &= Require(control_stream.value.remote_address == "203.0.113.44",
+                  "idle-recovery tunnel stream must report the resolved remote IPv4 address");
+  }
+
+  const auto stats = client.GetStats();
+  ok &= Require(stats.ok(), "idle-recovery tunnel stream test must read stats after open");
+  if (stats.ok()) {
+    ok &= Require(stats.value.reconnects == 1,
+                  "idle-recovery tunnel stream open must record one transport reconnect");
+    ok &= Require(stats.value.successful_handshakes == 2,
+                  "idle-recovery tunnel stream open must preserve the initial and recovered transport handshakes");
+  }
+
+  ok &= Require(engine_ptr->recovery_count() == 1,
+                "scripted tunnel engine must observe one bounded recovery request");
+  ok &= Require(engine_ptr->saw_blackholed_syn(),
+                "scripted tunnel engine must observe the pre-recovery SYN being blackholed");
+  ok &= Require(engine_ptr->saw_post_recovery_syn(),
+                "scripted tunnel engine must observe the retried SYN after recovery");
+  ok &= Require(engine_ptr->saw_post_recovery_ack(),
+                "scripted tunnel engine must observe the post-recovery ACK completion");
+  ok &= Require(engine_ptr->last_recovery_reason().find("timed out waiting for tunnel stream SYN-ACK") !=
+                    std::string::npos,
+                "scripted tunnel engine must receive the SYN-ACK timeout reason for recovery");
+
+  ok &= Require(session.Close().ok(), "tunnel stream idle-recovery app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after idle-recovery test");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -2472,6 +3294,10 @@ int main() {
   const bool session_socket_ok = TestSessionSocketAbstraction();
   const bool tunnel_datagram_ok = TestTunnelDatagramSocket();
   const bool tunnel_stream_ok = TestTunnelStreamSocket();
+  const bool tunnel_stream_out_of_order_ok = TestTunnelStreamSocketOutOfOrder();
+  const bool tunnel_stream_delayed_synack_ok = TestTunnelStreamSocketDelayedSynAck();
+  const bool tunnel_stream_deferred_synack_ok = TestTunnelStreamSocketUsesDeferredSynAck();
+  const bool tunnel_stream_idle_recovery_ok = TestTunnelStreamSocketRecoversAfterIdleTimeout();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
@@ -2479,7 +3305,9 @@ int main() {
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && tunnel_dns_codec_ok && dns_resolution_ok &&
-          session_socket_ok && tunnel_datagram_ok && tunnel_stream_ok)
+          session_socket_ok && tunnel_datagram_ok && tunnel_stream_ok && tunnel_stream_out_of_order_ok &&
+          tunnel_stream_delayed_synack_ok && tunnel_stream_deferred_synack_ok &&
+          tunnel_stream_idle_recovery_ok)
              ? 0
              : 1;
 }

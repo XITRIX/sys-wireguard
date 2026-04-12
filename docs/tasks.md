@@ -35,6 +35,8 @@
 - The Switch integration app now drives its DNS and socket-helper diagnostics from the active profile `endpoint_host`, and it skips DNS probes cleanly when the profile uses a numeric endpoint instead of a hostname.
 - The SDK and control service now expose a real UDP tunnel-datagram handle API (`OpenTunnelDatagram` / `SendTunnelDatagram` / `RecvTunnelDatagram` / `CloseTunnelDatagram`) plus `swg::TunnelDatagramSocket`, with host regression coverage for a Moonlight-style video datagram round trip.
 - The SDK and control service now expose a real TCP tunnel-stream handle API (`OpenTunnelStream` / `SendTunnelStream` / `RecvTunnelStream` / `CloseTunnelStream`) plus `swg::TunnelStreamSocket`, with host regression coverage for a Moonlight-style HTTPS control round trip.
+- The sibling Moonlight-Switch Switch build now embeds `swg_common` and `swg_sdk`, routes libgamestream HTTP control requests through a new Switch-only `SwgBridge`, uses tunnel-aware stream-host DNS before native resolution, and still builds successfully to `Moonlight.nro`.
+- The sibling Moonlight-Switch Switch build now also routes recognized TCP, UDP, and ENet transport sockets through the same Switch-only bridge onto `TunnelStreamSocket` and `TunnelDatagramSocket`, and a deployable `build/switch-swg/Moonlight-Switch.nro` artifact is produced successfully.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -53,6 +55,7 @@
 - Run the new real tunnel-DNS and `SessionSocket` integration controls on-device against a working VPN peer and record the results.
 - Run the new tunnel datagram handle on-device against a working VPN peer and record Moonlight-style UDP results.
 - Run the new tunnel stream handle on-device against a working VPN peer and record Moonlight-style TCP control results.
-- Decide whether the SDK should add a TLS helper above `TunnelStreamSocket` or whether Moonlight-Switch should terminate HTTPS directly on top of the new tunnel stream API.
+- Run the new Moonlight-Switch transport bridge on-device against a working VPN peer and record whether pairing, app launch, RTSP, ENet control, audio, video, and input all survive the tunneled path.
+- If on-device testing finds protocol gaps, narrow them by layer before rewriting more code: HTTP/TLS, RTSP, ENet control, UDP media, then input.
 - Finish the rest of Milestone 6 with a concrete usage example app that shows route planning, tunnel DNS, UDP datagrams, and TCP streams together.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.

@@ -109,6 +109,19 @@ For Moonlight adoption, the intended split is now:
 - video, audio, and input can move onto `TunnelDatagramSocket`
 - HTTPS control and TCP control can move onto `TunnelStreamSocket`, with TLS or HTTP layered above that byte stream on the app side
 
+The first real Moonlight-Switch consumer patch now exists in the sibling Switch app repo:
+- the Switch build imports `swg_common` and `swg_sdk` directly from the sibling `WGSysModule` checkout
+- a Switch-only `SwgBridge` owns route planning, tunnel-aware hostname resolution, and TLS-over-`TunnelStreamSocket` for control requests
+- `app/src/libgamestream/http.cpp` now tries the `SwgBridge` first, so pairing, app-launch, and other HTTPS control requests can ride the active tunnel without replacing Moonlight's higher-level HTTP call sites
+- `extern/moonlight-common-c/src/PlatformSockets.c` now consults the bridge for stream-host DNS so tunneled streaming hosts can resolve through `swg::AppSession` policy before falling back to native resolution
+- the integrated Moonlight-Switch Switch target now configures and builds to `Moonlight.nro` with the new bridge enabled
+
+The next consumer patch now moves the rest of Moonlight's transport stack onto the same Switch-only bridge layer:
+- `PlatformSockets.c` now classifies recognized Moonlight TCP and UDP sockets on Switch and attaches them to `TunnelStreamSocket` or `TunnelDatagramSocket` before native connect/bind when policy requires the tunnel
+- raw TCP and UDP call sites in `ControlStream.c`, `InputStream.c`, `AudioStream.c`, `VideoStream.c`, and `RtspConnection.c` now use bridge-aware helpers so tunneled sockets keep Moonlight's existing send/recv flow
+- `enet/unix.c` now routes ENet client sockets through the same datagram bridge on Switch, so Gen 5+ control traffic and ENet-backed RTSP can use the tunnel without changing Moonlight's higher-level ENet logic
+- the sibling Switch build still completes successfully after those transport changes, and a deployable `build/switch-swg/Moonlight-Switch.nro` artifact is produced for hardware testing
+
 The DNS helper is still intentionally narrow: it now executes IPv4 A-record DNS queries through the tunnel transport, but it does not yet cover AAAA lookups, TCP fallback, caching, or transparent resolver interception.
 
 The Switch integration app now uses the active profile `endpoint_host` as its live DNS and socket-helper target. If that field is a numeric endpoint, the app skips the DNS probe instead of querying the old placeholder hostname.
@@ -117,9 +130,8 @@ The Switch integration app now uses the active profile `endpoint_host` as its li
 
 ## Next steps for real integration
 
-- wire Moonlight video/audio/input UDP paths to `TunnelDatagramSocket`
-- wire Moonlight pairing, app-launch, and stream-control TCP flows to `TunnelStreamSocket`
-- decide whether to add an SDK TLS helper above `TunnelStreamSocket` or adapt Moonlight's existing HTTPS layer directly
+- run the new transport bridge on hardware and verify pairing, app launch, RTSP setup, ENet control, audio, video, and input against a real Sunshine/Moonlight host
+- capture on-device failures separately by phase: HTTPS control, RTSP setup, ENet control, audio/video receive, and input send
 - expand tunnel DNS beyond the current IPv4 A-record path
 - add per-title policy so Moonlight NSP forwarders can opt into the tunnel automatically
 - add transparent DNS and later `bsd:u` interception as an optional fast path

@@ -9,6 +9,10 @@ namespace swg {
 class AppSession {
  public:
   explicit AppSession(Client client = {});
+  AppSession(const AppSession&) = delete;
+  AppSession& operator=(const AppSession&) = delete;
+  AppSession(AppSession&& other) noexcept;
+  AppSession& operator=(AppSession&& other) noexcept;
   ~AppSession();
 
   Result<AppSessionInfo> Open(const AppTunnelRequest& request);

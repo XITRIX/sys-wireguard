@@ -12,9 +12,6 @@ add_library(swg_common STATIC
   src/wg_profile.cpp
 )
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(MBEDCRYPTO REQUIRED IMPORTED_TARGET mbedcrypto)
-
 target_include_directories(swg_common
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -24,9 +21,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
   target_compile_definitions(swg_common PUBLIC SWG_PLATFORM_SWITCH=1)
 endif()
 
-target_link_libraries(swg_common
-  PUBLIC
-    PkgConfig::MBEDCRYPTO
-)
+if(TARGET MbedTLS::mbedcrypto)
+  target_link_libraries(swg_common
+    PUBLIC
+      MbedTLS::mbedcrypto
+  )
+elseif(TARGET mbed::crypto)
+  target_link_libraries(swg_common
+    PUBLIC
+      mbed::crypto
+  )
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(MBEDCRYPTO REQUIRED IMPORTED_TARGET mbedcrypto)
+
+  target_link_libraries(swg_common
+    PUBLIC
+      PkgConfig::MBEDCRYPTO
+  )
+endif()
 
 swg_apply_defaults(swg_common)

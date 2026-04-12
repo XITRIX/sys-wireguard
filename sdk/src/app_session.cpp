@@ -4,6 +4,28 @@ namespace swg {
 
 AppSession::AppSession(Client client) : client_(std::move(client)) {}
 
+AppSession::AppSession(AppSession&& other) noexcept
+    : client_(std::move(other.client_)),
+      session_id_(other.session_id_),
+      session_info_(std::move(other.session_info_)) {
+  other.session_id_ = 0;
+  other.session_info_ = {};
+}
+
+AppSession& AppSession::operator=(AppSession&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+
+  static_cast<void>(Close());
+  client_ = std::move(other.client_);
+  session_id_ = other.session_id_;
+  session_info_ = std::move(other.session_info_);
+  other.session_id_ = 0;
+  other.session_info_ = {};
+  return *this;
+}
+
 AppSession::~AppSession() {
   static_cast<void>(Close());
 }

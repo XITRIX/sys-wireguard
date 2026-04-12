@@ -17,4 +17,6 @@
 - Capability detection now probes live service reachability, but some flags still map to nearest current surfaces (`sfdnsres` for resolver reachability and `nifm:a`/`nifm:s` for network-configuration reachability) rather than final transparent-mode hooks.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
 - The app API now includes policy-safe DNS responses plus real UDP and TCP tunnel handles, but the tunnel DNS path is still limited to synchronous IPv4 A-record lookups and HTTPS still needs TLS or HTTP handling layered above `TunnelStreamSocket`.
+- Moonlight-Switch now compiles with a Switch-only bridge for HTTPS control, stream-host DNS, TCP stream sockets, UDP media sockets, and ENet control sockets, but none of that new transport path has been validated on hardware yet.
+- The current Moonlight bridge opens its app session with local-network bypass disabled so RFC1918 Moonlight hosts can still be forced through the tunnel; local direct-streaming behavior on Switch should be treated as changed until tested explicitly.
 - The sysmodule NPDM is intentionally permissive in Phase A (`service_access = ["*"]`) and should be tightened once the exact service dependencies are fixed.

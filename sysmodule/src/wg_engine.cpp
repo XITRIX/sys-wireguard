@@ -253,6 +253,12 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     return Error::None();
   }
 
+  Error RecoverTransport(std::string_view reason) override {
+    const std::string recovery_reason = reason.empty() ? "external transport recovery requested"
+                                                       : std::string(reason);
+    return ReconnectWithBackoff(recovery_reason, ReconnectTrigger::External);
+  }
+
   Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) override {
     if (payload.empty()) {
       return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "authenticated transport payload must not be empty");
