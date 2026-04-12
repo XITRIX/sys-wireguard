@@ -109,16 +109,32 @@ swg::Result<swg::WireGuardResponderConfig> MakeHandshakeResponderConfig() {
   return swg::MakeSuccess(config);
 }
 
+std::vector<std::vector<std::uint8_t>> MakePayloadSequence(std::vector<std::uint8_t> payload) {
+  std::vector<std::vector<std::uint8_t>> payloads;
+  if (!payload.empty()) {
+    payloads.push_back(std::move(payload));
+  }
+  return payloads;
+}
+
 class LocalHandshakeResponder {
  public:
   explicit LocalHandshakeResponder(std::uint32_t expected_additional_keepalives = 0,
                                    std::uint32_t inbound_keepalives_to_send = 0,
                                    std::vector<std::uint8_t> inbound_transport_payload = {},
                                    std::vector<std::uint8_t> expected_outbound_transport_payload = {})
+      : LocalHandshakeResponder(expected_additional_keepalives, inbound_keepalives_to_send,
+                                MakePayloadSequence(std::move(inbound_transport_payload)),
+                                MakePayloadSequence(std::move(expected_outbound_transport_payload))) {}
+
+  LocalHandshakeResponder(std::uint32_t expected_additional_keepalives,
+                          std::uint32_t inbound_keepalives_to_send,
+                          std::vector<std::vector<std::uint8_t>> inbound_transport_payloads,
+                          std::vector<std::vector<std::uint8_t>> expected_outbound_transport_payloads)
       : expected_additional_keepalives_(expected_additional_keepalives),
         inbound_keepalives_to_send_(inbound_keepalives_to_send),
-        inbound_transport_payload_(std::move(inbound_transport_payload)),
-        expected_outbound_transport_payload_(std::move(expected_outbound_transport_payload)) {
+        inbound_transport_payloads_(std::move(inbound_transport_payloads)),
+        expected_outbound_transport_payloads_(std::move(expected_outbound_transport_payloads)) {
     socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd_ < 0) {
       error_ = DescribeSocketError("socket");
@@ -178,7 +194,7 @@ class LocalHandshakeResponder {
     }
     return error_.empty() && responded_ && keepalive_validated_ &&
            validated_additional_keepalives_ == expected_additional_keepalives_ &&
-           (expected_outbound_transport_payload_.empty() || outbound_transport_validated_);
+           validated_outbound_transport_packets_ == expected_outbound_transport_payloads_.size();
   }
 
   const std::string& error() const {
@@ -267,10 +283,11 @@ class LocalHandshakeResponder {
       }
     }
 
-    if (!inbound_transport_payload_.empty()) {
+    std::uint64_t inbound_transport_counter = inbound_keepalives_to_send_;
+    for (const auto& inbound_transport_payload : inbound_transport_payloads_) {
       const auto inbound_transport = swg::CreateTransportPacket(
           response.value.sending_key, response.value.receiver_index,
-          inbound_transport_payload_, inbound_keepalives_to_send_);
+          inbound_transport_payload, inbound_transport_counter);
       if (!inbound_transport.ok()) {
         error_ = inbound_transport.error.message;
         return;
@@ -287,9 +304,12 @@ class LocalHandshakeResponder {
         error_ = "sendto returned a short authenticated transport payload";
         return;
       }
+
+      ++inbound_transport_counter;
     }
 
-    if (!expected_outbound_transport_payload_.empty()) {
+    std::uint64_t expected_outbound_counter = 1;
+    for (const auto& expected_outbound_transport_payload : expected_outbound_transport_payloads_) {
       client_length = sizeof(client_address);
       const ssize_t outbound_received = ::recvfrom(socket_fd_, buffer.data(), buffer.size(), 0,
                                                    reinterpret_cast<sockaddr*>(&client_address), &client_length);
@@ -306,16 +326,17 @@ class LocalHandshakeResponder {
         return;
       }
 
-      if (outbound_transport.value.counter != 1) {
+      if (outbound_transport.value.counter != expected_outbound_counter) {
         error_ = "outbound transport payload used an unexpected transport counter";
         return;
       }
-      if (outbound_transport.value.payload != expected_outbound_transport_payload_) {
+      if (outbound_transport.value.payload != expected_outbound_transport_payload) {
         error_ = "outbound transport payload bytes did not match the expected authenticated payload";
         return;
       }
 
-      outbound_transport_validated_ = true;
+      ++validated_outbound_transport_packets_;
+      ++expected_outbound_counter;
     }
 
     for (std::uint32_t expected_counter = 1; expected_counter <= expected_additional_keepalives_; ++expected_counter) {
@@ -352,9 +373,9 @@ class LocalHandshakeResponder {
   std::uint32_t expected_additional_keepalives_ = 0;
   std::uint32_t validated_additional_keepalives_ = 0;
   std::uint32_t inbound_keepalives_to_send_ = 0;
-  std::vector<std::uint8_t> inbound_transport_payload_{};
-  std::vector<std::uint8_t> expected_outbound_transport_payload_{};
-  bool outbound_transport_validated_ = false;
+  std::vector<std::vector<std::uint8_t>> inbound_transport_payloads_{};
+  std::vector<std::vector<std::uint8_t>> expected_outbound_transport_payloads_{};
+  std::size_t validated_outbound_transport_packets_ = 0;
   std::string error_{};
 };
 
@@ -1459,6 +1480,109 @@ bool TestAppSessionSendPacket() {
   return ok;
 }
 
+bool TestAppSessionSustainedTraffic() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-app-session-sustained";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  const std::vector<std::vector<std::uint8_t>> inbound_payloads = {
+      {0x49, 0x4e, 0x30, 0x31},
+      {0x49, 0x4e, 0x30, 0x32, 0x41},
+      {0x49, 0x4e, 0x30, 0x33, 0x42, 0x43},
+  };
+  const std::vector<std::vector<std::uint8_t>> outbound_payloads = {
+      {0x4f, 0x55, 0x54, 0x30, 0x31},
+      {0x4f, 0x55, 0x54, 0x30, 0x32, 0x44},
+      {0x4f, 0x55, 0x54, 0x30, 0x33, 0x45, 0x46},
+  };
+
+  LocalHandshakeResponder responder(0, 0, inbound_payloads, outbound_payloads);
+  if (!Require(responder.ready(), "local handshake responder must start for sustained app-session traffic test")) {
+    return false;
+  }
+
+  swg::Config config = MakeValidConfig("127.0.0.1", responder.port());
+  config.profiles.at("default").persistent_keepalive = 0;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(),
+               "valid config must save before sustained app-session traffic test")) {
+    return false;
+  }
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  if (!Require(opened.ok(), "app session must open before sustained packet traffic")) {
+    return false;
+  }
+
+  if (!Require(client.Connect().ok(), "connect must succeed before sustained app-session traffic")) {
+    return false;
+  }
+
+  bool ok = true;
+  for (std::size_t index = 0; index < outbound_payloads.size(); ++index) {
+    const auto counter = session.SendPacket(outbound_payloads[index]);
+    ok &= Require(counter.ok(), "app session must send each sustained outbound payload packet");
+    if (counter.ok()) {
+      ok &= Require(counter.value == index + 1,
+                    "sustained outbound payload packets must preserve consecutive transport counters");
+    }
+  }
+
+  ok &= Require(responder.Join(), responder.error().empty()
+                                      ? "local responder must validate the sustained outbound payload sequence"
+                                      : responder.error());
+
+  for (std::size_t index = 0; index < inbound_payloads.size(); ++index) {
+    swg::Result<swg::TunnelPacket> packet =
+        swg::MakeFailure<swg::TunnelPacket>(swg::ErrorCode::NotFound, "not queued yet");
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      packet = session.ReceivePacket();
+      if (packet.ok()) {
+        break;
+      }
+      if (packet.error.code != swg::ErrorCode::NotFound) {
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ok &= Require(packet.ok(), "app session must receive each sustained inbound payload packet");
+    if (packet.ok()) {
+      ok &= Require(packet.value.counter == index,
+                    "sustained inbound payload packets must preserve consecutive transport counters");
+      ok &= Require(packet.value.payload == inbound_payloads[index],
+                    "sustained inbound payload packets must preserve the authenticated payload bytes");
+    }
+  }
+
+  const auto empty = session.ReceivePacket();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "sustained app-session receive must report empty after draining the queued packets");
+
+  const auto stats = client.GetStats();
+  ok &= Require(stats.ok(), "stats query must succeed after sustained app-session traffic");
+  if (stats.ok()) {
+    ok &= Require(stats.value.successful_handshakes == 1,
+                  "sustained app-session traffic must preserve a single successful handshake");
+    ok &= Require(stats.value.packets_out >= 2 + outbound_payloads.size(),
+                  "sustained app-session traffic must increase outbound packet counters across multiple payloads");
+    ok &= Require(stats.value.packets_in >= 1 + inbound_payloads.size(),
+                  "sustained app-session traffic must increase inbound packet counters across multiple payloads");
+    ok &= Require(stats.value.bytes_out >
+                      swg::kWireGuardHandshakeInitiationSize + swg::kWireGuardTransportKeepaliveSize,
+                  "sustained app-session traffic must increase outbound bytes beyond handshake traffic");
+    ok &= Require(stats.value.bytes_in > swg::kWireGuardHandshakeResponseSize,
+                  "sustained app-session traffic must increase inbound bytes beyond the handshake response");
+  }
+
+  ok &= Require(session.Close().ok(), "app session must close cleanly after sustained traffic test");
+  ok &= Require(client.Disconnect().ok(), "disconnect must succeed after sustained app-session traffic test");
+  return ok;
+}
+
 bool TestEngineReconnectAfterSendFailure() {
   const swg::Config valid_config = MakeValidConfig("127.0.0.1", 51820);
   const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
@@ -1592,6 +1716,7 @@ int main() {
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool app_session_send_ok = TestAppSessionSendPacket();
   const bool app_session_recv_ok = TestAppSessionReceivePacket();
+  const bool sustained_app_session_ok = TestAppSessionSustainedTraffic();
   const bool reconnect_ok = TestEngineReconnectAfterSendFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
@@ -1599,7 +1724,8 @@ int main() {
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
-          codec_ok && app_session_send_ok && app_session_recv_ok && reconnect_ok && moonlight_ok)
+          codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
+          moonlight_ok)
              ? 0
              : 1;
 }

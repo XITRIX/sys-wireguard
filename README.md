@@ -103,8 +103,9 @@ Current constraints:
 - While connected, `GetStats()` now includes live engine counters and scheduled keepalives when `persistent_keepalive` is non-zero.
 - The engine now also accepts inbound authenticated transport packets from the validated peer endpoint and folds them into live stats.
 - Non-empty transport payloads are authenticated, can be sent through `swg:ctl`, are queued in a bounded receive queue, and are available to SDK consumers through `swg::AppSession::SendPacket()` / `ReceivePacket()`.
+- Host regression coverage now exercises repeated authenticated app-session send/receive traffic over one connected tunnel session and validates transport counters plus stats growth across multiple packets.
 - Outbound transport sends now perform a bounded reconnect with backoff before failing if the authenticated datagram send hits an I/O error.
-- It still does not implement cookie replies, full reconnect/rekey policy beyond outbound send failures, or a broader sustained transport packet loop yet.
+- It still does not implement cookie replies, rekeying, or reconnect recovery beyond outbound send failures yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
@@ -147,6 +148,7 @@ Implemented:
 - inbound authenticated keepalive handling plus live receive-side stats
 - authenticated transport payload validation plus live receive-side stats
 - session-scoped send/receive of authenticated transport payload packets through `swg:ctl`
+- repeated app-session authenticated packet traffic validated on the host regression path
 - bounded reconnect with backoff on outbound authenticated transport send failure
 
 ## App integration
@@ -165,6 +167,6 @@ When tunnel traffic is routed through the sysmodule, the same session can now se
 
 Next:
 - manager UX expansion
-- WireGuard cookie reply handling, broader reconnect/rekey policy, and a sustained packet loop on top of the new handshake plus keepalive path
+- WireGuard cookie reply handling and broader reconnect/rekey policy on top of the current repeated packet path
 - firmware-specific routing hooks and DNS/tunnel integration
 - Tesla UI integration later

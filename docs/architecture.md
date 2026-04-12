@@ -30,7 +30,7 @@ Current implementation boundaries:
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
-- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, moves authenticated transport payloads through bounded send/receive paths, and performs a bounded reconnect with backoff when an outbound transport send hits an I/O failure.
+- The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, moves authenticated transport payloads through bounded send/receive paths that are regression-covered under repeated app-session traffic, and performs a bounded reconnect with backoff when an outbound transport send hits an I/O failure.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
 - Control-service stats now merge live engine counters while connected so manager and future overlay consumers can observe keepalive traffic without disconnecting first.
 - The control plane now exposes authenticated transport payload send/receive through `swg:ctl::SendPacket` and `swg:ctl::RecvPacket`, both currently gated by an open app session on the active connected profile.
@@ -76,6 +76,6 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 ## What is intentionally deferred
 
 - Tesla overlay parity, rendering, and input handling
-- WireGuard cookie handling, broader reconnect/rekey policy, and a broader packet loop
+- WireGuard cookie handling plus broader reconnect/rekey policy
 - DNS-over-tunnel and MITM logic
 - policy-driven transparent routing
