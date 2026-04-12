@@ -145,6 +145,13 @@ class LocalControlService final : public IControlService {
     status.runtime_flags = snapshot.runtime_flags;
     status.active_profile = snapshot.active_profile;
     status.last_error = initialization_error_ ? initialization_error_.message : snapshot.last_error;
+    if (!initialization_error_ && snapshot.state == TunnelState::Connected && !tunnel_engine_->IsRunning()) {
+      const std::string runtime_error = tunnel_engine_->GetLastError();
+      if (!runtime_error.empty()) {
+        status.state = TunnelState::Error;
+        status.last_error = runtime_error;
+      }
+    }
     return MakeSuccess(std::move(status));
   }
 
@@ -314,10 +321,7 @@ class LocalControlService final : public IControlService {
   Result<TunnelStats> GetStats() const override {
     std::scoped_lock lock(mutex_);
 
-    TunnelStats stats = state_machine_.snapshot().stats;
-    if (tunnel_engine_->IsRunning()) {
-      stats = MergeEngineStats(stats, tunnel_engine_->GetStats());
-    }
+    TunnelStats stats = MergeEngineStats(state_machine_.snapshot().stats, tunnel_engine_->GetStats());
 
     return MakeSuccess(std::move(stats));
   }

@@ -25,6 +25,7 @@
 - The shared transport layer now authenticates non-empty WireGuard transport packets too, and the engine now stores validated inbound payload packets in a bounded internal receive queue while folding them into live stats.
 - The control plane now exposes that bounded receive queue through `swg:ctl::RecvPacket`, `Client::RecvPacket()`, and `AppSession::ReceivePacket()` with host regression coverage through the marshalled transport path.
 - The control plane now also exposes outbound authenticated transport through `swg:ctl::SendPacket`, `Client::SendPacket()`, and `AppSession::SendPacket()`, and host regression coverage now validates an app-session payload end to end against a local responder.
+- The engine now performs a bounded reconnect with backoff when an outbound authenticated transport send hits an I/O failure, and a scripted host runtime test verifies that it re-handshakes and retries the payload successfully.
 - A manual host live-handshake probe now loads a real config file and runs the same local-control-service `Connect()` path against a live endpoint for off-device handshake validation.
 - The BSD runtime now prefers libnx's `bsd:u` defaults and emits staged on-device diagnostics for service access, transfer-memory setup, client registration, and monitor startup when initialization fails.
 - The sysmodule runtime now allocates a 4 MiB process heap through `svcSetHeapSize`, and BSD startup diagnostics report that heap budget alongside the required transfer-memory size after the old 512 KiB inner heap proved too small.
@@ -36,9 +37,9 @@
 ## Next slices
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
-- Add WireGuard cookie reply handling and a bounded retry policy on top of the current one-shot handshake path.
+- Add WireGuard cookie reply handling on top of the current one-shot handshake path.
 - Extend the new authenticated transport path into a broader sustained packet loop with clearer session-liveness rules.
-- Add reconnect/backoff policy beyond the current bounded handshake retry.
+- Expand reconnect handling beyond outbound send failures so receive-side and idle-liveness failures can recover too.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Add real tunnel-aware DNS resolution results for app consumers.
 - Add a Tesla frontend target later, once the manager-first path and tunnel milestones are stable and libtesla is wired into the build.

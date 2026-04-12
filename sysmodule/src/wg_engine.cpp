@@ -5,6 +5,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "swg_sysmodule/socket_runtime.h"
 
@@ -23,6 +24,9 @@ namespace {
 
 constexpr std::uint32_t kHandshakeResponseTimeoutMs = 5000;
 constexpr std::uint32_t kHandshakeRetryCount = 2;
+constexpr std::uint32_t kReconnectRetryCount = 3;
+constexpr std::uint32_t kReconnectInitialBackoffMs = 100;
+constexpr std::uint32_t kReconnectMaxBackoffMs = 1000;
 constexpr std::uint32_t kTransportReceiveTimeoutMs = 250;
 constexpr std::size_t kMaxQueuedTransportPackets = 8;
 constexpr std::size_t kMaxQueuedTransportPayloadBytes = 8 * 1024;
@@ -120,10 +124,23 @@ struct ReservedTransportSend {
   int socket_fd = -1;
 };
 
+struct EstablishedTransportSession {
+  PreparedTunnelSession session;
+  int udp_socket = -1;
+  std::uint32_t local_sender_index = 0;
+  std::uint32_t peer_sender_index = 0;
+  WireGuardKey sending_key{};
+  WireGuardKey receiving_key{};
+  TunnelStats stats{};
+};
+
 class WgTunnelEngine final : public IWgTunnelEngine {
  public:
+  explicit WgTunnelEngine(std::unique_ptr<IUdpSocketRuntime> socket_runtime)
+      : socket_runtime_(std::move(socket_runtime)) {}
+
   ~WgTunnelEngine() override {
-    if (running_ || keepalive_thread_.joinable() || receive_thread_.joinable()) {
+    if (running_ || keepalive_thread_.joinable() || receive_thread_.joinable() || socket_runtime_->IsStarted()) {
       Stop();
     }
   }
@@ -133,213 +150,34 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       return MakeError(ErrorCode::InvalidState, "WireGuard engine is already running");
     }
 
-    const Error runtime_error = socket_runtime_.Start();
+    const Error runtime_error = socket_runtime_->Start();
     if (runtime_error) {
       return runtime_error;
     }
 
-    const Result<PreparedTunnelSession> resolved_session = ResolvePreparedTunnelSessionEndpoint(request.session);
-    if (!resolved_session.ok()) {
-      socket_runtime_.Stop();
-      return resolved_session.error;
+    const Result<EstablishedTransportSession> established = EstablishTransportSession(request.session);
+    if (!established.ok()) {
+      socket_runtime_->Stop();
+      return established.error;
     }
-
-    const Result<int> socket_result = socket_runtime_.OpenUdpSocket();
-    if (!socket_result.ok()) {
-      socket_runtime_.Stop();
-      return socket_result.error;
-    }
-
-    const WireGuardHandshakeConfig handshake_config = {
-        resolved_session.value.private_key,
-        resolved_session.value.local_public_key,
-        resolved_session.value.public_key,
-        resolved_session.value.preshared_key,
-        resolved_session.value.has_preshared_key,
-    };
-
-    const std::string endpoint_description = DescribeResolvedEndpoint(resolved_session.value.endpoint);
-    const std::string local_public_key_b64 = EncodeBase64(resolved_session.value.local_public_key);
-    const std::string peer_public_key_b64 = EncodeBase64(resolved_session.value.public_key);
-    LogInfo("wg_engine", "starting handshake for profile " + resolved_session.value.profile_name +
-                              ": endpoint=" + endpoint_description +
-                              ", local_public_key=" + local_public_key_b64 +
-                              ", peer_public_key=" + peer_public_key_b64 +
-                              ", preshared_key=" + (resolved_session.value.has_preshared_key ? "enabled" : "disabled"));
-
-    std::size_t total_bytes_sent = 0;
-    std::size_t total_packets_sent = 0;
-    Error last_timeout_error = MakeError(ErrorCode::IoError, "WireGuard response did not arrive");
-    Result<WireGuardValidatedHandshake> validated =
-        Result<WireGuardValidatedHandshake>::Failure(MakeError(ErrorCode::IoError, "WireGuard response missing"));
-    std::size_t final_bytes_received = 0;
-
-    for (std::uint32_t attempt = 1; attempt <= kHandshakeRetryCount; ++attempt) {
-      const Result<WireGuardHandshakeInitiation> initiation = CreateHandshakeInitiation(handshake_config);
-      if (!initiation.ok()) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(initiation.error.code,
-                         "WireGuard initiation build failed: " + initiation.error.message);
-      }
-
-      LogInfo("wg_engine", "sending WireGuard initiation attempt " + std::to_string(attempt) + "/" +
-                                std::to_string(kHandshakeRetryCount) +
-                                ": sender_index=" + std::to_string(initiation.value.state.sender_index) +
-                                ", endpoint=" + endpoint_description);
-
-      const Result<std::size_t> bytes_sent = socket_runtime_.SendTo(socket_result.value, resolved_session.value.endpoint,
-                                                                    initiation.value.packet.data(), initiation.value.packet.size());
-      if (!bytes_sent.ok()) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(bytes_sent.error.code,
-                         "WireGuard initiation send failed: " + bytes_sent.error.message);
-      }
-      if (bytes_sent.value != initiation.value.packet.size()) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(ErrorCode::IoError,
-                         "WireGuard initiation send returned a short datagram for endpoint " +
-                             endpoint_description);
-      }
-
-      total_bytes_sent += bytes_sent.value;
-      ++total_packets_sent;
-
-      std::array<std::uint8_t, kMaxHandshakeDatagramSize> response_buffer{};
-      const Result<ReceivedUdpDatagram> received =
-          socket_runtime_.ReceiveFrom(socket_result.value, response_buffer.data(), response_buffer.size(),
-                                      kHandshakeResponseTimeoutMs);
-      if (!received.ok()) {
-        last_timeout_error = MakeError(received.error.code,
-                                       "waiting for WireGuard response failed for endpoint " + endpoint_description +
-                                           ": " + received.error.message +
-                                           "; verify the server has peer public key " + local_public_key_b64 +
-                                           " configured and that the endpoint/port is correct");
-        if (attempt < kHandshakeRetryCount) {
-          LogWarning("wg_engine", "WireGuard initiation attempt " + std::to_string(attempt) + " timed out: " +
-                                      received.error.message + "; retrying");
-          continue;
-        }
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return last_timeout_error;
-      }
-
-      if (received.value.size == 0) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(ErrorCode::IoError, "received an empty WireGuard UDP datagram from " + endpoint_description);
-      }
-
-      const std::string reply_source = DescribeReplySource(received.value);
-      if (reply_source != endpoint_description) {
-        LogInfo("wg_engine", "received WireGuard UDP reply from " + reply_source +
-                                 " while probing configured endpoint " + endpoint_description);
-      }
-
-      final_bytes_received = received.value.size;
-      const auto message_type = static_cast<WireGuardMessageType>(response_buffer[0]);
-      if (message_type == WireGuardMessageType::CookieReply) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(ErrorCode::Unsupported,
-                         "received a WireGuard cookie reply from " + reply_source +
-                             "; cookie handling is not implemented yet");
-      }
-      if (message_type != WireGuardMessageType::HandshakeResponse) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(ErrorCode::ParseError,
-                         "received an unexpected WireGuard message type during handshake from " + reply_source);
-      }
-
-      validated = ConsumeHandshakeResponse(handshake_config, initiation.value.state, response_buffer.data(),
-                                           received.value.size);
-      if (!validated.ok()) {
-        socket_runtime_.CloseSocket(socket_result.value);
-        socket_runtime_.Stop();
-        return MakeError(validated.error.code,
-                         "WireGuard handshake response validation failed from " + reply_source + ": " +
-                             validated.error.message);
-      }
-
-      resolved_response_endpoint_ = resolved_session.value.endpoint;
-      resolved_response_endpoint_.ipv4 = received.value.source_ipv4;
-      resolved_response_endpoint_.port = received.value.source_port;
-
-      break;
-    }
-
-    if (!validated.ok()) {
-      socket_runtime_.CloseSocket(socket_result.value);
-      socket_runtime_.Stop();
-      return last_timeout_error;
-    }
-
-    const PreparedTunnelEndpoint authenticated_endpoint =
-        resolved_response_endpoint_.state == PreparedEndpointState::Ready ? resolved_response_endpoint_
-                                                                          : resolved_session.value.endpoint;
-    const Result<WireGuardTransportKeepalive> keepalive =
-        CreateTransportKeepalivePacket(validated.value.sending_key, validated.value.peer_sender_index,
-                                       next_send_counter_);
-    if (!keepalive.ok()) {
-      socket_runtime_.CloseSocket(socket_result.value);
-      socket_runtime_.Stop();
-      return MakeError(keepalive.error.code,
-                       "failed to build post-handshake keepalive packet: " + keepalive.error.message);
-    }
-
-    LogInfo("wg_engine", "sending post-handshake keepalive: receiver_index=" +
-                              std::to_string(validated.value.peer_sender_index) +
-                              ", counter=" + std::to_string(next_send_counter_) +
-                              ", endpoint=" + DescribeResolvedEndpoint(authenticated_endpoint));
-
-    const Result<std::size_t> keepalive_bytes_sent =
-        socket_runtime_.SendTo(socket_result.value, authenticated_endpoint,
-                               keepalive.value.packet.data(), keepalive.value.packet.size());
-    if (!keepalive_bytes_sent.ok()) {
-      socket_runtime_.CloseSocket(socket_result.value);
-      socket_runtime_.Stop();
-      return MakeError(keepalive_bytes_sent.error.code,
-                       "failed to send post-handshake keepalive packet: " + keepalive_bytes_sent.error.message);
-    }
-    if (keepalive_bytes_sent.value != keepalive.value.packet.size()) {
-      socket_runtime_.CloseSocket(socket_result.value);
-      socket_runtime_.Stop();
-      return MakeError(ErrorCode::IoError,
-                       "post-handshake keepalive send returned a short datagram for endpoint " +
-                           DescribeResolvedEndpoint(authenticated_endpoint));
-    }
-
-    total_bytes_sent += keepalive_bytes_sent.value;
-    ++total_packets_sent;
-    ++next_send_counter_;
 
     {
       std::scoped_lock lock(engine_mutex_);
-      udp_socket_ = socket_result.value;
-      active_profile_ = resolved_session.value.profile_name;
-      prepared_session_ = resolved_session.value;
-      if (resolved_response_endpoint_.state == PreparedEndpointState::Ready) {
-        prepared_session_.endpoint = resolved_response_endpoint_;
-      }
-      local_sender_index_ = validated.value.local_sender_index;
-      peer_sender_index_ = validated.value.peer_sender_index;
-      sending_key_ = validated.value.sending_key;
-      receiving_key_ = validated.value.receiving_key;
-      stats_ = {};
-      stats_.bytes_out = total_bytes_sent;
-      stats_.bytes_in = final_bytes_received;
-      stats_.packets_out = total_packets_sent;
-      stats_.packets_in = 1;
-      stats_.successful_handshakes = 1;
+      udp_socket_ = established.value.udp_socket;
+      active_profile_ = established.value.session.profile_name;
+      prepared_session_ = established.value.session;
+      resolved_response_endpoint_ = established.value.session.endpoint;
+      local_sender_index_ = established.value.local_sender_index;
+      peer_sender_index_ = established.value.peer_sender_index;
+      sending_key_ = established.value.sending_key;
+      receiving_key_ = established.value.receiving_key;
+      stats_ = established.value.stats;
       next_send_counter_ = 1;
       next_receive_counter_ = 0;
       last_handshake_at_ = std::chrono::steady_clock::now();
       running_ = true;
       stop_requested_ = false;
+      last_error_.clear();
     }
 
     receive_thread_ = std::thread([this]() {
@@ -360,7 +198,8 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   Error Stop() override {
     {
       std::scoped_lock lock(engine_mutex_);
-      if (!running_ && !keepalive_thread_.joinable() && !receive_thread_.joinable()) {
+      if (!running_ && !keepalive_thread_.joinable() && !receive_thread_.joinable() && !socket_runtime_->IsStarted() &&
+          udp_socket_ < 0) {
         return Error::None();
       }
 
@@ -376,8 +215,11 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       keepalive_thread_.join();
     }
 
-    socket_runtime_.CloseSocket(udp_socket_);
-    socket_runtime_.Stop();
+    {
+      std::scoped_lock send_lock(transport_send_mutex_);
+      socket_runtime_->CloseSocket(udp_socket_);
+    }
+    socket_runtime_->Stop();
 
     {
       std::scoped_lock lock(engine_mutex_);
@@ -397,6 +239,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       receive_queue_overflow_logged_ = false;
       stop_requested_ = false;
       last_handshake_at_ = {};
+      last_error_.clear();
     }
 
     return Error::None();
@@ -431,7 +274,39 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     const Result<std::size_t> bytes_sent = SendReservedTransportDatagram(reserved.value, packet.value.packet.data(),
                                                                          packet.value.packet.size());
     if (!bytes_sent.ok()) {
-      return MakeFailure<std::uint64_t>(bytes_sent.error.code, bytes_sent.error.message);
+      if (bytes_sent.error.code != ErrorCode::IoError) {
+        return MakeFailure<std::uint64_t>(bytes_sent.error.code, bytes_sent.error.message);
+      }
+
+      const Error reconnect_error = ReconnectWithBackoff("authenticated transport send failed: " +
+                                                         bytes_sent.error.message);
+      if (reconnect_error) {
+        return MakeFailure<std::uint64_t>(reconnect_error.code, reconnect_error.message);
+      }
+
+      const Result<ReservedTransportSend> retry_reserved = ReserveTransportSend();
+      if (!retry_reserved.ok()) {
+        return MakeFailure<std::uint64_t>(retry_reserved.error.code, retry_reserved.error.message);
+      }
+
+      const Result<WireGuardTransportPacket> retry_packet = CreateTransportPacket(
+          retry_reserved.value.sending_key, retry_reserved.value.peer_sender_index, payload, retry_reserved.value.counter);
+      if (!retry_packet.ok()) {
+        return MakeFailure<std::uint64_t>(retry_packet.error.code, retry_packet.error.message);
+      }
+      if (retry_packet.value.packet.size() > kMaxTransportDatagramSize) {
+        return MakeFailure<std::uint64_t>(ErrorCode::Unsupported,
+                                          "authenticated transport datagram exceeds the current bounded send limit");
+      }
+
+      const Result<std::size_t> retry_bytes_sent = SendReservedTransportDatagram(
+          retry_reserved.value, retry_packet.value.packet.data(), retry_packet.value.packet.size());
+      if (!retry_bytes_sent.ok()) {
+        return MakeFailure<std::uint64_t>(retry_bytes_sent.error.code, retry_bytes_sent.error.message);
+      }
+
+      RecordSuccessfulOutboundDatagram(retry_bytes_sent.value);
+      return MakeSuccess(retry_reserved.value.counter);
     }
 
     RecordSuccessfulOutboundDatagram(bytes_sent.value);
@@ -457,12 +332,17 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   TunnelStats GetStats() const override {
     std::scoped_lock lock(engine_mutex_);
     TunnelStats stats = stats_;
-    if (running_ && stats.successful_handshakes != 0) {
+    if (stats.successful_handshakes != 0 && last_handshake_at_ != std::chrono::steady_clock::time_point{}) {
       stats.last_handshake_age_seconds = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - last_handshake_at_)
               .count());
     }
     return stats;
+  }
+
+  std::string GetLastError() const override {
+    std::scoped_lock lock(engine_mutex_);
+    return last_error_;
   }
 
   bool IsRunning() const override {
@@ -471,10 +351,190 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   }
 
  private:
+  Result<EstablishedTransportSession> EstablishTransportSession(const PreparedTunnelSession& requested_session) {
+    const Result<PreparedTunnelSession> resolved_session = ResolvePreparedTunnelSessionEndpoint(requested_session);
+    if (!resolved_session.ok()) {
+      return MakeFailure<EstablishedTransportSession>(resolved_session.error.code, resolved_session.error.message);
+    }
+
+    const Result<int> socket_result = socket_runtime_->OpenUdpSocket();
+    if (!socket_result.ok()) {
+      return MakeFailure<EstablishedTransportSession>(socket_result.error.code, socket_result.error.message);
+    }
+
+    const WireGuardHandshakeConfig handshake_config = {
+        resolved_session.value.private_key,
+        resolved_session.value.local_public_key,
+        resolved_session.value.public_key,
+        resolved_session.value.preshared_key,
+        resolved_session.value.has_preshared_key,
+    };
+
+    const std::string endpoint_description = DescribeResolvedEndpoint(resolved_session.value.endpoint);
+    const std::string local_public_key_b64 = EncodeBase64(resolved_session.value.local_public_key);
+    const std::string peer_public_key_b64 = EncodeBase64(resolved_session.value.public_key);
+    LogInfo("wg_engine", "starting handshake for profile " + resolved_session.value.profile_name +
+                              ": endpoint=" + endpoint_description +
+                              ", local_public_key=" + local_public_key_b64 +
+                              ", peer_public_key=" + peer_public_key_b64 +
+                              ", preshared_key=" + (resolved_session.value.has_preshared_key ? "enabled" : "disabled"));
+
+    std::size_t total_bytes_sent = 0;
+    std::size_t total_packets_sent = 0;
+    Error last_timeout_error = MakeError(ErrorCode::IoError, "WireGuard response did not arrive");
+    Result<WireGuardValidatedHandshake> validated =
+        Result<WireGuardValidatedHandshake>::Failure(MakeError(ErrorCode::IoError, "WireGuard response missing"));
+    std::size_t final_bytes_received = 0;
+    PreparedTunnelEndpoint authenticated_endpoint = resolved_session.value.endpoint;
+
+    for (std::uint32_t attempt = 1; attempt <= kHandshakeRetryCount; ++attempt) {
+      const Result<WireGuardHandshakeInitiation> initiation = CreateHandshakeInitiation(handshake_config);
+      if (!initiation.ok()) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(initiation.error.code,
+                                                        "WireGuard initiation build failed: " + initiation.error.message);
+      }
+
+      LogInfo("wg_engine", "sending WireGuard initiation attempt " + std::to_string(attempt) + "/" +
+                                std::to_string(kHandshakeRetryCount) +
+                                ": sender_index=" + std::to_string(initiation.value.state.sender_index) +
+                                ", endpoint=" + endpoint_description);
+
+      const Result<std::size_t> bytes_sent = socket_runtime_->SendTo(socket_result.value, resolved_session.value.endpoint,
+                                                                     initiation.value.packet.data(), initiation.value.packet.size());
+      if (!bytes_sent.ok()) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(bytes_sent.error.code,
+                                                        "WireGuard initiation send failed: " + bytes_sent.error.message);
+      }
+      if (bytes_sent.value != initiation.value.packet.size()) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(ErrorCode::IoError,
+                                                        "WireGuard initiation send returned a short datagram for endpoint " +
+                                                            endpoint_description);
+      }
+
+      total_bytes_sent += bytes_sent.value;
+      ++total_packets_sent;
+
+      std::array<std::uint8_t, kMaxHandshakeDatagramSize> response_buffer{};
+      const Result<ReceivedUdpDatagram> received =
+          socket_runtime_->ReceiveFrom(socket_result.value, response_buffer.data(), response_buffer.size(),
+                                       kHandshakeResponseTimeoutMs);
+      if (!received.ok()) {
+        last_timeout_error = MakeError(received.error.code,
+                                       "waiting for WireGuard response failed for endpoint " + endpoint_description +
+                                           ": " + received.error.message +
+                                           "; verify the server has peer public key " + local_public_key_b64 +
+                                           " configured and that the endpoint/port is correct");
+        if (attempt < kHandshakeRetryCount) {
+          LogWarning("wg_engine", "WireGuard initiation attempt " + std::to_string(attempt) + " timed out: " +
+                                      received.error.message + "; retrying");
+          continue;
+        }
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(last_timeout_error.code, last_timeout_error.message);
+      }
+
+      if (received.value.size == 0) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(ErrorCode::IoError,
+                                                        "received an empty WireGuard UDP datagram from " + endpoint_description);
+      }
+
+      const std::string reply_source = DescribeReplySource(received.value);
+      if (reply_source != endpoint_description) {
+        LogInfo("wg_engine", "received WireGuard UDP reply from " + reply_source +
+                                 " while probing configured endpoint " + endpoint_description);
+      }
+
+      final_bytes_received = received.value.size;
+      const auto message_type = static_cast<WireGuardMessageType>(response_buffer[0]);
+      if (message_type == WireGuardMessageType::CookieReply) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(ErrorCode::Unsupported,
+                                                        "received a WireGuard cookie reply from " + reply_source +
+                                                            "; cookie handling is not implemented yet");
+      }
+      if (message_type != WireGuardMessageType::HandshakeResponse) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(ErrorCode::ParseError,
+                                                        "received an unexpected WireGuard message type during handshake from " +
+                                                            reply_source);
+      }
+
+      validated = ConsumeHandshakeResponse(handshake_config, initiation.value.state, response_buffer.data(),
+                                           received.value.size);
+      if (!validated.ok()) {
+        socket_runtime_->CloseSocket(socket_result.value);
+        return MakeFailure<EstablishedTransportSession>(validated.error.code,
+                                                        "WireGuard handshake response validation failed from " +
+                                                            reply_source + ": " + validated.error.message);
+      }
+
+      authenticated_endpoint = resolved_session.value.endpoint;
+      authenticated_endpoint.ipv4 = received.value.source_ipv4;
+      authenticated_endpoint.port = received.value.source_port;
+      break;
+    }
+
+    if (!validated.ok()) {
+      socket_runtime_->CloseSocket(socket_result.value);
+      return MakeFailure<EstablishedTransportSession>(last_timeout_error.code, last_timeout_error.message);
+    }
+
+    const Result<WireGuardTransportKeepalive> keepalive =
+        CreateTransportKeepalivePacket(validated.value.sending_key, validated.value.peer_sender_index, 0);
+    if (!keepalive.ok()) {
+      socket_runtime_->CloseSocket(socket_result.value);
+      return MakeFailure<EstablishedTransportSession>(keepalive.error.code,
+                                                      "failed to build post-handshake keepalive packet: " + keepalive.error.message);
+    }
+
+    LogInfo("wg_engine", "sending post-handshake keepalive: receiver_index=" +
+                              std::to_string(validated.value.peer_sender_index) +
+                              ", counter=0, endpoint=" + DescribeResolvedEndpoint(authenticated_endpoint));
+
+    const Result<std::size_t> keepalive_bytes_sent =
+        socket_runtime_->SendTo(socket_result.value, authenticated_endpoint,
+                                keepalive.value.packet.data(), keepalive.value.packet.size());
+    if (!keepalive_bytes_sent.ok()) {
+      socket_runtime_->CloseSocket(socket_result.value);
+      return MakeFailure<EstablishedTransportSession>(keepalive_bytes_sent.error.code,
+                                                      "failed to send post-handshake keepalive packet: " +
+                                                          keepalive_bytes_sent.error.message);
+    }
+    if (keepalive_bytes_sent.value != keepalive.value.packet.size()) {
+      socket_runtime_->CloseSocket(socket_result.value);
+      return MakeFailure<EstablishedTransportSession>(ErrorCode::IoError,
+                                                      "post-handshake keepalive send returned a short datagram for endpoint " +
+                                                          DescribeResolvedEndpoint(authenticated_endpoint));
+    }
+
+    total_bytes_sent += keepalive_bytes_sent.value;
+    ++total_packets_sent;
+
+    EstablishedTransportSession established{};
+    established.session = resolved_session.value;
+    established.session.endpoint = authenticated_endpoint;
+    established.udp_socket = socket_result.value;
+    established.local_sender_index = validated.value.local_sender_index;
+    established.peer_sender_index = validated.value.peer_sender_index;
+    established.sending_key = validated.value.sending_key;
+    established.receiving_key = validated.value.receiving_key;
+    established.stats.bytes_out = total_bytes_sent;
+    established.stats.bytes_in = final_bytes_received;
+    established.stats.packets_out = total_packets_sent;
+    established.stats.packets_in = 1;
+    established.stats.successful_handshakes = 1;
+    return MakeSuccess(std::move(established));
+  }
+
   Result<ReservedTransportSend> ReserveTransportSend() {
     std::scoped_lock lock(engine_mutex_);
     if (!running_ || stop_requested_ || udp_socket_ < 0) {
-      return MakeFailure<ReservedTransportSend>(ErrorCode::InvalidState, "WireGuard transport is not running");
+      const std::string message = last_error_.empty() ? "WireGuard transport is not running" : last_error_;
+      return MakeFailure<ReservedTransportSend>(ErrorCode::InvalidState, message);
     }
 
     ReservedTransportSend reserved{};
@@ -491,7 +551,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
                                                     std::size_t size) {
     std::scoped_lock send_lock(transport_send_mutex_);
     const Result<std::size_t> bytes_sent =
-        socket_runtime_.SendTo(reserved.socket_fd, reserved.endpoint, data, size);
+        socket_runtime_->SendTo(reserved.socket_fd, reserved.endpoint, data, size);
     if (!bytes_sent.ok()) {
       return MakeFailure<std::size_t>(bytes_sent.error.code, bytes_sent.error.message);
     }
@@ -508,6 +568,107 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     std::scoped_lock lock(engine_mutex_);
     stats_.bytes_out += bytes_sent;
     ++stats_.packets_out;
+  }
+
+  Error ReconnectWithBackoff(const std::string& reason) {
+    std::scoped_lock reconnect_lock(reconnect_mutex_);
+
+    PreparedTunnelSession session{};
+    {
+      std::scoped_lock lock(engine_mutex_);
+      if (!running_) {
+        return MakeError(ErrorCode::InvalidState,
+                         last_error_.empty() ? "WireGuard transport is not running" : last_error_);
+      }
+
+      session = prepared_session_;
+      running_ = false;
+      last_error_ = reason;
+    }
+
+    keepalive_cv_.notify_all();
+    if (receive_thread_.joinable()) {
+      receive_thread_.join();
+    }
+    if (keepalive_thread_.joinable()) {
+      keepalive_thread_.join();
+    }
+
+    {
+      std::scoped_lock send_lock(transport_send_mutex_);
+      socket_runtime_->CloseSocket(udp_socket_);
+    }
+    {
+      std::scoped_lock lock(engine_mutex_);
+      udp_socket_ = -1;
+    }
+
+    Error last_error = MakeError(ErrorCode::IoError, reason);
+    std::uint32_t backoff_ms = kReconnectInitialBackoffMs;
+    for (std::uint32_t attempt = 1; attempt <= kReconnectRetryCount; ++attempt) {
+      if (attempt > 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        backoff_ms = std::min(backoff_ms * 2, kReconnectMaxBackoffMs);
+      }
+
+      if (!socket_runtime_->IsStarted()) {
+        const Error runtime_error = socket_runtime_->Start();
+        if (runtime_error) {
+          last_error = runtime_error;
+          continue;
+        }
+      }
+
+      const Result<EstablishedTransportSession> established = EstablishTransportSession(session);
+      if (!established.ok()) {
+        last_error = established.error;
+        LogWarning("wg_engine", "bounded reconnect attempt " + std::to_string(attempt) + "/" +
+                                    std::to_string(kReconnectRetryCount) + " failed: " + established.error.message);
+        continue;
+      }
+
+      {
+        std::scoped_lock lock(engine_mutex_);
+        udp_socket_ = established.value.udp_socket;
+        active_profile_ = established.value.session.profile_name;
+        prepared_session_ = established.value.session;
+        resolved_response_endpoint_ = established.value.session.endpoint;
+        local_sender_index_ = established.value.local_sender_index;
+        peer_sender_index_ = established.value.peer_sender_index;
+        sending_key_ = established.value.sending_key;
+        receiving_key_ = established.value.receiving_key;
+        stats_.bytes_in += established.value.stats.bytes_in;
+        stats_.bytes_out += established.value.stats.bytes_out;
+        stats_.packets_in += established.value.stats.packets_in;
+        stats_.packets_out += established.value.stats.packets_out;
+        stats_.successful_handshakes += established.value.stats.successful_handshakes;
+        ++stats_.reconnects;
+        next_send_counter_ = 1;
+        next_receive_counter_ = 0;
+        last_handshake_at_ = std::chrono::steady_clock::now();
+        running_ = true;
+        last_error_.clear();
+      }
+
+      receive_thread_ = std::thread([this]() {
+        ReceiveLoop();
+      });
+      if (prepared_session_.persistent_keepalive != 0) {
+        keepalive_thread_ = std::thread([this]() {
+          KeepaliveLoop();
+        });
+      }
+
+      LogInfo("wg_engine", "bounded reconnect succeeded after transport failure: attempt " +
+                                std::to_string(attempt) + "/" + std::to_string(kReconnectRetryCount));
+      return Error::None();
+    }
+
+    {
+      std::scoped_lock lock(engine_mutex_);
+      last_error_ = "bounded reconnect failed: " + last_error.message;
+    }
+    return MakeError(last_error.code, "bounded reconnect failed: " + last_error.message);
   }
 
   void ReceiveLoop() {
@@ -532,7 +693,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
       }
 
       const Result<ReceivedUdpDatagram> received =
-          socket_runtime_.ReceiveFrom(socket_fd, buffer.data(), buffer.size(), kTransportReceiveTimeoutMs);
+          socket_runtime_->ReceiveFrom(socket_fd, buffer.data(), buffer.size(), kTransportReceiveTimeoutMs);
       if (!received.ok()) {
         if (IsReceiveTimeout(received.error)) {
           continue;
@@ -654,9 +815,10 @@ class WgTunnelEngine final : public IWgTunnelEngine {
     }
   }
 
-  BsdSocketRuntime socket_runtime_{};
+  std::unique_ptr<IUdpSocketRuntime> socket_runtime_;
   mutable std::mutex engine_mutex_{};
   std::mutex transport_send_mutex_{};
+  std::mutex reconnect_mutex_{};
   std::condition_variable keepalive_cv_{};
   std::thread keepalive_thread_{};
   std::thread receive_thread_{};
@@ -676,6 +838,7 @@ class WgTunnelEngine final : public IWgTunnelEngine {
   bool receive_queue_overflow_logged_ = false;
   bool stop_requested_ = false;
   std::chrono::steady_clock::time_point last_handshake_at_{};
+  std::string last_error_;
   bool running_ = false;
 };
 
@@ -834,7 +997,11 @@ std::string DescribePreparedTunnelSession(const PreparedTunnelSession& session) 
 }
 
 std::unique_ptr<IWgTunnelEngine> CreateWgTunnelEngine() {
-  return std::make_unique<WgTunnelEngine>();
+  return std::make_unique<WgTunnelEngine>(std::make_unique<BsdSocketRuntime>());
+}
+
+std::unique_ptr<IWgTunnelEngine> CreateWgTunnelEngine(std::unique_ptr<IUdpSocketRuntime> socket_runtime) {
+  return std::make_unique<WgTunnelEngine>(std::move(socket_runtime));
 }
 
 }  // namespace swg::sysmodule

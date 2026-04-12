@@ -13,6 +13,8 @@
 
 namespace swg::sysmodule {
 
+class IUdpSocketRuntime;
+
 enum class PreparedEndpointState : std::uint32_t {
   Ready = 0,
   NeedsIpv4Resolution,
@@ -70,9 +72,11 @@ class IWgTunnelEngine {
   [[nodiscard]] virtual Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) = 0;
   [[nodiscard]] virtual Result<WireGuardConsumedTransportPacket> ReceivePacket() = 0;
   [[nodiscard]] virtual TunnelStats GetStats() const = 0;
+  [[nodiscard]] virtual std::string GetLastError() const = 0;
   [[nodiscard]] virtual bool IsRunning() const = 0;
 };
 
 std::unique_ptr<IWgTunnelEngine> CreateWgTunnelEngine();
+std::unique_ptr<IWgTunnelEngine> CreateWgTunnelEngine(std::unique_ptr<IUdpSocketRuntime> socket_runtime);
 
 }  // namespace swg::sysmodule

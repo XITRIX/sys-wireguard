@@ -24,6 +24,7 @@
 #include "swg_sysmodule/wg_engine.h"
 #include "swg_sysmodule/host_transport.h"
 #include "swg_sysmodule/local_service.h"
+#include "swg_sysmodule/socket_runtime.h"
 
 namespace {
 
@@ -355,6 +356,190 @@ class LocalHandshakeResponder {
   std::vector<std::uint8_t> expected_outbound_transport_payload_{};
   bool outbound_transport_validated_ = false;
   std::string error_{};
+};
+
+class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRuntime {
+ public:
+  explicit ScriptedReconnectSocketRuntime(swg::sysmodule::PreparedTunnelEndpoint endpoint,
+                                          std::vector<std::uint8_t> expected_payload)
+      : endpoint_(std::move(endpoint)), expected_payload_(std::move(expected_payload)) {
+    responder_config_result_ = MakeHandshakeResponderConfig();
+  }
+
+  swg::Error Start() override {
+    if (!responder_config_result_.ok()) {
+      return responder_config_result_.error;
+    }
+
+    started_ = true;
+    return swg::Error::None();
+  }
+
+  void Stop() override {
+    std::scoped_lock lock(mutex_);
+    started_ = false;
+    pending_response_.clear();
+    current_response_.reset();
+    active_socket_ = -1;
+  }
+
+  [[nodiscard]] bool IsStarted() const override {
+    std::scoped_lock lock(mutex_);
+    return started_;
+  }
+
+  swg::Result<int> OpenUdpSocket() const override {
+    std::scoped_lock lock(mutex_);
+    if (!started_) {
+      return swg::MakeFailure<int>(swg::ErrorCode::InvalidState, "scripted runtime is not initialized");
+    }
+
+    return swg::MakeSuccess(next_socket_++);
+  }
+
+  swg::Result<std::size_t> SendTo(int socket_fd,
+                                  const swg::sysmodule::PreparedTunnelEndpoint& endpoint,
+                                  const std::uint8_t* buffer,
+                                  std::size_t size) const override {
+    std::scoped_lock lock(mutex_);
+    if (!started_) {
+      return swg::MakeFailure<std::size_t>(swg::ErrorCode::InvalidState, "scripted runtime is not initialized");
+    }
+    if (endpoint.port != endpoint_.port || endpoint.ipv4 != endpoint_.ipv4) {
+      return swg::MakeFailure<std::size_t>(swg::ErrorCode::IoError, "scripted runtime received an unexpected endpoint");
+    }
+    if (!responder_config_result_.ok()) {
+      return swg::MakeFailure<std::size_t>(responder_config_result_.error.code, responder_config_result_.error.message);
+    }
+    if (size == 0) {
+      return swg::MakeFailure<std::size_t>(swg::ErrorCode::ParseError, "scripted runtime received an empty datagram");
+    }
+
+    const auto message_type = static_cast<swg::WireGuardMessageType>(buffer[0]);
+    switch (message_type) {
+      case swg::WireGuardMessageType::HandshakeInitiation: {
+        const auto response = swg::RespondToHandshakeInitiationForTest(
+            responder_config_result_.value, buffer, size,
+            swg::WireGuardHandshakeResponseOptions{.sender_index = static_cast<std::uint32_t>(0x4000u + handshake_count_)});
+        if (!response.ok()) {
+          return swg::MakeFailure<std::size_t>(response.error.code, response.error.message);
+        }
+
+        pending_response_ = std::vector<std::uint8_t>(response.value.packet.begin(), response.value.packet.end());
+        current_response_ = response.value;
+        active_socket_ = socket_fd;
+        awaiting_post_handshake_keepalive_ = true;
+        ++handshake_count_;
+        return swg::MakeSuccess(size);
+      }
+      case swg::WireGuardMessageType::Data: {
+        if (!current_response_.has_value()) {
+          return swg::MakeFailure<std::size_t>(swg::ErrorCode::ParseError,
+                                               "scripted runtime received transport data before a handshake response");
+        }
+
+        const auto packet = swg::ConsumeTransportPacket(current_response_->receiving_key, current_response_->sender_index,
+                                                        buffer, size);
+        if (!packet.ok()) {
+          return swg::MakeFailure<std::size_t>(packet.error.code, packet.error.message);
+        }
+
+        if (awaiting_post_handshake_keepalive_) {
+          if (packet.value.counter != 0 || !packet.value.payload.empty()) {
+            return swg::MakeFailure<std::size_t>(swg::ErrorCode::ParseError,
+                                                 "scripted runtime expected the post-handshake keepalive first");
+          }
+          awaiting_post_handshake_keepalive_ = false;
+          return swg::MakeSuccess(size);
+        }
+
+        if (!failed_send_once_) {
+          failed_send_once_ = true;
+          return swg::MakeFailure<std::size_t>(swg::ErrorCode::IoError,
+                                               "scripted outbound transport failure to trigger reconnect");
+        }
+
+        if (packet.value.counter != 1) {
+          return swg::MakeFailure<std::size_t>(swg::ErrorCode::ParseError,
+                                               "scripted runtime observed an unexpected outbound transport counter");
+        }
+        if (packet.value.payload != expected_payload_) {
+          return swg::MakeFailure<std::size_t>(swg::ErrorCode::ParseError,
+                                               "scripted runtime observed unexpected outbound transport payload bytes");
+        }
+
+        outbound_payload_validated_ = true;
+        return swg::MakeSuccess(size);
+      }
+      default:
+        return swg::MakeFailure<std::size_t>(swg::ErrorCode::Unsupported,
+                                             "scripted runtime observed an unsupported WireGuard message type");
+    }
+  }
+
+  swg::Result<swg::sysmodule::ReceivedUdpDatagram> ReceiveFrom(int socket_fd,
+                                                               std::uint8_t* buffer,
+                                                               std::size_t size,
+                                                               std::uint32_t timeout_ms) const override {
+    std::scoped_lock lock(mutex_);
+    if (!started_) {
+      return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::InvalidState,
+                                                                   "scripted runtime is not initialized");
+    }
+    if (socket_fd != active_socket_) {
+      return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::IoError,
+                                                                   "scripted runtime received from an unexpected socket");
+    }
+    if (pending_response_.empty()) {
+      return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::IoError,
+                                                                   "recv timed out after " + std::to_string(timeout_ms) + "ms");
+    }
+    if (size < pending_response_.size()) {
+      return swg::MakeFailure<swg::sysmodule::ReceivedUdpDatagram>(swg::ErrorCode::ParseError,
+                                                                   "scripted runtime receive buffer was too small");
+    }
+
+    std::copy(pending_response_.begin(), pending_response_.end(), buffer);
+    swg::sysmodule::ReceivedUdpDatagram datagram{};
+    datagram.size = pending_response_.size();
+    datagram.source_ipv4 = endpoint_.ipv4;
+    datagram.source_port = endpoint_.port;
+    pending_response_.clear();
+    return swg::MakeSuccess(std::move(datagram));
+  }
+
+  void CloseSocket(int socket_fd) const override {
+    std::scoped_lock lock(mutex_);
+    if (active_socket_ == socket_fd) {
+      active_socket_ = -1;
+    }
+  }
+
+  [[nodiscard]] bool outbound_payload_validated() const {
+    std::scoped_lock lock(mutex_);
+    return outbound_payload_validated_;
+  }
+
+  [[nodiscard]] std::uint32_t handshake_count() const {
+    std::scoped_lock lock(mutex_);
+    return handshake_count_;
+  }
+
+ private:
+  swg::sysmodule::PreparedTunnelEndpoint endpoint_{};
+  std::vector<std::uint8_t> expected_payload_{};
+  swg::Result<swg::WireGuardResponderConfig> responder_config_result_ =
+      swg::MakeFailure<swg::WireGuardResponderConfig>(swg::ErrorCode::InvalidState, "not initialized");
+  mutable std::mutex mutex_{};
+  mutable bool started_ = false;
+  mutable int next_socket_ = 100;
+  mutable int active_socket_ = -1;
+  mutable std::optional<swg::WireGuardHandshakeResponse> current_response_{};
+  mutable std::vector<std::uint8_t> pending_response_{};
+  mutable std::uint32_t handshake_count_ = 0;
+  mutable bool awaiting_post_handshake_keepalive_ = false;
+  mutable bool failed_send_once_ = false;
+  mutable bool outbound_payload_validated_ = false;
 };
 
 bool TestWireGuardCrypto() {
@@ -1274,6 +1459,55 @@ bool TestAppSessionSendPacket() {
   return ok;
 }
 
+bool TestEngineReconnectAfterSendFailure() {
+  const swg::Config valid_config = MakeValidConfig("127.0.0.1", 51820);
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for reconnect test");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for reconnect test");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  const std::vector<std::uint8_t> payload = {0x52, 0x45, 0x43, 0x4f, 0x4e};
+  auto runtime = std::make_unique<ScriptedReconnectSocketRuntime>(prepared.value.endpoint, payload);
+  ScriptedReconnectSocketRuntime* runtime_ptr = runtime.get();
+  auto engine = swg::sysmodule::CreateWgTunnelEngine(std::move(runtime));
+
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(start_error.ok(), "engine start must succeed before reconnect testing");
+  if (!start_error.ok()) {
+    return false;
+  }
+
+  const auto counter = engine->SendPacket(payload);
+  ok &= Require(counter.ok(), "engine send must succeed after one bounded reconnect");
+  if (counter.ok()) {
+    ok &= Require(counter.value == 1,
+                  "engine reconnect should resend the payload as the first post-reconnect transport packet");
+  }
+
+  const swg::TunnelStats stats = engine->GetStats();
+  ok &= Require(stats.reconnects == 1, "engine stats must record one successful bounded reconnect");
+  ok &= Require(stats.successful_handshakes == 2,
+                "engine stats must record the initial handshake plus the reconnect handshake");
+  ok &= Require(stats.packets_out >= 5,
+                "engine reconnect test must account for initial and reconnect handshake traffic plus the payload send");
+  ok &= Require(runtime_ptr->handshake_count() == 2,
+                "scripted runtime must observe two handshake exchanges across reconnect");
+  ok &= Require(runtime_ptr->outbound_payload_validated(),
+                "scripted runtime must validate the resent authenticated payload after reconnect");
+  ok &= Require(engine->Stop().ok(), "engine stop must succeed after reconnect test");
+  return ok;
+}
+
 bool TestMoonlightRoutePlanning() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-moonlight";
   std::error_code filesystem_error;
@@ -1358,13 +1592,14 @@ int main() {
   const bool codec_ok = TestIpcCodecRoundTrip();
   const bool app_session_send_ok = TestAppSessionSendPacket();
   const bool app_session_recv_ok = TestAppSessionReceivePacket();
+  const bool reconnect_ok = TestEngineReconnectAfterSendFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
-          codec_ok && app_session_send_ok && app_session_recv_ok && moonlight_ok)
+          codec_ok && app_session_send_ok && app_session_recv_ok && reconnect_ok && moonlight_ok)
              ? 0
              : 1;
 }

@@ -17,6 +17,7 @@
 | Engine inbound payload queue | Verified | `swg_tests` now drains one validated payload packet from the bounded engine receive queue after connect |
 | App-session packet send | Verified | `swg_tests` now sends one authenticated payload packet through `AppSession::SendPacket()` over the marshalled host transport and validates it at a local responder |
 | App-session packet receive | Verified | `swg_tests` now drains one validated payload packet through `AppSession::ReceivePacket()` over the marshalled host transport |
+| Engine bounded reconnect | Verified | `swg_tests` now uses a scripted UDP runtime to force one outbound transport send failure, then verifies the engine re-handshakes with backoff and retries the payload successfully |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
@@ -34,4 +35,4 @@
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |
 | Overlay queries status | Deferred | Tesla overlay is intentionally outside the current Phase A scope |
-| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, sends an authenticated keepalive, can schedule periodic keepalives, and exposes authenticated payload send/receive through `swg:ctl`; broader sustained traffic plus reconnect behavior are the next on-device checks |
+| Connect/disconnect loop | In progress | `Connect()` now resolves the IPv4 endpoint, sends a real initiation packet, validates the handshake response, sends an authenticated keepalive, can schedule periodic keepalives, exposes authenticated payload send/receive through `swg:ctl`, and has bounded reconnect on outbound send failure; broader sustained traffic plus more general reconnect behavior are the next on-device checks |
