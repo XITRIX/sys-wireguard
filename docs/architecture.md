@@ -9,6 +9,7 @@ Current implementation boundaries:
 - `swg_common` also owns the request/response codec and command dispatcher used by the current `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
 - `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
+- `swg_sdk` also owns the reusable compat bridge layer for tunnel-aware HTTP control, stream-host DNS, and tunnel socket attachment, with Moonlight kept as one compatibility consumer rather than the implementation center.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning, send/receive packet calls, and future per-app tunnel control.
 - `swg_integration_switch`: a dedicated Switch-side integration harness that exercises the app-facing SDK path separately from the manager UI.
 - `swg_overlay_stub`: a host-side stand-in for the future Tesla overlay.
@@ -25,6 +26,7 @@ Current implementation boundaries:
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
+- Per-app route policy now lives in config and is resolved by the sysmodule from app identity plus explicit request overrides, so compat layers can stay thin.
 - Host tools now use an in-process transport adapter that marshals requests through the shared IPC envelope instead of calling the service implementation directly.
 - Switch builds now register `swg:ctl` through `smRegisterService(...)` and carry the existing binary envelope over one CMIF command with alias buffers.
 - The manager app, not Tesla, is the current Phase A device control surface.
@@ -75,8 +77,15 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 - authenticated payloads can still be sent and received through the same `swg::AppSession`
 - real UDP flows can use `swg::TunnelDatagramSocket`
 - real TCP flows can use `swg::TunnelStreamSocket`
+- third-party apps can target an SDK-owned compat bridge C/C++ surface instead of carrying the tunnel/session bridge implementation in their own tree
 - a route-aware `SessionSocket` wrapper can collapse plan, DNS, and packet-channel selection into one app-facing transport object
 - future transparent routing can replace some of those explicit decisions later without changing the service contract
+- the Switch integration app now exercises that compat surface under a non-Moonlight identity so config-driven app policy can be validated outside the sibling Moonlight tree
+
+App-policy model:
+- `app_policy.default` defines the baseline route and DNS behavior for apps that do not have a more specific match
+- per-app sections can match on `client_name`, `integration_tag`, or a section name that mirrors one of those identifiers
+- callers can still force specific booleans through explicit `AppPolicyOverrideFlag` bits when a compat shim or test really needs to override config
 
 The current tunnel DNS implementation is intentionally conservative: it crafts IPv4 UDP DNS queries inside the WireGuard transport for SDK consumers, parses matching IPv4 A-record answers back out of the receive queue, and leaves broader resolver features to later milestones.
 

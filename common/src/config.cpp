@@ -179,6 +179,66 @@ Error AssignProfileValue(ProfileConfig& profile, const std::string& key, const s
   return MakeError(ErrorCode::ParseError, "unknown profile key: " + key);
 }
 
+Error AssignAppPolicyValue(AppPolicyConfig& policy, const std::string& key, const std::string& value) {
+  if (key == "client_name") {
+    policy.client_name = value;
+    return Error::None();
+  }
+
+  if (key == "integration_tag") {
+    policy.integration_tag = value;
+    return Error::None();
+  }
+
+  if (key == "desired_profile") {
+    policy.desired_profile = value;
+    return Error::None();
+  }
+
+  if (key == "requested_flags") {
+    policy.requested_flags = ParseRuntimeFlags(value);
+    return Error::None();
+  }
+
+  if (key == "allow_local_network_bypass") {
+    const Result<bool> parsed = ParseBool(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    policy.allow_local_network_bypass = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "require_tunnel_for_default_traffic") {
+    const Result<bool> parsed = ParseBool(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    policy.require_tunnel_for_default_traffic = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "prefer_tunnel_dns") {
+    const Result<bool> parsed = ParseBool(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    policy.prefer_tunnel_dns = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "allow_direct_internet_fallback") {
+    const Result<bool> parsed = ParseBool(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    policy.allow_direct_internet_fallback = parsed.value;
+    return Error::None();
+  }
+
+  return MakeError(ErrorCode::ParseError, "unknown app policy key: " + key);
+}
+
 bool HasCompleteKeyMaterial(const ProfileConfig& profile) {
   return !profile.private_key.empty() && !profile.public_key.empty() && !profile.endpoint_host.empty() &&
          !profile.allowed_ips.empty() && !profile.addresses.empty();
@@ -187,7 +247,15 @@ bool HasCompleteKeyMaterial(const ProfileConfig& profile) {
 }  // namespace
 
 Config DefaultConfig() {
-  return {};
+  Config config{};
+  AppPolicyConfig default_policy{};
+  default_policy.name = "default";
+  default_policy.allow_local_network_bypass = false;
+  default_policy.require_tunnel_for_default_traffic = true;
+  default_policy.prefer_tunnel_dns = true;
+  default_policy.allow_direct_internet_fallback = false;
+  config.app_policies.emplace(default_policy.name, default_policy);
+  return config;
 }
 
 RuntimePaths DetectRuntimePaths(const std::filesystem::path& root_override) {
@@ -219,6 +287,7 @@ Result<Config> LoadConfigFile(const std::filesystem::path& path) {
   std::string line;
   std::string current_section;
   std::string current_profile_name;
+  std::string current_policy_name;
   std::size_t line_number = 0;
 
   while (std::getline(input, line)) {
@@ -235,14 +304,25 @@ Result<Config> LoadConfigFile(const std::filesystem::path& path) {
       if (section == "runtime") {
         current_section = "runtime";
         current_profile_name.clear();
+        current_policy_name.clear();
         continue;
       }
 
       if (section.rfind("profile.", 0) == 0 && section.size() > 8) {
         current_section = "profile";
         current_profile_name = section.substr(8);
+        current_policy_name.clear();
         ProfileConfig& profile = config.profiles[current_profile_name];
         profile.name = current_profile_name;
+        continue;
+      }
+
+      if (section.rfind("app_policy.", 0) == 0 && section.size() > 11) {
+        current_section = "app_policy";
+        current_profile_name.clear();
+        current_policy_name = section.substr(11);
+        AppPolicyConfig& policy = config.app_policies[current_policy_name];
+        policy.name = current_policy_name;
         continue;
       }
 
@@ -275,6 +355,17 @@ Result<Config> LoadConfigFile(const std::filesystem::path& path) {
       ProfileConfig& profile = config.profiles[current_profile_name];
       profile.name = current_profile_name;
       const Error assign_error = AssignProfileValue(profile, key, value);
+      if (assign_error) {
+        return MakeFailure<Config>(assign_error.code,
+                                   assign_error.message + " at line " + std::to_string(line_number));
+      }
+      continue;
+    }
+
+    if (current_section == "app_policy") {
+      AppPolicyConfig& policy = config.app_policies[current_policy_name];
+      policy.name = current_policy_name;
+      const Error assign_error = AssignAppPolicyValue(policy, key, value);
       if (assign_error) {
         return MakeFailure<Config>(assign_error.code,
                                    assign_error.message + " at line " + std::to_string(line_number));
@@ -336,6 +427,21 @@ Error SaveConfigFile(const Config& config, const std::filesystem::path& path) {
   output << "active_profile = " << config.active_profile << "\n";
   output << "runtime_flags = " << RuntimeFlagsToString(config.runtime_flags) << "\n\n";
 
+  for (const auto& [name, policy] : config.app_policies) {
+    output << "[app_policy." << name << "]\n";
+    output << "client_name = " << policy.client_name << "\n";
+    output << "integration_tag = " << policy.integration_tag << "\n";
+    output << "desired_profile = " << policy.desired_profile << "\n";
+    output << "requested_flags = " << RuntimeFlagsToString(policy.requested_flags) << "\n";
+    output << "allow_local_network_bypass = " << (policy.allow_local_network_bypass ? "true" : "false")
+           << "\n";
+    output << "require_tunnel_for_default_traffic = "
+           << (policy.require_tunnel_for_default_traffic ? "true" : "false") << "\n";
+    output << "prefer_tunnel_dns = " << (policy.prefer_tunnel_dns ? "true" : "false") << "\n";
+    output << "allow_direct_internet_fallback = "
+           << (policy.allow_direct_internet_fallback ? "true" : "false") << "\n\n";
+  }
+
   for (const auto& [name, profile] : config.profiles) {
     output << "[profile." << name << "]\n";
     output << "private_key = " << profile.private_key << "\n";
@@ -381,12 +487,25 @@ Error ValidateConfig(const Config& config) {
     }
   }
 
+  for (const auto& [name, policy] : config.app_policies) {
+    if (name.empty()) {
+      return MakeError(ErrorCode::InvalidConfig, "app policy name must not be empty");
+    }
+
+    if (!policy.desired_profile.empty() && config.profiles.find(policy.desired_profile) == config.profiles.end()) {
+      return MakeError(ErrorCode::InvalidConfig,
+                       "app policy '" + name + "' references unknown desired_profile '" +
+                           policy.desired_profile + "'");
+    }
+  }
+
   return Error::None();
 }
 
 std::string DescribeConfig(const Config& config) {
   std::ostringstream stream;
   stream << "profiles=" << config.profiles.size();
+  stream << ", app_policies=" << config.app_policies.size();
 
   if (!config.active_profile.empty()) {
     stream << ", active_profile=" << config.active_profile;

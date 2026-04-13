@@ -125,6 +125,36 @@ std::vector<std::vector<std::uint8_t>> MakePayloadSequence(std::vector<std::uint
   return payloads;
 }
 
+template <typename T>
+void AppendPod(swg::ByteBuffer* buffer, const T& value) {
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
+  buffer->insert(buffer->end(), bytes, bytes + sizeof(T));
+}
+
+void AppendBool(swg::ByteBuffer* buffer, bool value) {
+  AppendPod<std::uint8_t>(buffer, value ? 1u : 0u);
+}
+
+void AppendString(swg::ByteBuffer* buffer, const std::string& value) {
+  AppendPod<std::uint32_t>(buffer, static_cast<std::uint32_t>(value.size()));
+  buffer->insert(buffer->end(), value.begin(), value.end());
+}
+
+swg::ByteBuffer EncodeLegacyAppTunnelRequestPayload(const swg::AppTunnelRequest& request) {
+  swg::ByteBuffer payload;
+  AppendPod<std::uint16_t>(&payload, request.abi_version);
+  AppendPod<std::uint64_t>(&payload, request.app.title_id);
+  AppendString(&payload, request.app.client_name);
+  AppendString(&payload, request.app.integration_tag);
+  AppendString(&payload, request.desired_profile);
+  AppendPod<swg::RuntimeFlags>(&payload, request.requested_flags);
+  AppendBool(&payload, request.allow_local_network_bypass);
+  AppendBool(&payload, request.require_tunnel_for_default_traffic);
+  AppendBool(&payload, request.prefer_tunnel_dns);
+  AppendBool(&payload, request.allow_direct_internet_fallback);
+  return payload;
+}
+
 class LocalHandshakeResponder {
  public:
   explicit LocalHandshakeResponder(std::uint32_t expected_additional_keepalives = 0,
@@ -1422,9 +1452,15 @@ bool TestConfigRoundTrip() {
   bool ok = true;
   ok &= Require(loaded.value.active_profile == expected.active_profile, "active profile must round-trip");
   ok &= Require(loaded.value.profiles.size() == 1, "exactly one profile must round-trip");
+  ok &= Require(loaded.value.app_policies.size() == expected.app_policies.size(),
+                "app policies must round-trip");
   ok &= Require(loaded.value.runtime_flags == expected.runtime_flags, "runtime flags must round-trip");
   ok &= Require(loaded.value.profiles.at("default").endpoint_host == expected.profiles.at("default").endpoint_host,
                 "endpoint_host must round-trip");
+  ok &= Require(loaded.value.app_policies.at("default").require_tunnel_for_default_traffic,
+                "default app policy must preserve full-tunnel routing");
+  ok &= Require(!loaded.value.app_policies.at("default").allow_local_network_bypass,
+                "default app policy must preserve disabled local bypass");
   return ok;
 }
 
@@ -1791,6 +1827,11 @@ bool TestIpcCodecRoundTrip() {
   ok &= Require(decoded_config.value.profiles.at("default").endpoint_host ==
                     expected_config.profiles.at("default").endpoint_host,
                 "config payload must preserve endpoint host");
+  ok &= Require(decoded_config.value.app_policies.size() == expected_config.app_policies.size(),
+                "config payload must preserve app policy entries");
+  ok &= Require(decoded_config.value.app_policies.at("default").prefer_tunnel_dns ==
+                    expected_config.app_policies.at("default").prefer_tunnel_dns,
+                "config payload must preserve default app-policy dns preference");
 
   const swg::TunnelPacket expected_packet{swg::kAbiVersion, 7, {0x41, 0x42, 0x43}};
   const swg::Result<swg::ByteBuffer> packet_payload = swg::EncodePayload(expected_packet);
@@ -1811,6 +1852,54 @@ bool TestIpcCodecRoundTrip() {
                 "tunnel packet payload must preserve the transport counter");
   ok &= Require(decoded_packet.value.payload == expected_packet.payload,
                 "tunnel packet payload must preserve the authenticated payload bytes");
+
+  swg::AppTunnelRequest expected_app_request{};
+  expected_app_request.app.title_id = 0x0102030405060708ull;
+  expected_app_request.app.client_name = "CompatConsumer";
+  expected_app_request.app.integration_tag = "compat-consumer";
+  expected_app_request.desired_profile = "default";
+  expected_app_request.requested_flags = 0;
+  expected_app_request.policy_overrides = 0;
+  expected_app_request.allow_local_network_bypass = false;
+  expected_app_request.require_tunnel_for_default_traffic = true;
+  expected_app_request.prefer_tunnel_dns = true;
+  expected_app_request.allow_direct_internet_fallback = false;
+
+  const swg::ByteBuffer legacy_app_request_payload = EncodeLegacyAppTunnelRequestPayload(expected_app_request);
+  const swg::Result<swg::AppTunnelRequest> decoded_legacy_app_request =
+      swg::DecodeAppTunnelRequestPayload(legacy_app_request_payload);
+  ok &= Require(decoded_legacy_app_request.ok(), "legacy app-tunnel payload decoding must succeed");
+  if (!decoded_legacy_app_request.ok()) {
+    return false;
+  }
+
+  ok &= Require(decoded_legacy_app_request.value.app.client_name == expected_app_request.app.client_name,
+                "legacy app-tunnel payload must preserve client name");
+  ok &= Require(decoded_legacy_app_request.value.policy_overrides == 0,
+                "legacy app-tunnel payload must default policy overrides to zero");
+  ok &= Require(!decoded_legacy_app_request.value.allow_local_network_bypass,
+                "legacy app-tunnel payload must preserve local-bypass preference");
+
+  const swg::Result<swg::ByteBuffer> encoded_legacy_shape = swg::EncodePayload(expected_app_request);
+  ok &= Require(encoded_legacy_shape.ok(), "zero-override app-tunnel payload encoding must succeed");
+  if (!encoded_legacy_shape.ok()) {
+    return false;
+  }
+
+  ok &= Require(encoded_legacy_shape.value == legacy_app_request_payload,
+                "zero-override app-tunnel payload must keep the legacy wire shape");
+
+  swg::AppTunnelRequest override_app_request = expected_app_request;
+  override_app_request.policy_overrides = swg::ToFlags(swg::AppPolicyOverrideFlag::AllowLocalNetworkBypass);
+  const swg::Result<swg::ByteBuffer> encoded_override_shape = swg::EncodePayload(override_app_request);
+  ok &= Require(encoded_override_shape.ok(), "override app-tunnel payload encoding must succeed");
+  if (!encoded_override_shape.ok()) {
+    return false;
+  }
+
+  ok &= Require(encoded_override_shape.value.size() ==
+                    legacy_app_request_payload.size() + sizeof(swg::AppPolicyOverrideFlags),
+                "override app-tunnel payload must include the policy-override field on the wire");
   return ok;
 }
 
@@ -2275,6 +2364,102 @@ bool TestMoonlightRoutePlanning() {
   ok &= Require(video.value.action == swg::RouteAction::Tunnel, "video traffic should use the tunnel after connect");
 
   ok &= Require(session.Close().ok(), "Moonlight app session must close cleanly");
+  return ok;
+}
+
+bool TestConfigDrivenAppPolicies() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-app-policies";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  swg::Config config = MakeValidConfig();
+  swg::AppPolicyConfig moonlight_policy{};
+  moonlight_policy.name = "moonlight-switch";
+  moonlight_policy.client_name = "Moonlight-Switch";
+  moonlight_policy.integration_tag = "moonlight-switch";
+  moonlight_policy.desired_profile = "default";
+  moonlight_policy.requested_flags = swg::ToFlags(swg::RuntimeFlag::DnsThroughTunnel);
+  moonlight_policy.allow_local_network_bypass = false;
+  moonlight_policy.require_tunnel_for_default_traffic = false;
+  moonlight_policy.prefer_tunnel_dns = true;
+  moonlight_policy.allow_direct_internet_fallback = true;
+  config.app_policies[moonlight_policy.name] = moonlight_policy;
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(config).ok(), "valid config with app policies must save")) {
+    return false;
+  }
+
+  bool ok = true;
+
+  swg::AppSession unknown_app_session(client);
+  swg::AppTunnelRequest unknown_request{};
+  unknown_request.app.client_name = "OtherApp";
+  unknown_request.app.integration_tag = "other-app";
+
+  const auto unknown_opened = unknown_app_session.Open(unknown_request);
+  ok &= Require(unknown_opened.ok(), "unknown app session must open with default app policy");
+  if (!unknown_opened.ok()) {
+    return false;
+  }
+
+  ok &= Require(unknown_opened.value.notes.find("app_policy=default") != std::string::npos,
+                "unknown app session must report the default app policy in notes");
+
+  swg::NetworkPlanRequest generic_plan{};
+  generic_plan.remote_host = "203.0.113.44";
+  generic_plan.remote_port = 47984;
+  generic_plan.transport = swg::TransportProtocol::Tcp;
+  generic_plan.traffic_class = swg::AppTrafficClass::Generic;
+  generic_plan.route_preference = swg::RoutePreference::Default;
+
+  const auto unknown_plan = unknown_app_session.PlanNetwork(generic_plan);
+  ok &= Require(unknown_plan.ok(), "unknown app network plan must succeed");
+  if (unknown_plan.ok()) {
+    ok &= Require(unknown_plan.value.action == swg::RouteAction::Deny,
+                  "default app policy must fail closed before the tunnel is connected");
+  }
+
+  ok &= Require(unknown_app_session.Close().ok(), "unknown app session must close cleanly");
+
+  swg::AppSession moonlight_session(client);
+  swg::AppTunnelRequest moonlight_request{};
+  moonlight_request.app.client_name = "Moonlight-Switch";
+  moonlight_request.app.integration_tag = "moonlight-switch";
+
+  const auto moonlight_opened = moonlight_session.Open(moonlight_request);
+  ok &= Require(moonlight_opened.ok(), "Moonlight app session must open with the specific app policy");
+  if (!moonlight_opened.ok()) {
+    return false;
+  }
+
+  ok &= Require(moonlight_opened.value.notes.find("app_policy=moonlight-switch") != std::string::npos,
+                "Moonlight app session must report the matched app policy in notes");
+
+  const auto moonlight_plan = moonlight_session.PlanNetwork(generic_plan);
+  ok &= Require(moonlight_plan.ok(), "Moonlight app network plan must succeed");
+  if (moonlight_plan.ok()) {
+    ok &= Require(moonlight_plan.value.action == swg::RouteAction::Direct,
+                  "specific Moonlight app policy must allow direct fallback before connect");
+  }
+
+  ok &= Require(moonlight_session.Close().ok(), "Moonlight app session must close cleanly");
+
+  swg::AppSession override_session(client);
+  const auto override_opened = override_session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(override_opened.ok(), "legacy Moonlight override session must open");
+  if (!override_opened.ok()) {
+    return false;
+  }
+
+  const auto override_plan = override_session.PlanNetwork(generic_plan);
+  ok &= Require(override_plan.ok(), "legacy Moonlight override plan must succeed");
+  if (override_plan.ok()) {
+    ok &= Require(override_plan.value.action == swg::RouteAction::Deny,
+                  "explicit Moonlight helper overrides must take precedence over config app policy");
+  }
+
+  ok &= Require(override_session.Close().ok(), "legacy Moonlight override session must close cleanly");
   return ok;
 }
 
@@ -3262,6 +3447,58 @@ bool TestTunnelStreamSocketRecoversAfterIdleTimeout() {
   return ok;
 }
 
+bool TestDisconnectReconnectInvalidatesOldTunnelStreamHandles() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-stream-disconnect-reset";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  auto engine = std::make_unique<RecoveringTunnelStreamEngine>();
+  const auto service = swg::sysmodule::CreateLocalControlServiceForTest(std::move(engine), runtime_root);
+  swg::Client client(swg::sysmodule::CreateHostInProcessTransport(service));
+
+  bool ok = true;
+  ok &= Require(client.SaveConfig(MakeValidConfig("127.0.0.1", 51820)).ok(),
+                "valid config must save before disconnect-reset tunnel stream test");
+  ok &= Require(client.Connect().ok(), "service connect must succeed before disconnect-reset tunnel stream test");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "disconnect-reset tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto first_stream = session.OpenTunnelStream(
+      swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", 47984));
+  ok &= Require(first_stream.ok(), "initial tunnel stream must open before disconnect-reset validation");
+  if (!first_stream.ok()) {
+    return false;
+  }
+
+  const auto pre_disconnect_send = session.SendTunnelStream(first_stream.value.stream_id, {'P'});
+  ok &= Require(pre_disconnect_send.ok(), "initial tunnel stream must send before disconnect-reset validation");
+
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed before reconnect-reset validation");
+  ok &= Require(client.Connect().ok(), "service reconnect must succeed before stale-handle validation");
+
+  const auto stale_send = session.SendTunnelStream(first_stream.value.stream_id, {'Q'});
+  ok &= Require(!stale_send.ok() && stale_send.error.code == swg::ErrorCode::NotFound,
+                "disconnect and reconnect must invalidate previously opened tunnel stream handles");
+
+  const auto reopened_stream = session.OpenTunnelStream(
+      swg::MakeMoonlightHttpsControlStreamRequest("203.0.113.44", 47984));
+  ok &= Require(reopened_stream.ok(), "fresh tunnel stream must open after disconnect-reset cleanup");
+  if (reopened_stream.ok()) {
+    ok &= Require(reopened_stream.value.stream_id != first_stream.value.stream_id,
+                  "reopened tunnel stream must allocate a fresh handle id");
+  }
+
+  ok &= Require(session.Close().ok(), "disconnect-reset tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after disconnect-reset test");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -3289,6 +3526,7 @@ int main() {
   const bool receive_reconnect_ok = TestEngineReconnectAfterReceiveFailure();
   const bool keepalive_reconnect_ok = TestEngineReconnectAfterKeepaliveFailure();
   const bool moonlight_ok = TestMoonlightRoutePlanning();
+  const bool app_policy_ok = TestConfigDrivenAppPolicies();
   const bool tunnel_dns_codec_ok = TestTunnelDnsPacketCodec();
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
@@ -3298,16 +3536,18 @@ int main() {
   const bool tunnel_stream_delayed_synack_ok = TestTunnelStreamSocketDelayedSynAck();
   const bool tunnel_stream_deferred_synack_ok = TestTunnelStreamSocketUsesDeferredSynAck();
   const bool tunnel_stream_idle_recovery_ok = TestTunnelStreamSocketRecoversAfterIdleTimeout();
+  const bool tunnel_stream_disconnect_reset_ok = TestDisconnectReconnectInvalidatesOldTunnelStreamHandles();
   return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
-          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && tunnel_dns_codec_ok && dns_resolution_ok &&
+          receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && app_policy_ok &&
+          tunnel_dns_codec_ok && dns_resolution_ok &&
           session_socket_ok && tunnel_datagram_ok && tunnel_stream_ok && tunnel_stream_out_of_order_ok &&
           tunnel_stream_delayed_synack_ok && tunnel_stream_deferred_synack_ok &&
-          tunnel_stream_idle_recovery_ok)
+          tunnel_stream_idle_recovery_ok && tunnel_stream_disconnect_reset_ok)
              ? 0
              : 1;
 }

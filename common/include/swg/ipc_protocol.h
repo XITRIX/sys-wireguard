@@ -70,6 +70,14 @@ enum class RuntimeFlag : std::uint32_t {
   KillSwitch = 1u << 2,
 };
 
+enum class AppPolicyOverrideFlag : std::uint32_t {
+  None = 0,
+  AllowLocalNetworkBypass = 1u << 0,
+  RequireTunnelForDefaultTraffic = 1u << 1,
+  PreferTunnelDns = 1u << 2,
+  AllowDirectInternetFallback = 1u << 3,
+};
+
 enum class TransportProtocol : std::uint32_t {
   Unspecified = 0,
   Tcp,
@@ -105,12 +113,21 @@ enum class RouteAction : std::uint32_t {
 };
 
 using RuntimeFlags = std::uint32_t;
+using AppPolicyOverrideFlags = std::uint32_t;
 
 inline constexpr RuntimeFlags ToFlags(RuntimeFlag flag) {
   return static_cast<RuntimeFlags>(flag);
 }
 
 inline constexpr bool HasFlag(RuntimeFlags flags, RuntimeFlag flag) {
+  return (flags & ToFlags(flag)) != 0;
+}
+
+inline constexpr AppPolicyOverrideFlags ToFlags(AppPolicyOverrideFlag flag) {
+  return static_cast<AppPolicyOverrideFlags>(flag);
+}
+
+inline constexpr bool HasFlag(AppPolicyOverrideFlags flags, AppPolicyOverrideFlag flag) {
   return (flags & ToFlags(flag)) != 0;
 }
 
@@ -171,6 +188,7 @@ struct AppTunnelRequest {
   AppIdentity app;
   std::string desired_profile;
   RuntimeFlags requested_flags = 0;
+  AppPolicyOverrideFlags policy_overrides = 0;
   bool allow_local_network_bypass = true;
   bool require_tunnel_for_default_traffic = false;
   bool prefer_tunnel_dns = true;

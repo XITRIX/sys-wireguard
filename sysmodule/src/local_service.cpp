@@ -34,6 +34,12 @@ bool ProfileHasCompleteKeyMaterial(const ProfileConfig& profile) {
 
 struct AppSessionRecord {
   AppTunnelRequest request;
+  std::string matched_policy_name;
+  RuntimeFlags requested_flags = 0;
+  bool allow_local_network_bypass = true;
+  bool require_tunnel_for_default_traffic = false;
+  bool prefer_tunnel_dns = true;
+  bool allow_direct_internet_fallback = false;
   std::string selected_profile;
 };
 
@@ -82,6 +88,19 @@ struct TunnelDnsLookupResult {
   std::uint32_t fallback_count = 0;
 };
 
+enum class ClosedTunnelFlowTransport : std::uint8_t {
+  Udp = 0,
+  Tcp,
+};
+
+struct ClosedTunnelFlowRecord {
+  ClosedTunnelFlowTransport transport = ClosedTunnelFlowTransport::Udp;
+  std::array<std::uint8_t, 4> remote_ipv4{};
+  std::array<std::uint8_t, 4> local_ipv4{};
+  std::uint16_t remote_port = 0;
+  std::uint16_t local_port = 0;
+};
+
 constexpr std::uint16_t kTunnelDnsSourcePortBase = 40000;
 constexpr std::uint16_t kTunnelDnsSourcePortSpan = 20000;
 constexpr std::uint16_t kTunnelDnsDestinationPort = 53;
@@ -96,6 +115,39 @@ constexpr std::chrono::milliseconds kTunnelStreamConnectPollInterval(25);
 constexpr std::chrono::milliseconds kTunnelStreamConnectTimeout(3000);
 constexpr std::chrono::milliseconds kTunnelStreamConnectSynRetransmitInterval(250);
 constexpr std::size_t kTunnelStreamBufferedSegmentLimit = 32;
+constexpr std::size_t kClosedTunnelFlowRecordLimit = 64;
+
+ClosedTunnelFlowRecord MakeClosedTunnelFlowRecord(const TunnelDatagramHandleRecord& datagram) {
+  ClosedTunnelFlowRecord record{};
+  record.transport = ClosedTunnelFlowTransport::Udp;
+  record.remote_ipv4 = datagram.remote_ipv4;
+  record.local_ipv4 = datagram.local_ipv4;
+  record.remote_port = datagram.remote_port;
+  record.local_port = datagram.local_port;
+  return record;
+}
+
+ClosedTunnelFlowRecord MakeClosedTunnelFlowRecord(const TunnelStreamHandleRecord& stream) {
+  ClosedTunnelFlowRecord record{};
+  record.transport = ClosedTunnelFlowTransport::Tcp;
+  record.remote_ipv4 = stream.remote_ipv4;
+  record.local_ipv4 = stream.local_ipv4;
+  record.remote_port = stream.remote_port;
+  record.local_port = stream.local_port;
+  return record;
+}
+
+bool MatchesClosedTunnelFlow(const ClosedTunnelFlowRecord& flow, const Ipv4UdpPacket& packet) {
+  return flow.transport == ClosedTunnelFlowTransport::Udp && packet.endpoint.source_ipv4 == flow.remote_ipv4 &&
+         packet.endpoint.destination_ipv4 == flow.local_ipv4 && packet.endpoint.source_port == flow.remote_port &&
+         packet.endpoint.destination_port == flow.local_port;
+}
+
+bool MatchesClosedTunnelFlow(const ClosedTunnelFlowRecord& flow, const Ipv4TcpPacket& packet) {
+  return flow.transport == ClosedTunnelFlowTransport::Tcp && packet.endpoint.source_ipv4 == flow.remote_ipv4 &&
+         packet.endpoint.destination_ipv4 == flow.local_ipv4 && packet.endpoint.source_port == flow.remote_port &&
+         packet.endpoint.destination_port == flow.local_port;
+}
 
 std::uint32_t MeasureTunnelStreamSequenceAdvance(const Ipv4TcpPacket& segment) {
   std::uint32_t advance = 0;
@@ -260,32 +312,141 @@ bool LooksLocalHost(std::string_view host) {
          IsPrivateIpv4(normalized);
 }
 
-bool IsRemoteStreamTraffic(AppTrafficClass traffic_class) {
-  return traffic_class == AppTrafficClass::HttpsControl || traffic_class == AppTrafficClass::StreamControl ||
-         traffic_class == AppTrafficClass::StreamVideo || traffic_class == AppTrafficClass::StreamAudio ||
-         traffic_class == AppTrafficClass::StreamInput;
-}
+const AppPolicyConfig* FindMatchingAppPolicy(const Config& config,
+                                             const AppIdentity& app,
+                                             std::string* matched_policy_name) {
+  const AppPolicyConfig* best_match = nullptr;
+  int best_score = -1;
 
-std::string SelectProfile(const Config& config, const AppTunnelRequest& request) {
-  if (!request.desired_profile.empty()) {
-    return request.desired_profile;
+  for (const auto& [name, policy] : config.app_policies) {
+    if (name == "default") {
+      continue;
+    }
+
+    bool has_explicit_match_fields = false;
+    int score = 0;
+
+    if (!policy.client_name.empty()) {
+      has_explicit_match_fields = true;
+      if (policy.client_name != app.client_name) {
+        continue;
+      }
+      score += 2;
+    }
+
+    if (!policy.integration_tag.empty()) {
+      has_explicit_match_fields = true;
+      if (policy.integration_tag != app.integration_tag) {
+        continue;
+      }
+      score += 4;
+    }
+
+    if (!has_explicit_match_fields) {
+      const bool name_matches = (!app.client_name.empty() && name == app.client_name) ||
+                                (!app.integration_tag.empty() && name == app.integration_tag);
+      if (!name_matches) {
+        continue;
+      }
+      score = 1;
+    }
+
+    if (score > best_score) {
+      best_match = &policy;
+      best_score = score;
+      if (matched_policy_name != nullptr) {
+        *matched_policy_name = name;
+      }
+    }
   }
 
-  return config.active_profile;
+  if (best_match != nullptr) {
+    return best_match;
+  }
+
+  const auto default_it = config.app_policies.find("default");
+  if (default_it != config.app_policies.end()) {
+    if (matched_policy_name != nullptr) {
+      *matched_policy_name = default_it->first;
+    }
+    return &default_it->second;
+  }
+
+  return nullptr;
 }
 
-std::string BuildAppSessionNotes(const AppTunnelRequest& request, const std::string& profile_name,
-                                 const StateSnapshot& snapshot, RuntimeFlags granted_flags) {
+AppSessionRecord ResolveAppSessionRecord(const Config& config, const AppTunnelRequest& request) {
+  AppSessionRecord session{};
+  session.request = request;
+  session.selected_profile = request.desired_profile.empty() ? config.active_profile : request.desired_profile;
+  session.requested_flags = request.requested_flags;
+  session.allow_local_network_bypass = request.allow_local_network_bypass;
+  session.require_tunnel_for_default_traffic = request.require_tunnel_for_default_traffic;
+  session.prefer_tunnel_dns = request.prefer_tunnel_dns;
+  session.allow_direct_internet_fallback = request.allow_direct_internet_fallback;
+
+  std::string matched_policy_name;
+  const AppPolicyConfig* matched_policy = FindMatchingAppPolicy(config, request.app, &matched_policy_name);
+  if (matched_policy == nullptr) {
+    return session;
+  }
+
+  session.matched_policy_name = std::move(matched_policy_name);
+
+  if (request.desired_profile.empty() && !matched_policy->desired_profile.empty()) {
+    session.selected_profile = matched_policy->desired_profile;
+  }
+
+  if (request.requested_flags == 0) {
+    session.requested_flags = matched_policy->requested_flags;
+  }
+
+  session.allow_local_network_bypass = matched_policy->allow_local_network_bypass;
+  session.require_tunnel_for_default_traffic = matched_policy->require_tunnel_for_default_traffic;
+  session.prefer_tunnel_dns = matched_policy->prefer_tunnel_dns;
+  session.allow_direct_internet_fallback = matched_policy->allow_direct_internet_fallback;
+
+  if (HasFlag(request.policy_overrides, AppPolicyOverrideFlag::AllowLocalNetworkBypass)) {
+    session.allow_local_network_bypass = request.allow_local_network_bypass;
+  }
+
+  if (HasFlag(request.policy_overrides, AppPolicyOverrideFlag::RequireTunnelForDefaultTraffic)) {
+    session.require_tunnel_for_default_traffic = request.require_tunnel_for_default_traffic;
+  }
+
+  if (HasFlag(request.policy_overrides, AppPolicyOverrideFlag::PreferTunnelDns)) {
+    session.prefer_tunnel_dns = request.prefer_tunnel_dns;
+  }
+
+  if (HasFlag(request.policy_overrides, AppPolicyOverrideFlag::AllowDirectInternetFallback)) {
+    session.allow_direct_internet_fallback = request.allow_direct_internet_fallback;
+  }
+
+  return session;
+}
+
+std::string BuildAppSessionNotes(const AppSessionRecord& session,
+                                 const StateSnapshot& snapshot,
+                                 RuntimeFlags granted_flags) {
   std::ostringstream stream;
-  stream << "app=" << (request.app.client_name.empty() ? "unknown" : request.app.client_name)
-         << ", profile=" << (profile_name.empty() ? "<none>" : profile_name)
+  stream << "app=" << (session.request.app.client_name.empty() ? "unknown" : session.request.app.client_name)
+         << ", profile=" << (session.selected_profile.empty() ? "<none>" : session.selected_profile)
          << ", runtime_flags=" << RuntimeFlagsToString(granted_flags)
          << ", state=" << ToString(snapshot.state);
-  if (request.require_tunnel_for_default_traffic) {
+  if (!session.matched_policy_name.empty()) {
+    stream << ", app_policy=" << session.matched_policy_name;
+  }
+  if (session.require_tunnel_for_default_traffic) {
     stream << ", default_routes=require_tunnel";
   }
-  if (request.allow_local_network_bypass) {
+  if (session.allow_local_network_bypass) {
     stream << ", local_bypass=enabled";
+  }
+  if (session.prefer_tunnel_dns) {
+    stream << ", dns=tunnel_preferred";
+  }
+  if (session.allow_direct_internet_fallback) {
+    stream << ", direct_fallback=enabled";
   }
   return stream.str();
 }
@@ -317,7 +478,7 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
   plan.transparent_eligible = tunnel_ready && HasFlag(granted_flags, RuntimeFlag::TransparentMode);
 
   const bool explicit_bypass = request.route_preference == RoutePreference::BypassTunnel;
-  const bool local_bypass = session.request.allow_local_network_bypass &&
+  const bool local_bypass = session.allow_local_network_bypass &&
                             (request.local_network_hint || request.traffic_class == AppTrafficClass::Discovery ||
                              request.traffic_class == AppTrafficClass::WakeOnLan ||
                              LooksLocalHost(request.remote_host));
@@ -331,7 +492,7 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
   }
 
   if (request.traffic_class == AppTrafficClass::Dns) {
-    const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    const bool wants_tunnel_dns = session.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
     if (wants_tunnel_dns && tunnel_ready) {
       plan.action = RouteAction::Tunnel;
       plan.use_tunnel_dns = true;
@@ -339,7 +500,7 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
       return plan;
     }
 
-    if (wants_tunnel_dns && !session.request.allow_direct_internet_fallback) {
+    if (wants_tunnel_dns && !session.allow_direct_internet_fallback) {
       plan.action = RouteAction::Deny;
       plan.reason = "tunnel DNS requested but the tunnel is not ready";
       return plan;
@@ -358,7 +519,7 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
       wants_tunnel = true;
       break;
     case RoutePreference::Default:
-      wants_tunnel = IsRemoteStreamTraffic(request.traffic_class) || session.request.require_tunnel_for_default_traffic;
+      wants_tunnel = session.require_tunnel_for_default_traffic;
       break;
     case RoutePreference::BypassTunnel:
       wants_tunnel = false;
@@ -368,11 +529,11 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
   if (wants_tunnel) {
     if (tunnel_ready) {
       plan.action = RouteAction::Tunnel;
-      plan.reason = "remote control or streaming traffic should use the active tunnel";
+      plan.reason = "policy selected the active tunnel for this traffic";
       return plan;
     }
 
-    if (request.route_preference != RoutePreference::RequireTunnel && session.request.allow_direct_internet_fallback) {
+    if (request.route_preference != RoutePreference::RequireTunnel && session.allow_direct_internet_fallback) {
       plan.action = RouteAction::Direct;
       plan.reason = "tunnel unavailable; app session allows direct fallback";
       return plan;
@@ -576,6 +737,8 @@ class LocalControlService final : public IControlService {
       return engine_error;
     }
 
+    InvalidateAllTunnelFlowsLocked();
+
     const Error mark_error = state_machine_.MarkDisconnected();
     if (mark_error) {
       return mark_error;
@@ -639,27 +802,28 @@ class LocalControlService final : public IControlService {
       return Result<AppSessionInfo>::Failure(initialization_error_);
     }
 
-    const std::string profile_name = SelectProfile(config_, request);
-    if (!request.desired_profile.empty() && config_.profiles.find(request.desired_profile) == config_.profiles.end()) {
-      return MakeFailure<AppSessionInfo>(ErrorCode::NotFound, "requested profile not found: " + request.desired_profile);
+    AppSessionRecord session = ResolveAppSessionRecord(config_, request);
+    if (!session.selected_profile.empty() && config_.profiles.find(session.selected_profile) == config_.profiles.end()) {
+      return MakeFailure<AppSessionInfo>(ErrorCode::NotFound,
+                                         "requested profile not found: " + session.selected_profile);
     }
 
     const std::uint64_t session_id = next_session_id_++;
-    app_sessions_[session_id] = AppSessionRecord{request, profile_name};
+    app_sessions_[session_id] = session;
 
     const StateSnapshot snapshot = state_machine_.snapshot();
-    const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, request.requested_flags);
+    const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
 
     AppSessionInfo info{};
     info.session_id = session_id;
     info.service_ready = true;
-    info.tunnel_ready = snapshot.state == TunnelState::Connected && !profile_name.empty() &&
-                        snapshot.active_profile == profile_name;
-    info.dns_ready = info.tunnel_ready && request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    info.tunnel_ready = snapshot.state == TunnelState::Connected && !session.selected_profile.empty() &&
+                        snapshot.active_profile == session.selected_profile;
+    info.dns_ready = info.tunnel_ready && session.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
     info.transparent_mode_ready = info.tunnel_ready && HasFlag(granted_flags, RuntimeFlag::TransparentMode);
-    info.active_profile = profile_name;
+    info.active_profile = session.selected_profile;
     info.granted_flags = granted_flags;
-    info.notes = BuildAppSessionNotes(request, profile_name, snapshot, granted_flags);
+    info.notes = BuildAppSessionNotes(session, snapshot, granted_flags);
 
     LogInfo("sysmodule", "opened app session " + std::to_string(session_id) + " for " +
                             (request.app.client_name.empty() ? std::string("unknown_app") : request.app.client_name));
@@ -692,7 +856,7 @@ class LocalControlService final : public IControlService {
 
     const AppSessionRecord& session = session_it->second;
     const StateSnapshot snapshot = state_machine_.snapshot();
-    const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+    const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
     NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, request);
     return MakeSuccess(std::move(plan));
   }
@@ -719,7 +883,7 @@ class LocalControlService final : public IControlService {
 
       session = session_it->second;
       snapshot = state_machine_.snapshot();
-      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
       active_runtime_flags = config_.runtime_flags;
 
       const auto profile_it = config_.profiles.find(session.selected_profile);
@@ -745,8 +909,8 @@ class LocalControlService final : public IControlService {
     result.dns_servers = dns_servers;
     result.message = plan.reason;
 
-    const bool local_dns_bypass = session.request.allow_local_network_bypass && LooksLocalHost(request.hostname);
-    const bool wants_tunnel_dns = session.request.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
+    const bool local_dns_bypass = session.allow_local_network_bypass && LooksLocalHost(request.hostname);
+    const bool wants_tunnel_dns = session.prefer_tunnel_dns && HasFlag(granted_flags, RuntimeFlag::DnsThroughTunnel);
     std::uint32_t fallback_count_increment = 0;
     const bool used_direct_fallback = plan.action == RouteAction::Direct && wants_tunnel_dns && !local_dns_bypass;
     if (plan.action == RouteAction::Direct) {
@@ -823,7 +987,7 @@ class LocalControlService final : public IControlService {
 
       session = session_it->second;
       snapshot = state_machine_.snapshot();
-      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
       active_runtime_flags = config_.runtime_flags;
 
       const auto profile_it = config_.profiles.find(session.selected_profile);
@@ -918,6 +1082,7 @@ class LocalControlService final : public IControlService {
       return MakeError(ErrorCode::NotFound, "tunnel datagram not found: " + std::to_string(datagram_id));
     }
 
+    RememberAndPurgeClosedTunnelFlowLocked(it->second);
     tunnel_datagrams_.erase(it);
     return Error::None();
   }
@@ -1009,7 +1174,7 @@ class LocalControlService final : public IControlService {
 
       session = session_it->second;
       snapshot = state_machine_.snapshot();
-      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.request.requested_flags);
+      granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
       active_runtime_flags = config_.runtime_flags;
 
       const auto profile_it = config_.profiles.find(session.selected_profile);
@@ -1222,6 +1387,7 @@ class LocalControlService final : public IControlService {
       static_cast<void>(SendTunnelStreamPacket(it->second, ToFlags(TcpControlFlag::Fin) | ToFlags(TcpControlFlag::Ack), {}));
     }
 
+    RememberAndPurgeClosedTunnelFlowLocked(it->second);
     tunnel_streams_.erase(it);
     return Error::None();
   }
@@ -1394,7 +1560,93 @@ class LocalControlService final : public IControlService {
     return MakeSuccess(std::move(received));
   }
 
+  void RememberClosedTunnelFlowLocked(const ClosedTunnelFlowRecord& flow) const {
+    closed_tunnel_flows_.push_back(flow);
+    while (closed_tunnel_flows_.size() > kClosedTunnelFlowRecordLimit) {
+      closed_tunnel_flows_.pop_front();
+    }
+  }
+
+  bool ShouldDropClosedTunnelFlowPacketLocked(const TunnelPacket& packet) const {
+    if (closed_tunnel_flows_.empty()) {
+      return false;
+    }
+
+    const Result<Ipv4TcpPacket> tcp_packet = ParseIpv4TcpPacket(packet.payload);
+    if (tcp_packet.ok()) {
+      for (const ClosedTunnelFlowRecord& flow : closed_tunnel_flows_) {
+        if (MatchesClosedTunnelFlow(flow, tcp_packet.value)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    const Result<Ipv4UdpPacket> udp_packet = ParseIpv4UdpPacket(packet.payload);
+    if (udp_packet.ok()) {
+      for (const ClosedTunnelFlowRecord& flow : closed_tunnel_flows_) {
+        if (MatchesClosedTunnelFlow(flow, udp_packet.value)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  void PurgeDeferredPacketsForClosedTunnelFlowLocked(const ClosedTunnelFlowRecord& flow) const {
+    std::deque<TunnelPacket> surviving_packets;
+    while (!deferred_packets_.empty()) {
+      TunnelPacket packet = std::move(deferred_packets_.front());
+      deferred_packets_.pop_front();
+      bool drop_packet = false;
+
+      const Result<Ipv4TcpPacket> tcp_packet = ParseIpv4TcpPacket(packet.payload);
+      if (tcp_packet.ok()) {
+        drop_packet = MatchesClosedTunnelFlow(flow, tcp_packet.value);
+      } else {
+        const Result<Ipv4UdpPacket> udp_packet = ParseIpv4UdpPacket(packet.payload);
+        if (udp_packet.ok()) {
+          drop_packet = MatchesClosedTunnelFlow(flow, udp_packet.value);
+        }
+      }
+
+      if (!drop_packet) {
+        surviving_packets.push_back(std::move(packet));
+      }
+    }
+
+    deferred_packets_ = std::move(surviving_packets);
+  }
+
+  template <typename FlowRecord>
+  void RememberAndPurgeClosedTunnelFlowLocked(const FlowRecord& flow_record) const {
+    const ClosedTunnelFlowRecord flow = MakeClosedTunnelFlowRecord(flow_record);
+    RememberClosedTunnelFlowLocked(flow);
+    PurgeDeferredPacketsForClosedTunnelFlowLocked(flow);
+  }
+
+  void InvalidateAllTunnelFlowsLocked() const {
+    for (const auto& [unused_id, datagram] : tunnel_datagrams_) {
+      static_cast<void>(unused_id);
+      RememberClosedTunnelFlowLocked(MakeClosedTunnelFlowRecord(datagram));
+    }
+
+    for (const auto& [unused_id, stream] : tunnel_streams_) {
+      static_cast<void>(unused_id);
+      RememberClosedTunnelFlowLocked(MakeClosedTunnelFlowRecord(stream));
+    }
+
+    tunnel_datagrams_.clear();
+    tunnel_streams_.clear();
+    deferred_packets_.clear();
+  }
+
   void DeferPacketLocked(TunnelPacket packet) const {
+    if (ShouldDropClosedTunnelFlowPacketLocked(packet)) {
+      return;
+    }
+
     deferred_packets_.push_back(std::move(packet));
   }
 
@@ -1422,7 +1674,7 @@ class LocalControlService final : public IControlService {
                        "tunnel is not connected after tunnel stream transport recovery");
     }
 
-    deferred_packets_.clear();
+    InvalidateAllTunnelFlowsLocked();
     LogInfo("sysmodule", "tunnel stream transport recovery succeeded; retrying stream open");
     return Error::None();
   }
@@ -1466,6 +1718,7 @@ class LocalControlService final : public IControlService {
   void RemoveTunnelDatagramsForSessionLocked(std::uint64_t session_id) {
     for (auto it = tunnel_datagrams_.begin(); it != tunnel_datagrams_.end();) {
       if (it->second.session_id == session_id) {
+        RememberAndPurgeClosedTunnelFlowLocked(it->second);
         it = tunnel_datagrams_.erase(it);
       } else {
         ++it;
@@ -1476,6 +1729,7 @@ class LocalControlService final : public IControlService {
   void RemoveTunnelStreamsForSessionLocked(std::uint64_t session_id) {
     for (auto it = tunnel_streams_.begin(); it != tunnel_streams_.end();) {
       if (it->second.session_id == session_id) {
+        RememberAndPurgeClosedTunnelFlowLocked(it->second);
         it = tunnel_streams_.erase(it);
       } else {
         ++it;
@@ -2036,6 +2290,7 @@ class LocalControlService final : public IControlService {
   mutable std::uint64_t next_tunnel_datagram_id_ = 1;
   mutable std::uint64_t next_tunnel_stream_id_ = 1;
   mutable std::deque<TunnelPacket> deferred_packets_{};
+  mutable std::deque<ClosedTunnelFlowRecord> closed_tunnel_flows_{};
   mutable std::uint16_t next_dns_query_id_ = 1;
   mutable std::uint16_t next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
   mutable std::uint16_t next_tunnel_stream_source_port_ = kTunnelStreamSourcePortBase;

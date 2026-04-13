@@ -27,8 +27,21 @@ struct ProfileConfig {
   bool kill_switch = false;
 };
 
+struct AppPolicyConfig {
+  std::string name;
+  std::string client_name;
+  std::string integration_tag;
+  std::string desired_profile;
+  RuntimeFlags requested_flags = 0;
+  bool allow_local_network_bypass = false;
+  bool require_tunnel_for_default_traffic = true;
+  bool prefer_tunnel_dns = true;
+  bool allow_direct_internet_fallback = false;
+};
+
 struct Config {
   std::map<std::string, ProfileConfig> profiles;
+  std::map<std::string, AppPolicyConfig> app_policies;
   std::string active_profile;
   RuntimeFlags runtime_flags = 0;
 };

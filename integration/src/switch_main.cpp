@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cstdio>
 #include <optional>
 #include <sstream>
@@ -8,6 +9,7 @@
 #include <switch.h>
 
 #include "swg/app_session.h"
+#include "swg/compat_bridge.h"
 #include "swg/client.h"
 #include "swg/ipc_protocol.h"
 #include "swg/moonlight.h"
@@ -46,6 +48,8 @@ struct IntegrationState {
   std::vector<std::string> dns_lines;
   std::string last_socket_result = "not run";
   std::vector<std::string> socket_lines;
+  std::string last_compat_result = "not run";
+  std::vector<std::string> compat_lines;
   std::string last_send_result = "not run";
   std::string last_receive_result = "not run";
   std::string last_smoke_summary = "not run";
@@ -98,6 +102,38 @@ std::string CurrentProfileName(const ScreenModel& model) {
   }
 
   return {};
+}
+
+swg::AppTunnelRequest MakeIntegrationSessionRequest(std::string desired_profile) {
+  swg::AppTunnelRequest request{};
+  request.app.client_name = "SWG Integration";
+  request.app.integration_tag = "switch-integration";
+  request.desired_profile = std::move(desired_profile);
+  return request;
+}
+
+const char* CompatRouteLabel(swg::CompatSocketRoute route) {
+  switch (route) {
+    case swg::CompatSocketRoute::Direct:
+      return "direct";
+    case swg::CompatSocketRoute::Tunnel:
+      return "tunnel";
+    case swg::CompatSocketRoute::Failed:
+    default:
+      return "failed";
+  }
+}
+
+std::string FormatResolvedCompatAddress(const sockaddr_storage& addr) {
+  char buffer[64] = {};
+  if (addr.ss_family == AF_INET) {
+    const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&addr);
+    if (inet_ntop(AF_INET, &ipv4->sin_addr, buffer, sizeof(buffer)) != nullptr) {
+      return std::string(buffer) + ":" + std::to_string(ntohs(ipv4->sin_port));
+    }
+  }
+
+  return "<unprintable>";
 }
 
 swg::Result<DiagnosticTarget> GetDiagnosticTarget(const ScreenModel& model) {
@@ -270,6 +306,8 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
     state->dns_lines.clear();
     state->last_socket_result = "not run";
     state->socket_lines.clear();
+    state->last_compat_result = "not run";
+    state->compat_lines.clear();
     state->last_send_result = "not run";
     state->last_receive_result = "not run";
     state->last_smoke_summary = "not run";
@@ -282,9 +320,7 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
     return "cannot open session without an active profile";
   }
 
-  swg::AppTunnelRequest request = swg::MakeMoonlightSessionRequest(profile_name, true);
-  request.app.client_name = "SWG Integration";
-  request.app.integration_tag = "switch-integration";
+  swg::AppTunnelRequest request = MakeIntegrationSessionRequest(profile_name);
 
   const auto opened = state->session.Open(request);
   if (!opened.ok()) {
@@ -399,6 +435,46 @@ std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state
   }
 
   return "socket abstraction refreshed";
+}
+
+std::string RunCompatResolveProbe(const ScreenModel& model, IntegrationState* state) {
+  state->compat_lines.clear();
+
+  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  if (!target.ok()) {
+    state->last_compat_result = "skipped";
+    state->compat_lines.push_back(target.error.message);
+    return "generic compat probe skipped";
+  }
+
+  constexpr char kCompatClientName[] = "SWG Integration Compat";
+  constexpr char kCompatIntegrationTag[] = "switch-integration-compat";
+  swg::ConfigureCompatBridgeIdentity(kCompatClientName, kCompatIntegrationTag, kCompatClientName);
+
+  state->compat_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
+  state->compat_lines.push_back(std::string("identity: client=") + kCompatClientName +
+                                " tag=" + kCompatIntegrationTag);
+
+  sockaddr_storage resolved_addr{};
+  socklen_t resolved_addr_len = 0;
+  std::string error;
+  const swg::CompatSocketRoute route =
+      swg::CompatResolveStreamHost(target.value.host, 47984, &resolved_addr, &resolved_addr_len, &error);
+
+  state->last_compat_result = std::string("route=") + CompatRouteLabel(route);
+  if (route == swg::CompatSocketRoute::Direct) {
+    state->compat_lines.push_back("result: compat layer selected native direct routing");
+    return "generic compat probe refreshed";
+  }
+
+  if (route == swg::CompatSocketRoute::Tunnel) {
+    state->compat_lines.push_back("result: compat layer selected tunnel routing");
+    state->compat_lines.push_back("resolved address: " + FormatResolvedCompatAddress(resolved_addr));
+    return "generic compat probe refreshed";
+  }
+
+  state->compat_lines.push_back("error: " + (error.empty() ? std::string("unknown compat failure") : error));
+  return "generic compat probe failed";
 }
 
 bool RecordPlanCheck(const char* label,
@@ -650,13 +726,19 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
     std::printf("  %s\n", line.c_str());
   }
 
+  std::printf("\ngeneric compat probe:\n");
+  std::printf("  %s\n", state.last_compat_result.c_str());
+  for (const auto& line : state.compat_lines) {
+    std::printf("  %s\n", line.c_str());
+  }
+
   std::printf("\ndiagnostic payload:\n");
   std::printf("  send=%s\n", state.last_send_result.c_str());
   std::printf("  recv=%s\n", state.last_receive_result.c_str());
   std::printf("  send/recv uses the sample tunnel socket when available\n");
 
   std::printf("\ncontrols:\n");
-  std::printf("  A connect/disconnect   B refresh   + exit\n");
+  std::printf("  A connect/disconnect   B refresh   - compat probe   + exit\n");
   std::printf("  X open/close session   Y run session smoke\n");
   std::printf("  Up resolve dns         Down open socket helpers\n");
   std::printf("  Left/Right change active profile\n");
@@ -693,6 +775,10 @@ int main(int argc, char** argv) {
     if ((buttons_down & HidNpadButton_B) != 0) {
       state.last_action = "manual refresh";
       refresh_requested = true;
+    }
+
+    if ((buttons_down & HidNpadButton_Minus) != 0) {
+      state.last_action = RunCompatResolveProbe(model, &state);
     }
 
     if (refresh_requested || frame_counter % kAutoRefreshFrames == 0) {

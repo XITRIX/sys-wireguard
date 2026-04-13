@@ -17,6 +17,10 @@ inline AppTunnelRequest MakeMoonlightSessionRequest(std::string desired_profile 
   request.app.integration_tag = "moonlight-switch";
   request.desired_profile = std::move(desired_profile);
   request.requested_flags = ToFlags(RuntimeFlag::DnsThroughTunnel);
+  request.policy_overrides = ToFlags(AppPolicyOverrideFlag::AllowLocalNetworkBypass) |
+                             ToFlags(AppPolicyOverrideFlag::RequireTunnelForDefaultTraffic) |
+                             ToFlags(AppPolicyOverrideFlag::PreferTunnelDns) |
+                             ToFlags(AppPolicyOverrideFlag::AllowDirectInternetFallback);
   request.allow_local_network_bypass = true;
   request.require_tunnel_for_default_traffic = require_tunnel;
   request.prefer_tunnel_dns = true;

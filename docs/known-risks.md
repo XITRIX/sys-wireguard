@@ -18,5 +18,7 @@
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
 - The app API now includes policy-safe DNS responses plus real UDP and TCP tunnel handles, but the tunnel DNS path is still limited to synchronous IPv4 A-record lookups and HTTPS still needs TLS or HTTP handling layered above `TunnelStreamSocket`.
 - Moonlight-Switch now compiles with a Switch-only bridge for HTTPS control, stream-host DNS, TCP stream sockets, UDP media sockets, and ENet control sockets, but none of that new transport path has been validated on hardware yet.
-- The current Moonlight bridge opens its app session with local-network bypass disabled so RFC1918 Moonlight hosts can still be forced through the tunnel; local direct-streaming behavior on Switch should be treated as changed until tested explicitly.
+- The generic compat bridge now builds for a second non-Moonlight consumer in the Switch integration app, but those route decisions still need real on-device validation against a live profile.
+- The runtime compat bridge now opens app sessions with identity only and relies on `[app_policy.*]` config for route behavior; misconfigured policies can change direct-vs-tunnel behavior without any source change in the consuming app.
+- The SDK now owns the Moonlight bridge implementation, but third-party apps still need small source-level hook points to call the exported C/C++ bridge surface; full build-time interposition of unmodified upstream socket calls is not implemented yet.
 - The sysmodule NPDM is intentionally permissive in Phase A (`service_access = ["*"]`) and should be tightened once the exact service dependencies are fixed.

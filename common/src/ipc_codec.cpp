@@ -156,11 +156,11 @@ class BufferReader {
     return offset_ == buffer_.size();
   }
 
- private:
   [[nodiscard]] std::size_t Remaining() const {
     return buffer_.size() - offset_;
   }
 
+ private:
   const ByteBuffer& buffer_;
   std::size_t offset_ = 0;
 };
@@ -192,6 +192,18 @@ void WriteProfileConfig(BufferWriter& writer, const ProfileConfig& value) {
   writer.WriteBool(value.autostart);
   writer.WriteBool(value.transparent_mode);
   writer.WriteBool(value.kill_switch);
+}
+
+void WriteAppPolicyConfig(BufferWriter& writer, const AppPolicyConfig& value) {
+  writer.WriteString(value.name);
+  writer.WriteString(value.client_name);
+  writer.WriteString(value.integration_tag);
+  writer.WriteString(value.desired_profile);
+  writer.WritePod<RuntimeFlags>(value.requested_flags);
+  writer.WriteBool(value.allow_local_network_bypass);
+  writer.WriteBool(value.require_tunnel_for_default_traffic);
+  writer.WriteBool(value.prefer_tunnel_dns);
+  writer.WriteBool(value.allow_direct_internet_fallback);
 }
 
 Result<ProfileConfig> ReadProfileConfig(BufferReader& reader) {
@@ -274,6 +286,69 @@ Result<ProfileConfig> ReadProfileConfig(BufferReader& reader) {
     return MakeFailure<ProfileConfig>(kill_switch.error.code, kill_switch.error.message);
   }
   value.kill_switch = kill_switch.value;
+  return MakeSuccess(std::move(value));
+}
+
+Result<AppPolicyConfig> ReadAppPolicyConfig(BufferReader& reader) {
+  AppPolicyConfig value{};
+
+  const Result<std::string> name = reader.ReadString();
+  if (!name.ok()) {
+    return MakeFailure<AppPolicyConfig>(name.error.code, name.error.message);
+  }
+  value.name = name.value;
+
+  const Result<std::string> client_name = reader.ReadString();
+  if (!client_name.ok()) {
+    return MakeFailure<AppPolicyConfig>(client_name.error.code, client_name.error.message);
+  }
+  value.client_name = client_name.value;
+
+  const Result<std::string> integration_tag = reader.ReadString();
+  if (!integration_tag.ok()) {
+    return MakeFailure<AppPolicyConfig>(integration_tag.error.code, integration_tag.error.message);
+  }
+  value.integration_tag = integration_tag.value;
+
+  const Result<std::string> desired_profile = reader.ReadString();
+  if (!desired_profile.ok()) {
+    return MakeFailure<AppPolicyConfig>(desired_profile.error.code, desired_profile.error.message);
+  }
+  value.desired_profile = desired_profile.value;
+
+  const Result<RuntimeFlags> requested_flags = reader.ReadPod<RuntimeFlags>();
+  if (!requested_flags.ok()) {
+    return MakeFailure<AppPolicyConfig>(requested_flags.error.code, requested_flags.error.message);
+  }
+  value.requested_flags = requested_flags.value;
+
+  const Result<bool> allow_local_network_bypass = reader.ReadBool();
+  if (!allow_local_network_bypass.ok()) {
+    return MakeFailure<AppPolicyConfig>(allow_local_network_bypass.error.code,
+                                        allow_local_network_bypass.error.message);
+  }
+  value.allow_local_network_bypass = allow_local_network_bypass.value;
+
+  const Result<bool> require_tunnel_for_default_traffic = reader.ReadBool();
+  if (!require_tunnel_for_default_traffic.ok()) {
+    return MakeFailure<AppPolicyConfig>(require_tunnel_for_default_traffic.error.code,
+                                        require_tunnel_for_default_traffic.error.message);
+  }
+  value.require_tunnel_for_default_traffic = require_tunnel_for_default_traffic.value;
+
+  const Result<bool> prefer_tunnel_dns = reader.ReadBool();
+  if (!prefer_tunnel_dns.ok()) {
+    return MakeFailure<AppPolicyConfig>(prefer_tunnel_dns.error.code, prefer_tunnel_dns.error.message);
+  }
+  value.prefer_tunnel_dns = prefer_tunnel_dns.value;
+
+  const Result<bool> allow_direct_internet_fallback = reader.ReadBool();
+  if (!allow_direct_internet_fallback.ok()) {
+    return MakeFailure<AppPolicyConfig>(allow_direct_internet_fallback.error.code,
+                                        allow_direct_internet_fallback.error.message);
+  }
+  value.allow_direct_internet_fallback = allow_direct_internet_fallback.value;
+
   return MakeSuccess(std::move(value));
 }
 
@@ -485,6 +560,11 @@ Result<ByteBuffer> EncodePayload(const Config& value) {
   BufferWriter writer;
   writer.WriteString(value.active_profile);
   writer.WritePod<RuntimeFlags>(value.runtime_flags);
+  writer.WritePod<std::uint32_t>(static_cast<std::uint32_t>(value.app_policies.size()));
+  for (const auto& [name, policy] : value.app_policies) {
+    (void)name;
+    WriteAppPolicyConfig(writer, policy);
+  }
   writer.WritePod<std::uint32_t>(static_cast<std::uint32_t>(value.profiles.size()));
   for (const auto& [name, profile] : value.profiles) {
     (void)name;
@@ -508,6 +588,19 @@ Result<Config> DecodeConfigPayload(const ByteBuffer& payload) {
     return MakeFailure<Config>(runtime_flags.error.code, runtime_flags.error.message);
   }
   value.runtime_flags = runtime_flags.value;
+
+  const Result<std::uint32_t> app_policy_count = reader.ReadPod<std::uint32_t>();
+  if (!app_policy_count.ok()) {
+    return MakeFailure<Config>(app_policy_count.error.code, app_policy_count.error.message);
+  }
+
+  for (std::uint32_t index = 0; index < app_policy_count.value; ++index) {
+    const Result<AppPolicyConfig> app_policy = ReadAppPolicyConfig(reader);
+    if (!app_policy.ok()) {
+      return MakeFailure<Config>(app_policy.error.code, app_policy.error.message);
+    }
+    value.app_policies[app_policy.value.name] = app_policy.value;
+  }
 
   const Result<std::uint32_t> count = reader.ReadPod<std::uint32_t>();
   if (!count.ok()) {
@@ -730,6 +823,9 @@ Result<ByteBuffer> EncodePayload(const AppTunnelRequest& value) {
   writer.WriteString(value.app.integration_tag);
   writer.WriteString(value.desired_profile);
   writer.WritePod<RuntimeFlags>(value.requested_flags);
+  if (value.policy_overrides != 0) {
+    writer.WritePod<AppPolicyOverrideFlags>(value.policy_overrides);
+  }
   writer.WriteBool(value.allow_local_network_bypass);
   writer.WriteBool(value.require_tunnel_for_default_traffic);
   writer.WriteBool(value.prefer_tunnel_dns);
@@ -776,6 +872,21 @@ Result<AppTunnelRequest> DecodeAppTunnelRequestPayload(const ByteBuffer& payload
     return MakeFailure<AppTunnelRequest>(requested_flags.error.code, requested_flags.error.message);
   }
   value.requested_flags = requested_flags.value;
+
+  constexpr std::size_t kAppTunnelRequestBoolFieldCount = 4;
+  constexpr std::size_t kLegacyAppTunnelRequestTrailingBytes = kAppTunnelRequestBoolFieldCount * sizeof(std::uint8_t);
+  constexpr std::size_t kCurrentAppTunnelRequestTrailingBytes =
+      sizeof(AppPolicyOverrideFlags) + kLegacyAppTunnelRequestTrailingBytes;
+
+  if (reader.Remaining() == kCurrentAppTunnelRequestTrailingBytes) {
+    const Result<AppPolicyOverrideFlags> policy_overrides = reader.ReadPod<AppPolicyOverrideFlags>();
+    if (!policy_overrides.ok()) {
+      return MakeFailure<AppTunnelRequest>(policy_overrides.error.code, policy_overrides.error.message);
+    }
+    value.policy_overrides = policy_overrides.value;
+  } else if (reader.Remaining() != kLegacyAppTunnelRequestTrailingBytes) {
+    return MakeFailure<AppTunnelRequest>(ErrorCode::ParseError, "unexpected AppTunnelRequest payload size");
+  }
 
   const Result<bool> allow_local_network_bypass = reader.ReadBool();
   if (!allow_local_network_bypass.ok()) {
