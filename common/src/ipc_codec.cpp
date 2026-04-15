@@ -206,6 +206,15 @@ void WriteAppPolicyConfig(BufferWriter& writer, const AppPolicyConfig& value) {
   writer.WriteBool(value.allow_direct_internet_fallback);
 }
 
+void WriteIntegrationTestConfig(BufferWriter& writer, const IntegrationTestConfig& value) {
+  writer.WriteString(value.target_host);
+  writer.WriteString(value.dns_hostname);
+  writer.WritePod<std::uint16_t>(value.tcp_echo_port);
+  writer.WritePod<std::uint16_t>(value.http_port);
+  writer.WritePod<std::uint16_t>(value.udp_echo_port);
+  writer.WriteString(value.http_path);
+}
+
 Result<ProfileConfig> ReadProfileConfig(BufferReader& reader) {
   ProfileConfig value{};
 
@@ -348,6 +357,48 @@ Result<AppPolicyConfig> ReadAppPolicyConfig(BufferReader& reader) {
                                         allow_direct_internet_fallback.error.message);
   }
   value.allow_direct_internet_fallback = allow_direct_internet_fallback.value;
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<IntegrationTestConfig> ReadIntegrationTestConfig(BufferReader& reader) {
+  IntegrationTestConfig value{};
+
+  const Result<std::string> target_host = reader.ReadString();
+  if (!target_host.ok()) {
+    return MakeFailure<IntegrationTestConfig>(target_host.error.code, target_host.error.message);
+  }
+  value.target_host = target_host.value;
+
+  const Result<std::string> dns_hostname = reader.ReadString();
+  if (!dns_hostname.ok()) {
+    return MakeFailure<IntegrationTestConfig>(dns_hostname.error.code, dns_hostname.error.message);
+  }
+  value.dns_hostname = dns_hostname.value;
+
+  const Result<std::uint16_t> tcp_echo_port = reader.ReadPod<std::uint16_t>();
+  if (!tcp_echo_port.ok()) {
+    return MakeFailure<IntegrationTestConfig>(tcp_echo_port.error.code, tcp_echo_port.error.message);
+  }
+  value.tcp_echo_port = tcp_echo_port.value;
+
+  const Result<std::uint16_t> http_port = reader.ReadPod<std::uint16_t>();
+  if (!http_port.ok()) {
+    return MakeFailure<IntegrationTestConfig>(http_port.error.code, http_port.error.message);
+  }
+  value.http_port = http_port.value;
+
+  const Result<std::uint16_t> udp_echo_port = reader.ReadPod<std::uint16_t>();
+  if (!udp_echo_port.ok()) {
+    return MakeFailure<IntegrationTestConfig>(udp_echo_port.error.code, udp_echo_port.error.message);
+  }
+  value.udp_echo_port = udp_echo_port.value;
+
+  const Result<std::string> http_path = reader.ReadString();
+  if (!http_path.ok()) {
+    return MakeFailure<IntegrationTestConfig>(http_path.error.code, http_path.error.message);
+  }
+  value.http_path = http_path.value;
 
   return MakeSuccess(std::move(value));
 }
@@ -570,6 +621,7 @@ Result<ByteBuffer> EncodePayload(const Config& value) {
     (void)name;
     WriteProfileConfig(writer, profile);
   }
+  WriteIntegrationTestConfig(writer, value.integration_test);
   return MakeSuccess(std::move(writer).Finish());
 }
 
@@ -614,6 +666,12 @@ Result<Config> DecodeConfigPayload(const ByteBuffer& payload) {
     }
     value.profiles[profile.value.name] = profile.value;
   }
+
+  const Result<IntegrationTestConfig> integration_test = ReadIntegrationTestConfig(reader);
+  if (!integration_test.ok()) {
+    return MakeFailure<Config>(integration_test.error.code, integration_test.error.message);
+  }
+  value.integration_test = integration_test.value;
 
   const Error trailing = EnsureFullyConsumed(reader);
   if (trailing) {

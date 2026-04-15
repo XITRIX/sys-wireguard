@@ -19,6 +19,19 @@
       }
     },
     {
+      "name": "host-server",
+      "displayName": "Host Integration Server",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-server",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SWG_BUILD_HOST_TOOLS": "ON",
+        "SWG_BUILD_SWITCH_TARGETS": "OFF",
+        "SWG_BUILD_TESTS": "OFF",
+        "SWG_BUILD_INTEGRATION_SERVER_ONLY": "ON"
+      }
+    },
+    {
       "name": "switch-debug",
       "displayName": "Switch Debug",
       "generator": "Ninja",
@@ -36,6 +49,10 @@
     {
       "name": "host-debug",
       "configurePreset": "host-debug"
+    },
+    {
+      "name": "host-server",
+      "configurePreset": "host-server"
     },
     {
       "name": "switch-debug",

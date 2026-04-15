@@ -239,6 +239,54 @@ Error AssignAppPolicyValue(AppPolicyConfig& policy, const std::string& key, cons
   return MakeError(ErrorCode::ParseError, "unknown app policy key: " + key);
 }
 
+Error AssignIntegrationTestValue(IntegrationTestConfig& config,
+                                 const std::string& key,
+                                 const std::string& value) {
+  if (key == "target_host") {
+    config.target_host = value;
+    return Error::None();
+  }
+
+  if (key == "dns_hostname") {
+    config.dns_hostname = value;
+    return Error::None();
+  }
+
+  if (key == "tcp_echo_port") {
+    const Result<std::uint16_t> parsed = ParseU16(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    config.tcp_echo_port = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "http_port") {
+    const Result<std::uint16_t> parsed = ParseU16(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    config.http_port = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "udp_echo_port") {
+    const Result<std::uint16_t> parsed = ParseU16(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    config.udp_echo_port = parsed.value;
+    return Error::None();
+  }
+
+  if (key == "http_path") {
+    config.http_path = value;
+    return Error::None();
+  }
+
+  return MakeError(ErrorCode::ParseError, "unknown integration test key: " + key);
+}
+
 bool HasCompleteKeyMaterial(const ProfileConfig& profile) {
   return !profile.private_key.empty() && !profile.public_key.empty() && !profile.endpoint_host.empty() &&
          !profile.allowed_ips.empty() && !profile.addresses.empty();
@@ -326,6 +374,13 @@ Result<Config> LoadConfigFile(const std::filesystem::path& path) {
         continue;
       }
 
+      if (section == "integration_test") {
+        current_section = "integration_test";
+        current_profile_name.clear();
+        current_policy_name.clear();
+        continue;
+      }
+
       return MakeFailure<Config>(ErrorCode::ParseError,
                                  "unknown section at line " + std::to_string(line_number) + ": " + section);
     }
@@ -366,6 +421,15 @@ Result<Config> LoadConfigFile(const std::filesystem::path& path) {
       AppPolicyConfig& policy = config.app_policies[current_policy_name];
       policy.name = current_policy_name;
       const Error assign_error = AssignAppPolicyValue(policy, key, value);
+      if (assign_error) {
+        return MakeFailure<Config>(assign_error.code,
+                                   assign_error.message + " at line " + std::to_string(line_number));
+      }
+      continue;
+    }
+
+    if (current_section == "integration_test") {
+      const Error assign_error = AssignIntegrationTestValue(config.integration_test, key, value);
       if (assign_error) {
         return MakeFailure<Config>(assign_error.code,
                                    assign_error.message + " at line " + std::to_string(line_number));
@@ -427,6 +491,14 @@ Error SaveConfigFile(const Config& config, const std::filesystem::path& path) {
   output << "active_profile = " << config.active_profile << "\n";
   output << "runtime_flags = " << RuntimeFlagsToString(config.runtime_flags) << "\n\n";
 
+  output << "[integration_test]\n";
+  output << "target_host = " << config.integration_test.target_host << "\n";
+  output << "dns_hostname = " << config.integration_test.dns_hostname << "\n";
+  output << "tcp_echo_port = " << config.integration_test.tcp_echo_port << "\n";
+  output << "http_port = " << config.integration_test.http_port << "\n";
+  output << "udp_echo_port = " << config.integration_test.udp_echo_port << "\n";
+  output << "http_path = " << config.integration_test.http_path << "\n\n";
+
   for (const auto& [name, policy] : config.app_policies) {
     output << "[app_policy." << name << "]\n";
     output << "client_name = " << policy.client_name << "\n";
@@ -471,6 +543,23 @@ Error ValidateConfig(const Config& config) {
                      "active_profile does not match any profile: " + config.active_profile);
   }
 
+  if (config.integration_test.tcp_echo_port == 0) {
+    return MakeError(ErrorCode::InvalidConfig, "integration_test tcp_echo_port must not be 0");
+  }
+
+  if (config.integration_test.http_port == 0) {
+    return MakeError(ErrorCode::InvalidConfig, "integration_test http_port must not be 0");
+  }
+
+  if (config.integration_test.udp_echo_port == 0) {
+    return MakeError(ErrorCode::InvalidConfig, "integration_test udp_echo_port must not be 0");
+  }
+
+  if (config.integration_test.http_path.empty() || config.integration_test.http_path.front() != '/') {
+    return MakeError(ErrorCode::InvalidConfig,
+                     "integration_test http_path must start with '/'");
+  }
+
   for (const auto& [name, profile] : config.profiles) {
     if (name.empty()) {
       return MakeError(ErrorCode::InvalidConfig, "profile name must not be empty");
@@ -509,6 +598,10 @@ std::string DescribeConfig(const Config& config) {
 
   if (!config.active_profile.empty()) {
     stream << ", active_profile=" << config.active_profile;
+  }
+
+  if (!config.integration_test.target_host.empty()) {
+    stream << ", integration_target=" << config.integration_test.target_host;
   }
 
   stream << ", runtime_flags=" << RuntimeFlagsToString(config.runtime_flags);

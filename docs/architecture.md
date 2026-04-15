@@ -8,6 +8,7 @@ Current implementation boundaries:
 - `swg_common`: config schema, logging, state machine, compatibility probes, and IPC-facing structs.
 - `swg_common` also owns the request/response codec and command dispatcher used by the current `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
+- `swg_sysmodule_core` also now carries a dormant experimental MITM scaffold for `sfdnsres` and future `bsd:*` interception planning, compiled for policy/tests only and not installed by `switch_main`.
 - `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
 - `swg_sdk` also owns the reusable compat bridge layer for tunnel-aware HTTP control, stream-host DNS, and tunnel socket attachment, with Moonlight kept as one compatibility consumer rather than the implementation center.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning, send/receive packet calls, and future per-app tunnel control.
@@ -23,6 +24,7 @@ Current implementation boundaries:
 - The overlay stub talks through the SDK client, not by mutating files directly.
 - Host execution is a first-class development mode so the control plane can be tested without device-only dependencies.
 - A dedicated host live-handshake probe now exists for Milestone 4 diagnosis so a real config can be exercised through the same local control service and tunnel engine path without deploying to hardware.
+- Experimental service MITM work is isolated from the stable control plane until a dedicated Switch-only server path exists; `swg:ctl` remains the only active sysmodule API today.
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
@@ -93,5 +95,5 @@ The current tunnel DNS implementation is intentionally conservative: it crafts I
 
 - Tesla overlay parity, rendering, and input handling
 - WireGuard cookie handling plus later rekey or roaming policy
-- DNS-over-tunnel and MITM logic
+- Switch-side service MITM activation for `sfdnsres` and later `bsd:*` work
 - policy-driven transparent routing

@@ -156,7 +156,9 @@ Implemented:
 
 The SDK now exposes a generic `swg::AppSession` wrapper, a route-planning surface, a route-aware `swg::SessionSocket` wrapper, and send/receive packet calls for app consumers that still use their own sockets and HTTP stack.
 
-For on-device validation, the Switch build now also stages `build/switch-debug/integration/switch/swg_integration_test.nro` as a separate integration harness. It exercises the live `swg::Client` and `swg::AppSession` path on hardware, runs Moonlight-style route-planning smoke checks against the active runtime state, exposes `ResolveDns()` results directly, and opens sample `SessionSocket` wrappers before using the current tunnel packet path for diagnostic send/receive.
+For on-device validation, the Switch build now also stages `build/switch-debug/integration/switch/swg_integration_test.nro` as a separate integration harness. It exercises the live `swg::Client` and `swg::AppSession` path on hardware, reads a dedicated `[integration_test]` target from the runtime config, and exposes a one-button `Y` runner that checks route-planning smoke, tunnel DNS, `SessionSocket` mode selection, TCP echo, HTTP probe, and UDP echo over the real tunnel APIs.
+
+The host build now also stages `build/host-debug/integration/swg_integration_server`, a passive IPv4 test server with TCP echo, UDP echo, and HTTP probe listeners so the Switch harness can validate a routed LAN host independently from the WireGuard endpoint.
 
 Moonlight-oriented helpers are provided in `sdk/include/swg/moonlight.h`:
 - open an app session with `MakeMoonlightSessionRequest()`

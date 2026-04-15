@@ -1,4 +1,6 @@
 add_library(swg_sysmodule_core STATIC
+  src/experimental_dns_mitm.cpp
+  src/experimental_mitm.cpp
   src/host_transport.cpp
   src/local_service.cpp
   src/socket_runtime.cpp
@@ -16,6 +18,13 @@ target_link_libraries(swg_sysmodule_core
   PUBLIC
     swg_common
 )
+
+if(TARGET Threads::Threads)
+  target_link_libraries(swg_sysmodule_core
+    PUBLIC
+      Threads::Threads
+  )
+endif()
 
 swg_apply_defaults(swg_sysmodule_core)
 

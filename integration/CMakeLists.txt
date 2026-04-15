@@ -1,3 +1,25 @@
+if(SWG_BUILD_HOST_TOOLS)
+  add_executable(swg_integration_server
+    src/host_server.cpp
+  )
+
+  if(TARGET Threads::Threads)
+    target_link_libraries(swg_integration_server
+      PRIVATE
+        Threads::Threads
+    )
+  endif()
+
+  if(WIN32)
+    target_link_libraries(swg_integration_server
+      PRIVATE
+        ws2_32
+    )
+  endif()
+
+  swg_apply_defaults(swg_integration_server)
+endif()
+
 if(SWG_BUILD_SWITCH_TARGETS AND CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
   add_executable(swg_integration_switch
     src/switch_main.cpp

@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <switch.h>
@@ -20,6 +22,10 @@ namespace {
 
 constexpr int kAutoRefreshFrames = 30;
 constexpr std::size_t kMaxPreviewBytes = 8;
+constexpr std::uint64_t kReceivePollIntervalNs = 100 * 1000 * 1000ULL;
+constexpr int kReceivePollAttempts = 20;
+
+constexpr char kHarnessHttpSignature[] = "service=swg-integration-server";
 
 struct ScreenModel {
   swg::Result<swg::VersionInfo> version;
@@ -35,6 +41,16 @@ struct DiagnosticTarget {
   bool is_hostname = false;
   bool is_numeric_ipv4 = false;
   bool is_numeric_ipv6 = false;
+};
+
+struct IntegrationServerTarget {
+  DiagnosticTarget endpoint;
+  std::string dns_hostname;
+  std::uint16_t tcp_echo_port = 0;
+  std::uint16_t http_port = 0;
+  std::uint16_t udp_echo_port = 0;
+  std::string http_path;
+  bool uses_profile_endpoint = false;
 };
 
 struct IntegrationState {
@@ -54,8 +70,13 @@ struct IntegrationState {
   std::string last_receive_result = "not run";
   std::string last_smoke_summary = "not run";
   std::vector<std::string> smoke_lines;
+  std::string last_run_all_summary = "not run";
+  std::vector<std::string> run_all_lines;
   std::uint8_t payload_nonce = 1;
+  std::uint32_t run_all_nonce = 1;
 };
+
+bool IsSessionTunnelReady(const ScreenModel& model, const IntegrationState& state);
 
 const char* BoolLabel(bool value) {
   return value ? "yes" : "no";
@@ -173,6 +194,27 @@ swg::Result<DiagnosticTarget> GetDiagnosticTarget(const ScreenModel& model) {
   return swg::MakeSuccess(std::move(target));
 }
 
+swg::Result<DiagnosticTarget> ClassifyDiagnosticTarget(std::string host, std::string_view field_name) {
+  if (host.empty()) {
+    return swg::MakeFailure<DiagnosticTarget>(swg::ErrorCode::ParseError,
+                                              std::string(field_name) + " must not be empty");
+  }
+
+  DiagnosticTarget target{};
+  target.host = std::move(host);
+
+  const swg::Result<swg::ParsedIpAddress> parsed = swg::ParseIpAddress(target.host, std::string(field_name));
+  if (!parsed.ok()) {
+    target.is_hostname = true;
+  } else if (parsed.value.family == swg::ParsedIpFamily::IPv4) {
+    target.is_numeric_ipv4 = true;
+  } else {
+    target.is_numeric_ipv6 = true;
+  }
+
+  return swg::MakeSuccess(std::move(target));
+}
+
 std::string DescribeDiagnosticTarget(const DiagnosticTarget& target) {
   if (target.is_hostname) {
     return target.host + " (hostname)";
@@ -185,13 +227,201 @@ std::string DescribeDiagnosticTarget(const DiagnosticTarget& target) {
   return target.host + " (numeric IPv6)";
 }
 
+swg::Result<IntegrationServerTarget> GetIntegrationServerTarget(const ScreenModel& model) {
+  if (!model.config.ok()) {
+    return swg::MakeFailure<IntegrationServerTarget>(model.config.error.code,
+                                                     "config unavailable: " + model.config.error.message);
+  }
+
+  IntegrationServerTarget target{};
+  target.tcp_echo_port = model.config.value.integration_test.tcp_echo_port;
+  target.http_port = model.config.value.integration_test.http_port;
+  target.udp_echo_port = model.config.value.integration_test.udp_echo_port;
+  target.http_path = model.config.value.integration_test.http_path;
+
+  if (!model.config.value.integration_test.target_host.empty()) {
+    const swg::Result<DiagnosticTarget> classified =
+        ClassifyDiagnosticTarget(model.config.value.integration_test.target_host, "integration_test.target_host");
+    if (!classified.ok()) {
+      return swg::MakeFailure<IntegrationServerTarget>(classified.error.code, classified.error.message);
+    }
+    target.endpoint = classified.value;
+  } else {
+    const swg::Result<DiagnosticTarget> fallback = GetDiagnosticTarget(model);
+    if (!fallback.ok()) {
+      return swg::MakeFailure<IntegrationServerTarget>(fallback.error.code, fallback.error.message);
+    }
+    target.endpoint = fallback.value;
+    target.uses_profile_endpoint = true;
+  }
+
+  if (!model.config.value.integration_test.dns_hostname.empty()) {
+    target.dns_hostname = model.config.value.integration_test.dns_hostname;
+  } else if (target.endpoint.is_hostname) {
+    target.dns_hostname = target.endpoint.host;
+  }
+
+  return swg::MakeSuccess(std::move(target));
+}
+
+std::string DescribeIntegrationServerTarget(const IntegrationServerTarget& target) {
+  std::string description = DescribeDiagnosticTarget(target.endpoint);
+  description += " tcp=" + std::to_string(target.tcp_echo_port);
+  description += " http=" + std::to_string(target.http_port);
+  description += " udp=" + std::to_string(target.udp_echo_port);
+  if (target.uses_profile_endpoint) {
+    description += " source=profile.endpoint_host";
+  } else {
+    description += " source=integration_test.target_host";
+  }
+  if (!target.dns_hostname.empty()) {
+    description += " dns=" + target.dns_hostname;
+  }
+  return description;
+}
+
+void ClearSessionDiagnostics(IntegrationState* state) {
+  state->sample_socket.reset();
+  state->last_dns_result = "not run";
+  state->dns_lines.clear();
+  state->last_socket_result = "not run";
+  state->socket_lines.clear();
+  state->last_compat_result = "not run";
+  state->compat_lines.clear();
+  state->last_send_result = "not run";
+  state->last_receive_result = "not run";
+  state->last_smoke_summary = "not run";
+  state->smoke_lines.clear();
+  state->last_run_all_summary = "not run";
+  state->run_all_lines.clear();
+}
+
+std::vector<std::uint8_t> ToByteVector(const std::string& value) {
+  return std::vector<std::uint8_t>(value.begin(), value.end());
+}
+
+std::string ToString(const std::vector<std::uint8_t>& value) {
+  return std::string(value.begin(), value.end());
+}
+
+void RecordRunAllStep(std::vector<std::string>* lines,
+                      bool passed,
+                      const char* label,
+                      const std::string& detail) {
+  lines->push_back(std::string(passed ? "PASS " : "FAIL ") + label + ": " + detail);
+}
+
+swg::Result<swg::TunnelDatagram> PollTunnelDatagramReceive(const swg::TunnelDatagramSocket& socket) {
+  for (int attempt = 0; attempt < kReceivePollAttempts; ++attempt) {
+    const auto result = socket.Receive();
+    if (result.ok()) {
+      return result;
+    }
+    if (result.error.code != swg::ErrorCode::NotFound) {
+      return result;
+    }
+    svcSleepThread(kReceivePollIntervalNs);
+  }
+
+  return swg::MakeFailure<swg::TunnelDatagram>(swg::ErrorCode::NotFound,
+                                               "timed out waiting for a tunnel datagram response");
+}
+
+swg::Result<swg::TunnelStreamReadResult> PollTunnelStreamReceive(const swg::TunnelStreamSocket& socket) {
+  for (int attempt = 0; attempt < kReceivePollAttempts; ++attempt) {
+    const auto result = socket.Receive();
+    if (result.ok()) {
+      if (!result.value.payload.empty() || result.value.peer_closed) {
+        return result;
+      }
+    } else if (result.error.code != swg::ErrorCode::NotFound) {
+      return result;
+    }
+
+    svcSleepThread(kReceivePollIntervalNs);
+  }
+
+  return swg::MakeFailure<swg::TunnelStreamReadResult>(swg::ErrorCode::NotFound,
+                                                       "timed out waiting for a tunnel stream response");
+}
+
+bool EnsureConnectedSession(const swg::Client& client,
+                            ScreenModel* model,
+                            IntegrationState* state,
+                            std::string* detail) {
+  if (!model->status.ok()) {
+    *detail = "status unavailable: " + model->status.error.message;
+    return false;
+  }
+
+  if (model->status.value.state != swg::TunnelState::Connected) {
+    const swg::Error error = client.Connect();
+    if (error) {
+      *detail = "connect failed: " + error.message;
+      return false;
+    }
+
+    RefreshModel(client, model);
+    if (!model->status.ok()) {
+      *detail = "status unavailable after connect: " + model->status.error.message;
+      return false;
+    }
+    if (model->status.value.state != swg::TunnelState::Connected) {
+      *detail = "connect returned without reaching connected state";
+      return false;
+    }
+  }
+
+  const std::string profile_name = CurrentProfileName(*model);
+  if (profile_name.empty()) {
+    *detail = "no active profile available";
+    return false;
+  }
+
+  if (state->session.is_open() && state->session.info().active_profile != profile_name) {
+    const swg::Error error = state->session.Close();
+    if (error) {
+      *detail = "close stale session failed: " + error.message;
+      return false;
+    }
+    state->session_request = {};
+    ClearSessionDiagnostics(state);
+  }
+
+  if (!state->session.is_open()) {
+    const swg::AppTunnelRequest request = MakeIntegrationSessionRequest(profile_name);
+    const auto opened = state->session.Open(request);
+    if (!opened.ok()) {
+      *detail = "open session failed: " + opened.error.message;
+      return false;
+    }
+
+    state->session_request = request;
+    ClearSessionDiagnostics(state);
+  }
+
+  RefreshModel(client, model);
+  if (!IsSessionTunnelReady(*model, *state)) {
+    *detail = "session opened but tunnel is not ready for the active profile";
+    return false;
+  }
+
+  *detail = "connected profile=" + state->session.info().active_profile +
+            " session_id=" + std::to_string(state->session.info().session_id);
+  return true;
+}
+
 std::string SelectSmokeTargetHost(const ScreenModel& model) {
-  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(model);
   if (!target.ok()) {
     return "vpn.example.test";
   }
 
-  return target.value.host;
+  if (!target.value.dns_hostname.empty()) {
+    return target.value.dns_hostname;
+  }
+
+  return target.value.endpoint.host;
 }
 
 bool IsSessionTunnelReady(const ScreenModel& model, const IntegrationState& state) {
@@ -301,17 +531,7 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
     }
 
     state->session_request = {};
-    state->sample_socket.reset();
-    state->last_dns_result = "not run";
-    state->dns_lines.clear();
-    state->last_socket_result = "not run";
-    state->socket_lines.clear();
-    state->last_compat_result = "not run";
-    state->compat_lines.clear();
-    state->last_send_result = "not run";
-    state->last_receive_result = "not run";
-    state->last_smoke_summary = "not run";
-    state->smoke_lines.clear();
+    ClearSessionDiagnostics(state);
     return "app session closed";
   }
 
@@ -328,11 +548,7 @@ std::string ToggleSession(const ScreenModel& model, IntegrationState* state) {
   }
 
   state->session_request = request;
-  state->sample_socket.reset();
-  state->last_dns_result = "not run";
-  state->dns_lines.clear();
-  state->last_socket_result = "not run";
-  state->socket_lines.clear();
+  ClearSessionDiagnostics(state);
   return "app session opened: id=" + std::to_string(opened.value.session_id) +
          " profile=" + opened.value.active_profile;
 }
@@ -343,21 +559,22 @@ std::string RunDnsResolve(const ScreenModel& model, IntegrationState* state) {
   }
 
   state->dns_lines.clear();
-  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(model);
   if (!target.ok()) {
     state->last_dns_result = "skipped";
     state->dns_lines.push_back(target.error.message);
     return "dns resolve skipped";
   }
 
-  state->dns_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
-  if (!target.value.is_hostname) {
+  state->dns_lines.push_back("target: " + DescribeIntegrationServerTarget(target.value));
+  if (target.value.dns_hostname.empty()) {
     state->last_dns_result = "skipped";
-    state->dns_lines.push_back("active profile endpoint_host is numeric; tunnel DNS diagnostics require a hostname");
+    state->dns_lines.push_back(
+        "configure integration_test.dns_hostname to exercise tunnel DNS when the target host is numeric");
     return "dns resolve skipped";
   }
 
-  const auto dns = state->session.ResolveDns(target.value.host);
+  const auto dns = state->session.ResolveDns(target.value.dns_hostname);
   if (!dns.ok()) {
     state->last_dns_result = "failed";
     state->dns_lines.push_back(dns.error.message);
@@ -401,7 +618,7 @@ std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state
   }
 
   state->socket_lines.clear();
-  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(model);
   if (!target.ok()) {
     state->sample_socket.reset();
     state->last_socket_result = "skipped";
@@ -409,8 +626,8 @@ std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state
     return "socket abstraction skipped";
   }
 
-  state->socket_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
-  if (target.value.is_numeric_ipv6) {
+  state->socket_lines.push_back("target: " + DescribeIntegrationServerTarget(target.value));
+  if (target.value.endpoint.is_numeric_ipv6) {
     state->sample_socket.reset();
     state->last_socket_result = "skipped";
     state->socket_lines.push_back(
@@ -419,12 +636,13 @@ std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state
   }
 
   const auto video_socket = swg::SessionSocket::OpenDatagram(
-      state->session, swg::MakeMoonlightVideoSocketRequest(target.value.host, 47998));
+      state->session, swg::MakeMoonlightVideoSocketRequest(target.value.endpoint.host, target.value.udp_echo_port));
   RecordSocketSummary("video-datagram", video_socket, &state->socket_lines);
 
   const auto control_socket = swg::SessionSocket::OpenStream(
-      state->session, swg::MakeMoonlightHttpsControlSocketRequest(target.value.host, 47984));
-  RecordSocketSummary("https-control", control_socket, &state->socket_lines);
+      state->session,
+      swg::MakeMoonlightStreamControlSocketRequest(target.value.endpoint.host, target.value.tcp_echo_port));
+  RecordSocketSummary("tcp-stream", control_socket, &state->socket_lines);
 
   if (video_socket.ok() && video_socket.value.uses_tunnel_packets()) {
     state->sample_socket = video_socket.value;
@@ -440,7 +658,7 @@ std::string PrepareSocketSmoke(const ScreenModel& model, IntegrationState* state
 std::string RunCompatResolveProbe(const ScreenModel& model, IntegrationState* state) {
   state->compat_lines.clear();
 
-  const swg::Result<DiagnosticTarget> target = GetDiagnosticTarget(model);
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(model);
   if (!target.ok()) {
     state->last_compat_result = "skipped";
     state->compat_lines.push_back(target.error.message);
@@ -451,15 +669,18 @@ std::string RunCompatResolveProbe(const ScreenModel& model, IntegrationState* st
   constexpr char kCompatIntegrationTag[] = "switch-integration-compat";
   swg::ConfigureCompatBridgeIdentity(kCompatClientName, kCompatIntegrationTag, kCompatClientName);
 
-  state->compat_lines.push_back("target: " + DescribeDiagnosticTarget(target.value));
+  state->compat_lines.push_back("target: " + DescribeIntegrationServerTarget(target.value));
   state->compat_lines.push_back(std::string("identity: client=") + kCompatClientName +
                                 " tag=" + kCompatIntegrationTag);
 
   sockaddr_storage resolved_addr{};
   socklen_t resolved_addr_len = 0;
   std::string error;
-  const swg::CompatSocketRoute route =
-      swg::CompatResolveStreamHost(target.value.host, 47984, &resolved_addr, &resolved_addr_len, &error);
+  const swg::CompatSocketRoute route = swg::CompatResolveStreamHost(target.value.endpoint.host,
+                                                                    target.value.tcp_echo_port,
+                                                                    &resolved_addr,
+                                                                    &resolved_addr_len,
+                                                                    &error);
 
   state->last_compat_result = std::string("route=") + CompatRouteLabel(route);
   if (route == swg::CompatSocketRoute::Direct) {
@@ -616,6 +837,191 @@ std::string RunSessionSmoke(const ScreenModel& model, IntegrationState* state) {
   return state->last_smoke_summary;
 }
 
+std::string RunAllTunnelTests(const swg::Client& client, ScreenModel* model, IntegrationState* state) {
+  std::vector<std::string> lines;
+  int total_steps = 0;
+  int passed_steps = 0;
+
+  auto record = [&](bool passed, const char* label, const std::string& detail) {
+    ++total_steps;
+    if (passed) {
+      ++passed_steps;
+    }
+    RecordRunAllStep(&lines, passed, label, detail);
+  };
+
+  std::string detail;
+  if (!EnsureConnectedSession(client, model, state, &detail)) {
+    record(false, "connect/session", detail);
+    state->run_all_lines = std::move(lines);
+    state->last_run_all_summary = "fail 0/1 steps";
+    return state->last_run_all_summary;
+  }
+  record(true, "connect/session", detail);
+
+  const std::string smoke_summary = RunSessionSmoke(*model, state);
+  record(state->last_smoke_summary.rfind("pass ", 0) == 0, "route-smoke", smoke_summary);
+
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(*model);
+  if (!target.ok()) {
+    record(false, "target", target.error.message);
+    state->run_all_lines = std::move(lines);
+    state->last_run_all_summary = std::string(passed_steps == total_steps ? "pass " : "fail ") +
+                                  std::to_string(passed_steps) + "/" + std::to_string(total_steps) + " steps";
+    return state->last_run_all_summary;
+  }
+
+  const IntegrationServerTarget& server = target.value;
+  if (server.endpoint.is_numeric_ipv6) {
+    record(false, "target", "IPv6 targets are not supported by the current tunnel diagnostics");
+    state->run_all_lines = std::move(lines);
+    state->last_run_all_summary = std::string(passed_steps == total_steps ? "pass " : "fail ") +
+                                  std::to_string(passed_steps) + "/" + std::to_string(total_steps) + " steps";
+    return state->last_run_all_summary;
+  }
+
+  record(true, "target", DescribeIntegrationServerTarget(server));
+
+  if (server.dns_hostname.empty()) {
+    record(false, "dns", "configure integration_test.dns_hostname to exercise tunnel DNS for this target");
+  } else {
+    const auto dns = state->session.ResolveDns(server.dns_hostname);
+    if (!dns.ok()) {
+      record(false, "dns", dns.error.message);
+    } else if (!dns.value.resolved || dns.value.addresses.empty()) {
+      record(false, "dns", "resolve returned no IPv4 addresses");
+    } else {
+      record(true,
+             "dns",
+             std::string(swg::ToString(dns.value.action)) + " addrs=" + FormatJoined(dns.value.addresses));
+    }
+  }
+
+  const auto session_datagram =
+      swg::SessionSocket::OpenDatagram(state->session,
+                                       swg::MakeMoonlightVideoSocketRequest(server.endpoint.host, server.udp_echo_port));
+  const auto session_stream =
+      swg::SessionSocket::OpenStream(state->session,
+                                     swg::MakeMoonlightStreamControlSocketRequest(server.endpoint.host,
+                                                                                  server.tcp_echo_port));
+
+  bool socket_probe_ok = session_datagram.ok() && session_stream.ok();
+  if (!socket_probe_ok) {
+    const std::string socket_error = !session_datagram.ok() ? session_datagram.error.message
+                                                            : session_stream.error.message;
+    state->sample_socket.reset();
+    record(false, "session-socket", socket_error);
+  } else {
+    const bool datagram_tunnel = session_datagram.value.uses_tunnel_packets();
+    const bool stream_tunnel = session_stream.value.uses_tunnel_packets();
+    socket_probe_ok = datagram_tunnel && stream_tunnel;
+    if (datagram_tunnel) {
+      state->sample_socket = session_datagram.value;
+    } else {
+      state->sample_socket.reset();
+    }
+    record(socket_probe_ok,
+           "session-socket",
+           std::string("udp=") + std::string(swg::ToString(session_datagram.value.info().mode)) +
+               " tcp=" + std::string(swg::ToString(session_stream.value.info().mode)));
+  }
+
+  {
+    const auto stream =
+        swg::TunnelStreamSocket::Open(state->session,
+                                      swg::MakeMoonlightStreamControlStreamRequest(server.endpoint.host,
+                                                                                   server.tcp_echo_port));
+    if (!stream.ok()) {
+      record(false, "tcp-echo", stream.error.message);
+    } else {
+      const std::string payload_text = "SWG-TCP-ECHO-" + std::to_string(state->run_all_nonce++);
+      const auto send_counter = stream.value.Send(ToByteVector(payload_text));
+      if (!send_counter.ok()) {
+        record(false, "tcp-echo", send_counter.error.message);
+      } else {
+        const auto received = PollTunnelStreamReceive(stream.value);
+        if (!received.ok()) {
+          record(false, "tcp-echo", received.error.message);
+        } else {
+          const std::string response = ToString(received.value.payload);
+          record(response == payload_text,
+                 "tcp-echo",
+                 "send_counter=" + std::to_string(send_counter.value) +
+                     " bytes=" + std::to_string(received.value.payload.size()));
+        }
+      }
+    }
+  }
+
+  {
+    swg::TunnelStreamOpenRequest http_request{};
+    http_request.remote_host = server.endpoint.host;
+    http_request.remote_port = server.http_port;
+    http_request.transport = swg::TransportProtocol::Https;
+    http_request.traffic_class = swg::AppTrafficClass::HttpsControl;
+    http_request.route_preference = swg::RoutePreference::RequireTunnel;
+
+    const auto stream = swg::TunnelStreamSocket::Open(state->session, http_request);
+    if (!stream.ok()) {
+      record(false, "http-probe", stream.error.message);
+    } else {
+      const std::string host_header = server.dns_hostname.empty() ? server.endpoint.host : server.dns_hostname;
+      const std::string request_text = "GET " + server.http_path + " HTTP/1.1\r\nHost: " + host_header +
+                                       "\r\nConnection: close\r\nUser-Agent: swg-integration/1\r\n\r\n";
+      const auto send_counter = stream.value.Send(ToByteVector(request_text));
+      if (!send_counter.ok()) {
+        record(false, "http-probe", send_counter.error.message);
+      } else {
+        const auto received = PollTunnelStreamReceive(stream.value);
+        if (!received.ok()) {
+          record(false, "http-probe", received.error.message);
+        } else {
+          const std::string response = ToString(received.value.payload);
+          const bool ok = response.find("HTTP/1.1 200 OK") != std::string::npos &&
+                          response.find(kHarnessHttpSignature) != std::string::npos;
+          record(ok,
+                 "http-probe",
+                 "send_counter=" + std::to_string(send_counter.value) +
+                     " bytes=" + std::to_string(received.value.payload.size()));
+        }
+      }
+    }
+  }
+
+  {
+    const auto socket =
+        swg::TunnelDatagramSocket::Open(state->session,
+                                        swg::MakeMoonlightVideoDatagramRequest(server.endpoint.host,
+                                                                               server.udp_echo_port));
+    if (!socket.ok()) {
+      record(false, "udp-echo", socket.error.message);
+    } else {
+      const std::string payload_text = "SWG-UDP-ECHO-" + std::to_string(state->run_all_nonce++);
+      const auto send_counter = socket.value.Send(ToByteVector(payload_text));
+      if (!send_counter.ok()) {
+        record(false, "udp-echo", send_counter.error.message);
+      } else {
+        const auto received = PollTunnelDatagramReceive(socket.value);
+        if (!received.ok()) {
+          record(false, "udp-echo", received.error.message);
+        } else {
+          const std::string response = ToString(received.value.payload);
+          record(response == payload_text,
+                 "udp-echo",
+                 "send_counter=" + std::to_string(send_counter.value) +
+                     " bytes=" + std::to_string(received.value.payload.size()));
+        }
+      }
+    }
+  }
+
+  state->run_all_lines = std::move(lines);
+  state->last_run_all_summary = std::string(passed_steps == total_steps ? "pass " : "fail ") +
+                                std::to_string(passed_steps) + "/" + std::to_string(total_steps) + " steps";
+  RefreshModel(client, model);
+  return state->last_run_all_summary;
+}
+
 std::string SendDiagnosticPayload(IntegrationState* state) {
   if (!state->session.is_open()) {
     return "open app session before sending a diagnostic payload";
@@ -709,6 +1115,11 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
   }
 
   std::printf("\nlast action: %s\n", state.last_action.c_str());
+  std::printf("run all: %s\n", state.last_run_all_summary.c_str());
+  for (const auto& line : state.run_all_lines) {
+    std::printf("  %s\n", line.c_str());
+  }
+
   std::printf("smoke: %s\n", state.last_smoke_summary.c_str());
   for (const auto& line : state.smoke_lines) {
     std::printf("  %s\n", line.c_str());
@@ -739,7 +1150,7 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
 
   std::printf("\ncontrols:\n");
   std::printf("  A connect/disconnect   B refresh   - compat probe   + exit\n");
-  std::printf("  X open/close session   Y run session smoke\n");
+  std::printf("  X open/close session   Y run all tunnel tests\n");
   std::printf("  Up resolve dns         Down open socket helpers\n");
   std::printf("  Left/Right change active profile\n");
   std::printf("  ZL toggle dns flag     ZR toggle transparent flag\n");
@@ -797,7 +1208,8 @@ int main(int argc, char** argv) {
     }
 
     if ((buttons_down & HidNpadButton_Y) != 0) {
-      state.last_action = RunSessionSmoke(model, &state);
+      state.last_action = RunAllTunnelTests(client, &model, &state);
+      refresh_requested = true;
     }
 
     if ((buttons_down & HidNpadButton_Up) != 0) {

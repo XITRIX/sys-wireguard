@@ -1,4 +1,4 @@
-#include "swg/moonlight_bridge.h"
+#include "compat_bridge_internal.h"
 
 #include <algorithm>
 #include <array>
@@ -21,8 +21,8 @@
 
 #include "swg/app_session.h"
 #include "swg/client.h"
+#include "swg/compat_bridge_c.h"
 #include "swg/log.h"
-#include "swg/moonlight_bridge_c.h"
 #include "swg/switch_transport.h"
 #include "swg/tunnel_datagram.h"
 #include "swg/tunnel_stream.h"
@@ -626,10 +626,10 @@ ReceiveOutcome FillDatagram(BridgeSocketEntry* entry, int timeout_ms) {
   return ReceiveOutcome::Ready;
 }
 
-class MoonlightBridgeState {
+class CompatBridgeState {
  public:
-  static MoonlightBridgeState& Instance() {
-    static MoonlightBridgeState instance;
+  static CompatBridgeState& Instance() {
+    static CompatBridgeState instance;
     return instance;
   }
 
@@ -672,13 +672,13 @@ class MoonlightBridgeState {
                          int traffic_class) {
     if (socket_fd < 0 || remote_addr == nullptr || remote_addr_len <= 0 || remote_port == 0) {
       errno = EINVAL;
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     const std::string remote_host = FormatSocketAddress(*remote_addr);
     if (remote_host.empty()) {
       errno = EAFNOSUPPORT;
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     const swg::AppTrafficClass app_traffic_class = ToTrafficClass(traffic_class);
@@ -689,20 +689,20 @@ class MoonlightBridgeState {
                                   remote_port, ": ",
                                   plan.message.empty() ? std::string("no tunnel route available")
                                                        : plan.message));
-      return SWG_MOONLIGHT_ROUTE_DIRECT;
+      return SWG_COMPAT_ROUTE_DIRECT;
     }
     if (plan.kind == RouteKind::Deny) {
       errno = EHOSTUNREACH;
       LogWarningMessage(BuildMessage("denying tunnel stream attach for socket ", socket_fd,
                                      " to ", remote_host, ":", remote_port, ": ",
                                      plan.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     auto entry = CreateSocketEntry(socket_fd);
     if (!entry.ok()) {
       errno = ToErrno(entry.error.code);
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     entry.value->kind = BridgeSocketKind::Stream;
@@ -721,12 +721,12 @@ class MoonlightBridgeState {
       errno = ToErrno(opened.error.code);
       LogWarningMessage(BuildMessage("failed to open tunnel stream for ", remote_host, ":",
                                      remote_port, ": ", opened.error.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     entry.value->stream_socket = std::move(opened.value);
     RegisterSocket(entry.value);
-    return SWG_MOONLIGHT_ROUTE_TUNNEL;
+    return SWG_COMPAT_ROUTE_TUNNEL;
   }
 
   int AttachDatagramSocket(int socket_fd,
@@ -736,13 +736,13 @@ class MoonlightBridgeState {
                            int traffic_class) {
     if (socket_fd < 0 || remote_addr == nullptr || remote_addr_len <= 0 || remote_port == 0) {
       errno = EINVAL;
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     const std::string remote_host = FormatSocketAddress(*remote_addr);
     if (remote_host.empty()) {
       errno = EAFNOSUPPORT;
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     const swg::AppTrafficClass app_traffic_class = ToTrafficClass(traffic_class);
@@ -753,20 +753,20 @@ class MoonlightBridgeState {
                                   remote_port, ": ",
                                   plan.message.empty() ? std::string("no tunnel route available")
                                                        : plan.message));
-      return SWG_MOONLIGHT_ROUTE_DIRECT;
+      return SWG_COMPAT_ROUTE_DIRECT;
     }
     if (plan.kind == RouteKind::Deny) {
       errno = EHOSTUNREACH;
       LogWarningMessage(BuildMessage("denying tunnel datagram attach for socket ", socket_fd,
                                      " to ", remote_host, ":", remote_port, ": ",
                                      plan.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     auto entry = CreateSocketEntry(socket_fd);
     if (!entry.ok()) {
       errno = ToErrno(entry.error.code);
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     entry.value->kind = BridgeSocketKind::Datagram;
@@ -784,12 +784,12 @@ class MoonlightBridgeState {
       errno = ToErrno(opened.error.code);
       LogWarningMessage(BuildMessage("failed to open tunnel datagram for ", remote_host, ":",
                                      remote_port, ": ", opened.error.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     entry.value->datagram_socket = std::move(opened.value);
     RegisterSocket(entry.value);
-    return SWG_MOONLIGHT_ROUTE_TUNNEL;
+    return SWG_COMPAT_ROUTE_TUNNEL;
   }
 
   bool IsTunnelSocket(int socket_fd) const {
@@ -1061,7 +1061,7 @@ class MoonlightBridgeState {
       if (error) {
         *error = "host and address outputs must not be null";
       }
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     if (error) {
@@ -1074,7 +1074,7 @@ class MoonlightBridgeState {
       LogInfoMessage(BuildMessage("using direct hostname resolution for ", host, ":", port, ": ",
                                   plan.message.empty() ? std::string("no tunnel route available")
                                                        : plan.message));
-      return SWG_MOONLIGHT_ROUTE_DIRECT;
+      return SWG_COMPAT_ROUTE_DIRECT;
     }
     if (plan.kind == RouteKind::Deny) {
       if (error) {
@@ -1082,12 +1082,12 @@ class MoonlightBridgeState {
       }
       LogWarningMessage(BuildMessage("denying stream hostname resolution for ", host, ":",
                                      port, ": ", plan.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     if (TryParseIpv4(host, addr, addr_len)) {
       reinterpret_cast<sockaddr_in*>(addr)->sin_port = htons(port);
-      return SWG_MOONLIGHT_ROUTE_TUNNEL;
+      return SWG_COMPAT_ROUTE_TUNNEL;
     }
 
     std::scoped_lock lock(mutex_);
@@ -1095,7 +1095,7 @@ class MoonlightBridgeState {
       if (error) {
         *error = session_error_;
       }
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     const auto resolved = session_->ResolveDns(host);
@@ -1106,7 +1106,7 @@ class MoonlightBridgeState {
       LogWarningMessage(BuildMessage("failed to resolve ", host, " through swg tunnel DNS: ",
                                      resolved.ok() ? resolved.value.message
                                                    : resolved.error.message));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     if (!TryParseIpv4(resolved.value.addresses.front(), addr, addr_len)) {
@@ -1115,11 +1115,11 @@ class MoonlightBridgeState {
       }
       LogWarningMessage(BuildMessage("unsupported resolved address for ", host, ": ",
                                      resolved.value.addresses.front()));
-      return SWG_MOONLIGHT_ROUTE_ERROR;
+      return SWG_COMPAT_ROUTE_ERROR;
     }
 
     reinterpret_cast<sockaddr_in*>(addr)->sin_port = htons(port);
-    return SWG_MOONLIGHT_ROUTE_TUNNEL;
+    return SWG_COMPAT_ROUTE_TUNNEL;
   }
 
   swg::CompatHttpRoute HttpRequest(const std::string& url,
@@ -1225,7 +1225,7 @@ class MoonlightBridgeState {
   }
 
  private:
-  MoonlightBridgeState() = default;
+  CompatBridgeState() = default;
 
   bool EnsureTransportLocked() {
     if (transport_checked_) {
@@ -1519,248 +1519,113 @@ class MoonlightBridgeState {
 
 }  // namespace
 
-namespace swg {
+namespace swg::internal {
 
-void ConfigureCompatBridgeIdentity(std::string client_name,
+#if defined(SWG_PLATFORM_SWITCH)
+void CompatBridgeConfigureIdentity(std::string client_name,
                                    std::string integration_tag,
                                    std::string http_user_agent) {
-#if defined(SWG_PLATFORM_SWITCH)
-  MoonlightBridgeState::Instance().ConfigureIdentity(std::move(client_name),
-                                                     std::move(integration_tag),
-                                                     std::move(http_user_agent));
-#else
-  (void)client_name;
-  (void)integration_tag;
-  (void)http_user_agent;
-#endif
+  CompatBridgeState::Instance().ConfigureIdentity(std::move(client_name),
+                                                  std::move(integration_tag),
+                                                  std::move(http_user_agent));
 }
 
-void ConfigureCompatHttpCredentials(std::string certificate_path, std::string key_path) {
-#if defined(SWG_PLATFORM_SWITCH)
-  MoonlightBridgeState::Instance().ConfigureHttpCredentials(std::move(certificate_path),
-                                                            std::move(key_path));
-#else
-  (void)certificate_path;
-  (void)key_path;
-#endif
+void CompatBridgeConfigureHttpCredentials(std::string certificate_path,
+                                          std::string key_path) {
+  CompatBridgeState::Instance().ConfigureHttpCredentials(std::move(certificate_path),
+                                                         std::move(key_path));
 }
 
-CompatHttpRoute CompatHttpRequest(const std::string& url,
-                                  std::vector<std::uint8_t>* response_body,
-                                  long timeout_seconds,
-                                  std::string* error) {
-#if defined(SWG_PLATFORM_SWITCH)
-  return MoonlightBridgeState::Instance().HttpRequest(url, response_body, timeout_seconds, error);
-#else
-  (void)url;
-  (void)response_body;
-  (void)timeout_seconds;
-  (void)error;
-  return CompatHttpRoute::Direct;
-#endif
-}
-
-#if defined(SWG_PLATFORM_SWITCH)
-CompatSocketRoute CompatResolveStreamHost(const std::string& host,
-                                          std::uint16_t port,
-                                          struct sockaddr_storage* addr,
-                                          socklen_t* addr_len,
-                                          std::string* error) {
-  return static_cast<CompatSocketRoute>(
-      MoonlightBridgeState::Instance().ResolveStreamHost(host.c_str(), port, addr, addr_len, error));
-}
-#endif
-
-void ConfigureMoonlightHttpCredentials(std::string certificate_path, std::string key_path) {
-  ConfigureCompatHttpCredentials(std::move(certificate_path), std::move(key_path));
-}
-
-MoonlightHttpRoute MoonlightHttpRequest(const std::string& url,
+CompatHttpRoute CompatBridgeHttpRequest(const std::string& url,
                                         std::vector<std::uint8_t>* response_body,
                                         long timeout_seconds,
                                         std::string* error) {
-  return CompatHttpRequest(url, response_body, timeout_seconds, error);
+  return CompatBridgeState::Instance().HttpRequest(url, response_body, timeout_seconds, error);
 }
 
-}  // namespace swg
-
-#if defined(SWG_PLATFORM_SWITCH)
-extern "C" void swg_compat_configure_identity(const char* client_name,
-                                               const char* integration_tag,
-                                               const char* http_user_agent) {
-  swg::ConfigureCompatBridgeIdentity(client_name == nullptr ? std::string{} : std::string(client_name),
-                                     integration_tag == nullptr ? std::string{} : std::string(integration_tag),
-                                     http_user_agent == nullptr ? std::string{} : std::string(http_user_agent));
+CompatSocketRoute CompatBridgeResolveStreamHost(const std::string& host,
+                                                std::uint16_t port,
+                                                struct sockaddr_storage* addr,
+                                                socklen_t* addr_len,
+                                                std::string* error) {
+  return static_cast<CompatSocketRoute>(
+      CompatBridgeState::Instance().ResolveStreamHost(host.c_str(), port, addr, addr_len, error));
 }
 
-extern "C" int swg_compat_resolve_stream_host(const char* host,
-                                               unsigned short port,
-                                               struct sockaddr_storage* addr,
-                                               socklen_t* addr_len) {
-  return MoonlightBridgeState::Instance().ResolveStreamHost(host, port, addr, addr_len);
+int CompatBridgeAttachStreamSocket(int socket_fd,
+                                   const struct sockaddr_storage* remote_addr,
+                                   socklen_t remote_addr_len,
+                                   unsigned short remote_port,
+                                   int traffic_class) {
+  return CompatBridgeState::Instance().AttachStreamSocket(socket_fd, remote_addr, remote_addr_len,
+                                                          remote_port, traffic_class);
 }
 
-extern "C" int swg_compat_attach_stream_socket(int socket_fd,
-                                                const struct sockaddr_storage* remote_addr,
-                                                socklen_t remote_addr_len,
-                                                unsigned short remote_port,
-                                                int traffic_class) {
-  return MoonlightBridgeState::Instance().AttachStreamSocket(socket_fd, remote_addr,
-                                                             remote_addr_len, remote_port,
-                                                             traffic_class);
+int CompatBridgeAttachDatagramSocket(int socket_fd,
+                                     const struct sockaddr_storage* remote_addr,
+                                     socklen_t remote_addr_len,
+                                     unsigned short remote_port,
+                                     int traffic_class) {
+  return CompatBridgeState::Instance().AttachDatagramSocket(socket_fd, remote_addr, remote_addr_len,
+                                                            remote_port, traffic_class);
 }
 
-extern "C" int swg_compat_attach_datagram_socket(int socket_fd,
-                                                  const struct sockaddr_storage* remote_addr,
-                                                  socklen_t remote_addr_len,
-                                                  unsigned short remote_port,
-                                                  int traffic_class) {
-  return MoonlightBridgeState::Instance().AttachDatagramSocket(socket_fd, remote_addr,
-                                                               remote_addr_len, remote_port,
-                                                               traffic_class);
+int CompatBridgeIsTunnelSocket(int socket_fd) {
+  return CompatBridgeState::Instance().IsTunnelSocket(socket_fd) ? 1 : 0;
 }
 
-extern "C" int swg_compat_is_tunnel_socket(int socket_fd) {
-  return MoonlightBridgeState::Instance().IsTunnelSocket(socket_fd) ? 1 : 0;
+int CompatBridgeStreamSend(int socket_fd, const void* buffer, size_t size) {
+  return CompatBridgeState::Instance().StreamSend(socket_fd, buffer, size);
 }
 
-extern "C" int swg_compat_stream_send(int socket_fd, const void* buffer, size_t size) {
-  return MoonlightBridgeState::Instance().StreamSend(socket_fd, buffer, size);
+int CompatBridgeStreamRecv(int socket_fd, void* buffer, size_t size) {
+  return CompatBridgeState::Instance().StreamRecv(socket_fd, buffer, size);
 }
 
-extern "C" int swg_compat_stream_recv(int socket_fd, void* buffer, size_t size) {
-  return MoonlightBridgeState::Instance().StreamRecv(socket_fd, buffer, size);
+int CompatBridgeDatagramSend(int socket_fd,
+                             const void* buffer,
+                             size_t size,
+                             const struct sockaddr* remote_addr,
+                             socklen_t remote_addr_len) {
+  return CompatBridgeState::Instance().DatagramSend(socket_fd, buffer, size, remote_addr,
+                                                    remote_addr_len);
 }
 
-extern "C" int swg_compat_datagram_send(int socket_fd,
-                                         const void* buffer,
-                                         size_t size,
-                                         const struct sockaddr* remote_addr,
-                                         socklen_t remote_addr_len) {
-  return MoonlightBridgeState::Instance().DatagramSend(socket_fd, buffer, size, remote_addr,
-                                                       remote_addr_len);
+int CompatBridgeDatagramRecv(int socket_fd, void* buffer, size_t size, int timeout_ms) {
+  return CompatBridgeState::Instance().DatagramRecv(socket_fd, buffer, size, timeout_ms);
 }
 
-extern "C" int swg_compat_datagram_recv(int socket_fd,
-                                         void* buffer,
-                                         size_t size,
-                                         int timeout_ms) {
-  return MoonlightBridgeState::Instance().DatagramRecv(socket_fd, buffer, size, timeout_ms);
+int CompatBridgeCopyRemoteAddr(int socket_fd,
+                               struct sockaddr_storage* remote_addr,
+                               socklen_t* remote_addr_len) {
+  return CompatBridgeState::Instance().CopyRemoteAddr(socket_fd, remote_addr, remote_addr_len);
 }
 
-extern "C" int swg_compat_copy_remote_addr(int socket_fd,
-                                            struct sockaddr_storage* remote_addr,
-                                            socklen_t* remote_addr_len) {
-  return MoonlightBridgeState::Instance().CopyRemoteAddr(socket_fd, remote_addr, remote_addr_len);
+int CompatBridgeSocketWait(int socket_fd,
+                           int want_read,
+                           int want_write,
+                           int timeout_ms,
+                           int* can_read,
+                           int* can_write) {
+  return CompatBridgeState::Instance().SocketWait(socket_fd, want_read, want_write, timeout_ms,
+                                                  can_read, can_write);
 }
 
-extern "C" int swg_compat_socket_wait(int socket_fd,
-                                       int want_read,
-                                       int want_write,
-                                       int timeout_ms,
-                                       int* can_read,
-                                       int* can_write) {
-  return MoonlightBridgeState::Instance().SocketWait(socket_fd, want_read, want_write,
-                                                     timeout_ms, can_read, can_write);
+int CompatBridgeCloseSocket(int socket_fd) {
+  return CompatBridgeState::Instance().CloseSocket(socket_fd);
 }
 
-extern "C" int swg_compat_close_socket(int socket_fd) {
-  return MoonlightBridgeState::Instance().CloseSocket(socket_fd);
+int CompatBridgeShutdownSocket(int socket_fd) {
+  return CompatBridgeState::Instance().ShutdownSocket(socket_fd);
 }
 
-extern "C" int swg_compat_shutdown_socket(int socket_fd) {
-  return MoonlightBridgeState::Instance().ShutdownSocket(socket_fd);
+int CompatBridgeSetRecvTimeout(int socket_fd, int timeout_ms) {
+  return CompatBridgeState::Instance().SetRecvTimeout(socket_fd, timeout_ms);
 }
 
-extern "C" int swg_compat_set_recv_timeout(int socket_fd, int timeout_ms) {
-  return MoonlightBridgeState::Instance().SetRecvTimeout(socket_fd, timeout_ms);
-}
-
-extern "C" int swg_compat_enable_no_delay(int socket_fd) {
-  return MoonlightBridgeState::Instance().EnableNoDelay(socket_fd);
-}
-
-extern "C" int swg_moonlight_resolve_stream_host(const char* host,
-                                                 unsigned short port,
-                                                 struct sockaddr_storage* addr,
-                                                 socklen_t* addr_len) {
-  return swg_compat_resolve_stream_host(host, port, addr, addr_len);
-}
-
-extern "C" int swg_moonlight_attach_stream_socket(int socket_fd,
-                                                   const struct sockaddr_storage* remote_addr,
-                                                   socklen_t remote_addr_len,
-                                                   unsigned short remote_port,
-                                                   int traffic_class) {
-  return swg_compat_attach_stream_socket(socket_fd, remote_addr, remote_addr_len, remote_port,
-                                         traffic_class);
-}
-
-extern "C" int swg_moonlight_attach_datagram_socket(int socket_fd,
-                                                     const struct sockaddr_storage* remote_addr,
-                                                     socklen_t remote_addr_len,
-                                                     unsigned short remote_port,
-                                                     int traffic_class) {
-  return swg_compat_attach_datagram_socket(socket_fd, remote_addr, remote_addr_len, remote_port,
-                                           traffic_class);
-}
-
-extern "C" int swg_moonlight_is_tunnel_socket(int socket_fd) {
-  return swg_compat_is_tunnel_socket(socket_fd);
-}
-
-extern "C" int swg_moonlight_stream_send(int socket_fd, const void* buffer, size_t size) {
-  return swg_compat_stream_send(socket_fd, buffer, size);
-}
-
-extern "C" int swg_moonlight_stream_recv(int socket_fd, void* buffer, size_t size) {
-  return swg_compat_stream_recv(socket_fd, buffer, size);
-}
-
-extern "C" int swg_moonlight_datagram_send(int socket_fd,
-                                            const void* buffer,
-                                            size_t size,
-                                            const struct sockaddr* remote_addr,
-                                            socklen_t remote_addr_len) {
-  return swg_compat_datagram_send(socket_fd, buffer, size, remote_addr, remote_addr_len);
-}
-
-extern "C" int swg_moonlight_datagram_recv(int socket_fd,
-                                            void* buffer,
-                                            size_t size,
-                                            int timeout_ms) {
-  return swg_compat_datagram_recv(socket_fd, buffer, size, timeout_ms);
-}
-
-extern "C" int swg_moonlight_copy_remote_addr(int socket_fd,
-                                               struct sockaddr_storage* remote_addr,
-                                               socklen_t* remote_addr_len) {
-  return swg_compat_copy_remote_addr(socket_fd, remote_addr, remote_addr_len);
-}
-
-extern "C" int swg_moonlight_socket_wait(int socket_fd,
-                                          int want_read,
-                                          int want_write,
-                                          int timeout_ms,
-                                          int* can_read,
-                                          int* can_write) {
-  return swg_compat_socket_wait(socket_fd, want_read, want_write, timeout_ms, can_read,
-                                can_write);
-}
-
-extern "C" int swg_moonlight_close_socket(int socket_fd) {
-  return swg_compat_close_socket(socket_fd);
-}
-
-extern "C" int swg_moonlight_shutdown_socket(int socket_fd) {
-  return swg_compat_shutdown_socket(socket_fd);
-}
-
-extern "C" int swg_moonlight_set_recv_timeout(int socket_fd, int timeout_ms) {
-  return swg_compat_set_recv_timeout(socket_fd, timeout_ms);
-}
-
-extern "C" int swg_moonlight_enable_no_delay(int socket_fd) {
-  return swg_compat_enable_no_delay(socket_fd);
+int CompatBridgeEnableNoDelay(int socket_fd) {
+  return CompatBridgeState::Instance().EnableNoDelay(socket_fd);
 }
 #endif
+
+}  // namespace swg::internal

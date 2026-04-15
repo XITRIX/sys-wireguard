@@ -46,13 +46,21 @@
 - Host-side tests added for config and state transitions.
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
 - Switch preset configure and deployable sysmodule build verified with devkitPro.
+- External transparent-routing research now points the first MITM slice at `sfdnsres`, informed mainly by Atmosphere's `dns_mitm`, and `swg_sysmodule_core` now includes a dormant experimental MITM scaffold plus host policy tests without changing `swg:ctl` runtime behavior.
+- The runtime config and IPC path now carry a dedicated `[integration_test]` section so on-device diagnostics can target a routed LAN test host independently from the WireGuard endpoint.
+- The integration component now builds a passive host-side harness server (`swg_integration_server`) with TCP echo, UDP echo, and plain HTTP probe listeners.
+- The Switch integration NRO now exposes a one-button `Y` path that ensures the tunnel and app session are ready, then runs DNS, session-socket, TCP stream, HTTP stream, and UDP datagram checks against the configured integration target.
 
 ## Next slices
 
 - Expand the Switch manager beyond the current console UI if a richer device-side control surface is needed before Tesla.
 - Add WireGuard cookie reply handling on top of the current one-shot handshake path.
+- Wire the experimental DNS scaffold into a Switch-only `sfdnsres` observe-only MITM server behind a feature flag.
+- Add a direct `bsd:u` availability probe before any socket MITM implementation work.
+- Reuse the existing `ResolveDns()` and tunnel-DNS path for DNS MITM answers instead of building a second resolver stack.
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.
 - Run the new Switch integration app against a working VPN peer and record on-device connect, route-plan, and diagnostic payload results.
+- Run the new passive integration harness with a real routed LAN or VPN-side host and record end-to-end pass/fail results from the Switch `Y` runner.
 - Accept or deliberately reject additional endpoint/DNS formats once the real handshake backend defines those constraints.
 - Run the new real tunnel-DNS and `SessionSocket` integration controls on-device against a working VPN peer and record the results.
 - Run the new tunnel datagram handle on-device against a working VPN peer and record Moonlight-style UDP results.

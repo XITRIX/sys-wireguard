@@ -34,6 +34,8 @@
 #include "swg_sysmodule/local_service.h"
 #include "swg_sysmodule/socket_runtime.h"
 
+bool TestExperimentalMitmHarness();
+
 namespace {
 
 bool Require(bool condition, const std::string& message) {
@@ -1217,6 +1219,12 @@ swg::Config MakeValidConfig(std::string endpoint_host = "localhost", std::uint16
   config.profiles.emplace(profile.name, profile);
   config.active_profile = profile.name;
   config.runtime_flags = swg::ToFlags(swg::RuntimeFlag::DnsThroughTunnel);
+  config.integration_test.target_host = "integration.example.test";
+  config.integration_test.dns_hostname = "dns.integration.example.test";
+  config.integration_test.tcp_echo_port = 28080;
+  config.integration_test.http_port = 28081;
+  config.integration_test.udp_echo_port = 28082;
+  config.integration_test.http_path = "/swg/health";
   return config;
 }
 
@@ -1461,6 +1469,18 @@ bool TestConfigRoundTrip() {
                 "default app policy must preserve full-tunnel routing");
   ok &= Require(!loaded.value.app_policies.at("default").allow_local_network_bypass,
                 "default app policy must preserve disabled local bypass");
+  ok &= Require(loaded.value.integration_test.target_host == expected.integration_test.target_host,
+                "integration target_host must round-trip");
+  ok &= Require(loaded.value.integration_test.dns_hostname == expected.integration_test.dns_hostname,
+                "integration dns_hostname must round-trip");
+  ok &= Require(loaded.value.integration_test.tcp_echo_port == expected.integration_test.tcp_echo_port,
+                "integration tcp_echo_port must round-trip");
+  ok &= Require(loaded.value.integration_test.http_port == expected.integration_test.http_port,
+                "integration http_port must round-trip");
+  ok &= Require(loaded.value.integration_test.udp_echo_port == expected.integration_test.udp_echo_port,
+                "integration udp_echo_port must round-trip");
+  ok &= Require(loaded.value.integration_test.http_path == expected.integration_test.http_path,
+                "integration http_path must round-trip");
   return ok;
 }
 
@@ -3504,6 +3524,7 @@ bool TestDisconnectReconnectInvalidatesOldTunnelStreamHandles() {
 int main() {
   const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
+  const bool mitm_scaffold_ok = TestExperimentalMitmHarness();
   const bool wg_crypto_ok = TestWireGuardCrypto();
   const bool wg_handshake_ok = TestWireGuardHandshakeRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
@@ -3537,7 +3558,7 @@ int main() {
   const bool tunnel_stream_deferred_synack_ok = TestTunnelStreamSocketUsesDeferredSynAck();
   const bool tunnel_stream_idle_recovery_ok = TestTunnelStreamSocketRecoversAfterIdleTimeout();
   const bool tunnel_stream_disconnect_reset_ok = TestDisconnectReconnectInvalidatesOldTunnelStreamHandles();
-  return (endpoint_parser_ok && config_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
+  return (endpoint_parser_ok && config_ok && mitm_scaffold_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&

@@ -39,9 +39,19 @@ struct AppPolicyConfig {
   bool allow_direct_internet_fallback = false;
 };
 
+struct IntegrationTestConfig {
+  std::string target_host;
+  std::string dns_hostname;
+  std::uint16_t tcp_echo_port = 28080;
+  std::uint16_t http_port = 28081;
+  std::uint16_t udp_echo_port = 28082;
+  std::string http_path = "/swg/health";
+};
+
 struct Config {
   std::map<std::string, ProfileConfig> profiles;
   std::map<std::string, AppPolicyConfig> app_policies;
+  IntegrationTestConfig integration_test;
   std::string active_profile;
   RuntimeFlags runtime_flags = 0;
 };

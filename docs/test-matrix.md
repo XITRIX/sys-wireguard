@@ -22,12 +22,15 @@
 | Engine reconnect after receive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one receive-loop transport failure, then verifies the engine re-handshakes and remains usable |
 | Engine reconnect after keepalive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one periodic keepalive send failure, then verifies the engine re-handshakes and remains usable |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
+| Experimental MITM scaffold policy | Verified | `swg_tests` now covers dormant `sfdnsres` policy selection and DNS planning without changing runtime behavior |
+| Integration config round-trip | Verified | `swg_tests` now covers `[integration_test]` settings through config save/load |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | App-session DNS resolution policy | Verified | `swg_tests` now covers direct DNS fallback, fail-closed tunnel-DNS policy before connect, and connected tunnel-DNS A-record resolution |
 | Tunnel DNS packet codec | Verified | `swg_tests` covers IPv4 UDP DNS query build plus response parse round-trip |
 | Session socket abstraction | Verified | `swg_tests` now covers direct fallback, disconnected deny, and connected tunnel-packet selection through `swg::SessionSocket` |
 | Tunnel datagram socket | Verified | `swg_tests` covers a Moonlight-style video UDP round trip through `swg::TunnelDatagramSocket` |
 | Tunnel stream socket | Verified | `swg_tests` covers a Moonlight-style HTTPS control TCP round trip through `swg::TunnelStreamSocket` |
+| Passive integration harness server build | Verified | `cmake --build --preset host-debug --target swg_integration_server` succeeds on macOS |
 | Overlay/manager smoke flow | Verified | `sample-profile`, `status`, and `connect` commands exercised |
 
 ## On-device
@@ -40,7 +43,7 @@
 | Switch manager build | Verified | `build/switch-debug/manager/swg_manager.nro` and staged `build/switch-debug/manager/switch/swg_manager.nro` are generated |
 | Switch integration app build | Verified | `build/switch-debug/integration/swg_integration_test.nro` and staged `build/switch-debug/integration/switch/swg_integration_test.nro` are generated |
 | Switch manager control flow | Verified | Manager now queries `swg:ctl` successfully on hardware and surfaces compatibility diagnostics |
-| Switch integration app smoke flow | In progress | The separate integration NRO now exposes `ResolveDns()` and sample `SessionSocket` checks in addition to route-planning and packet diagnostics; live VPN-peer validation of real tunnel DNS, tunnel datagrams, and tunnel streams is still pending |
+| Switch integration app smoke flow | In progress | The separate integration NRO now exposes a `Y` run-all harness for tunnel DNS, `SessionSocket`, tunnel stream, and tunnel datagram checks against `[integration_test]`, but live VPN-peer validation is still pending |
 | Milestone 3 manager frontend | Verified | Current manager implementation is sufficient to close the manager-first frontend milestone |
 | Tesla live start/stop | Deferred | Tesla is intentionally excluded from Phase A; verify later if the overlay path is revived |
 | Config survives reboot | Not started | Requires device deployment |

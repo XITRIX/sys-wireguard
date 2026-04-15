@@ -4,7 +4,8 @@
 - Tesla overlay work is intentionally deferred from Phase A; the overlay target remains a host stub.
 - Tesla live toggling now relies on `ovl-sysmodules` using `pmshellTerminateProgram()` / `pmshellLaunchProgram()`; active clients should tolerate abrupt `swg:ctl` disconnects during manual stop/start.
 - The Switch manager is the current Phase A control UI; it is text-mode and intentionally simpler than the future Tesla UX.
-- The new Switch integration app now exposes real `ResolveDns()` and sample `SessionSocket` checks on hardware, but it still does not exercise the new `TunnelDatagramSocket` or `TunnelStreamSocket` paths on-device.
+- The new Switch integration app now exposes a one-button end-to-end harness for `ResolveDns()`, `SessionSocket`, `TunnelDatagramSocket`, and `TunnelStreamSocket`, but it still needs hardware validation against a real routed test host.
+- The new experimental MITM scaffold is design-only: it models `sfdnsres` and future `bsd:*` policy decisions, but no Atmosphere MITM server is installed yet, so on-device transparent DNS behavior is unchanged.
 - Milestone 5 implementation now covers one-shot WireGuard initiation/response, authenticated transport send/receive, repeated host-side traffic, and bounded reconnect on outbound send, receive-loop, and periodic keepalive transport failures, but cookie replies and rekeying are still not implemented.
 - The current Switch tunnel session preparation is intentionally IPv4-only: hostname endpoints are left unresolved for a later resolver/UDP slice, IPv6 endpoints are rejected, and IPv6 routes or DNS entries are only tracked as skipped metadata.
 - The live connect path now resolves IPv4 endpoints, validates the handshake, schedules authenticated keepalives, and surfaces authenticated transport send/receive through `swg:ctl`; host regression coverage now repeats multi-packet app-session traffic and scripted reconnect triggers, but there is still no endpoint roaming support.
@@ -15,8 +16,10 @@
 - The current Switch heap budget is 4 MiB so BSD can allocate its `0x234000` transfer-memory block with headroom; future WireGuard packet pools or transparent-mode buffers may require retuning that heap size.
 - DNS servers currently need to be numeric IP literals during connect preflight; hostname-based resolver configuration is not accepted yet.
 - Capability detection now probes live service reachability, but some flags still map to nearest current surfaces (`sfdnsres` for resolver reachability and `nifm:a`/`nifm:s` for network-configuration reachability) rather than final transparent-mode hooks.
+- Current compatibility reporting still does not probe `bsd:u` or `bsd:s` directly, so any future socket MITM rollout needs a tighter service-availability check before activation.
 - Config validation checks presence and basic ranges, not cryptographic key or CIDR correctness.
 - The app API now includes policy-safe DNS responses plus real UDP and TCP tunnel handles, but the tunnel DNS path is still limited to synchronous IPv4 A-record lookups and HTTPS still needs TLS or HTTP handling layered above `TunnelStreamSocket`.
+- The passive integration harness server currently validates raw TCP echo, raw UDP echo, and plain HTTP over the tunneled stream path. It does not yet cover TLS, ENet, RTSP, or multi-packet media behavior.
 - Moonlight-Switch now compiles with a Switch-only bridge for HTTPS control, stream-host DNS, TCP stream sockets, UDP media sockets, and ENet control sockets, but none of that new transport path has been validated on hardware yet.
 - The generic compat bridge now builds for a second non-Moonlight consumer in the Switch integration app, but those route decisions still need real on-device validation against a live profile.
 - The runtime compat bridge now opens app sessions with identity only and relies on `[app_policy.*]` config for route behavior; misconfigured policies can change direct-vs-tunnel behavior without any source change in the consuming app.

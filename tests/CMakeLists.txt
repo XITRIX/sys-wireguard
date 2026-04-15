@@ -4,6 +4,7 @@ endif()
 
 add_executable(swg_tests
   config_tests.cpp
+  mitm_scaffold_tests.cpp
 )
 
 target_link_libraries(swg_tests
