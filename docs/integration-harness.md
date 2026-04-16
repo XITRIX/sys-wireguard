@@ -69,6 +69,7 @@ If `target_host` is left empty, the integration app falls back to the active pro
 - `Y`: run the full harness
 - `Up`: run only the DNS probe
 - `Down`: run only the session-socket planning probe
+- `LStick`: open the built-in Switch keyboard and edit `integration_test.target_host`
 
 The `Y` action ensures the tunnel and app session are ready, then records per-step pass or fail results for:
 

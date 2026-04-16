@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -24,6 +25,7 @@ constexpr int kAutoRefreshFrames = 30;
 constexpr std::size_t kMaxPreviewBytes = 8;
 constexpr std::uint64_t kReceivePollIntervalNs = 100 * 1000 * 1000ULL;
 constexpr int kReceivePollAttempts = 20;
+constexpr std::size_t kMaxEditableTargetHostLength = 16;
 
 constexpr char kHarnessHttpSignature[] = "service=swg-integration-server";
 
@@ -280,6 +282,21 @@ std::string DescribeIntegrationServerTarget(const IntegrationServerTarget& targe
   return description;
 }
 
+std::string TrimCopy(std::string_view value) {
+  std::size_t begin = 0;
+  std::size_t end = value.size();
+
+  while (begin < end && std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
+    ++begin;
+  }
+
+  while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+    --end;
+  }
+
+  return std::string(value.substr(begin, end - begin));
+}
+
 void ClearSessionDiagnostics(IntegrationState* state) {
   state->sample_socket.reset();
   state->last_dns_result = "not run";
@@ -294,6 +311,74 @@ void ClearSessionDiagnostics(IntegrationState* state) {
   state->smoke_lines.clear();
   state->last_run_all_summary = "not run";
   state->run_all_lines.clear();
+}
+
+std::string EditIntegrationTargetHost(const swg::Client& client,
+                                      const ScreenModel& model,
+                                      IntegrationState* state) {
+  if (!model.config.ok()) {
+    return "config unavailable: " + model.config.error.message;
+  }
+
+  std::string initial_text = model.config.value.integration_test.target_host;
+  if (initial_text.empty()) {
+    const swg::Result<IntegrationServerTarget> current_target = GetIntegrationServerTarget(model);
+    if (current_target.ok()) {
+      initial_text = current_target.value.endpoint.host;
+    }
+  }
+
+  SwkbdConfig keyboard{};
+  ::Result keyboard_result = swkbdCreate(&keyboard, 0);
+  if (R_FAILED(keyboard_result)) {
+    std::ostringstream stream;
+    stream << "keyboard init failed: 0x" << std::hex << static_cast<unsigned int>(keyboard_result);
+    return stream.str();
+  }
+
+  swkbdConfigMakePresetDefault(&keyboard);
+  swkbdConfigSetType(&keyboard, SwkbdType_NumPad);
+  swkbdConfigSetLeftOptionalSymbolKey(&keyboard, ".");
+  swkbdConfigSetRightOptionalSymbolKey(&keyboard, ".");
+  swkbdConfigSetHeaderText(&keyboard, "Integration Target IP");
+  swkbdConfigSetSubText(&keyboard, "Edit integration_test.target_host");
+  swkbdConfigSetGuideText(&keyboard, "IPv4 only. Leave blank to use profile endpoint_host.");
+  swkbdConfigSetInitialText(&keyboard, initial_text.c_str());
+  swkbdConfigSetOkButtonText(&keyboard, "Save");
+  swkbdConfigSetStringLenMax(&keyboard, static_cast<u32>(kMaxEditableTargetHostLength - 1));
+  swkbdConfigSetStringLenMin(&keyboard, 0);
+
+  char edited_buffer[kMaxEditableTargetHostLength] = {};
+  keyboard_result = swkbdShow(&keyboard, edited_buffer, sizeof(edited_buffer));
+  swkbdClose(&keyboard);
+  if (R_FAILED(keyboard_result)) {
+    return "target edit canceled";
+  }
+
+  const std::string edited = TrimCopy(edited_buffer);
+  swg::Config updated = model.config.value;
+  if (edited.empty()) {
+    updated.integration_test.target_host.clear();
+  } else {
+    const swg::Result<swg::ParsedIpAddress> parsed =
+        swg::ParseIpAddress(edited, "integration_test.target_host");
+    if (!parsed.ok() || parsed.value.family != swg::ParsedIpFamily::IPv4) {
+      return "invalid IPv4 address: " + edited;
+    }
+    updated.integration_test.target_host = edited;
+  }
+
+  const swg::Error save_error = client.SaveConfig(updated);
+  if (save_error) {
+    return "save config failed: " + save_error.message;
+  }
+
+  ClearSessionDiagnostics(state);
+  if (edited.empty()) {
+    return "integration target override cleared; using profile endpoint_host";
+  }
+
+  return "integration target host saved: " + edited;
 }
 
 std::vector<std::uint8_t> ToByteVector(const std::string& value) {
@@ -1114,6 +1199,14 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
     std::printf("  open=no\n");
   }
 
+  std::printf("\nintegration target:\n");
+  const swg::Result<IntegrationServerTarget> target = GetIntegrationServerTarget(model);
+  if (target.ok()) {
+    std::printf("  %s\n", DescribeIntegrationServerTarget(target.value).c_str());
+  } else {
+    std::printf("  unavailable (%s)\n", target.error.message.c_str());
+  }
+
   std::printf("\nlast action: %s\n", state.last_action.c_str());
   std::printf("run all: %s\n", state.last_run_all_summary.c_str());
   for (const auto& line : state.run_all_lines) {
@@ -1154,7 +1247,7 @@ void DrawScreen(const ScreenModel& model, const IntegrationState& state) {
   std::printf("  Up resolve dns         Down open socket helpers\n");
   std::printf("  Left/Right change active profile\n");
   std::printf("  ZL toggle dns flag     ZR toggle transparent flag\n");
-  std::printf("  L send diagnostic payload   R poll receive queue\n");
+  std::printf("  LStick edit target IP  L send diagnostic payload   R poll receive queue\n");
 }
 
 }  // namespace
@@ -1218,6 +1311,11 @@ int main(int argc, char** argv) {
 
     if ((buttons_down & HidNpadButton_Down) != 0) {
       state.last_action = PrepareSocketSmoke(model, &state);
+    }
+
+    if ((buttons_down & HidNpadButton_StickL) != 0) {
+      state.last_action = EditIntegrationTargetHost(client, model, &state);
+      refresh_requested = true;
     }
 
     if ((buttons_down & HidNpadButton_Left) != 0) {
