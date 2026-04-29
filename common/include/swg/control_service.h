@@ -36,6 +36,8 @@ class IControlService {
   virtual Error CloseTunnelDatagram(std::uint64_t datagram_id) = 0;
   virtual Result<std::uint64_t> SendTunnelDatagram(const TunnelDatagramSendRequest& request) = 0;
   virtual Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) = 0;
+  virtual Result<TunnelDatagramBurstResult> RecvTunnelDatagramBurst(
+      const TunnelDatagramBurstRequest& request) = 0;
   virtual Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) = 0;
   virtual Error CloseTunnelStream(std::uint64_t stream_id) = 0;
   virtual Result<std::uint64_t> SendTunnelStream(const TunnelStreamSendRequest& request) = 0;

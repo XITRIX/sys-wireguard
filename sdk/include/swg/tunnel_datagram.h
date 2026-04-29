@@ -32,6 +32,9 @@ class TunnelDatagramSocket {
   Error Close();
   Result<std::uint64_t> Send(const std::vector<std::uint8_t>& payload) const;
   Result<TunnelDatagram> Receive() const;
+  Result<TunnelDatagramBurstResult> ReceiveBurst(std::uint32_t max_datagrams,
+                                                 std::uint32_t max_payload_bytes,
+                                                 std::int32_t timeout_ms = 0) const;
 
  private:
   TunnelDatagramSocket(const AppSession* session, TunnelDatagramInfo info);

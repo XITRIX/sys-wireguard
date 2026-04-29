@@ -51,6 +51,10 @@ constexpr std::string_view kCompatBridgeClientName = "Moonlight-Switch";
 constexpr std::string_view kCompatBridgeIntegrationTag = "moonlight-switch";
 constexpr int kCompatHttpTunnelAttempts = 3;
 constexpr auto kCompatHttpRetryDelay = 250ms;
+constexpr auto kCompatEmptyReceiveProbeBackoff = 4ms;
+constexpr auto kCompatControlDatagramPollInterval = 1ms;
+constexpr std::uint32_t kCompatDatagramBurstMaxDatagrams = 32;
+constexpr std::uint32_t kCompatDatagramBurstMaxPayloadBytes = 48 * 1024;
 
 template <typename... Args>
 std::string BuildMessage(Args&&... args) {
@@ -495,7 +499,9 @@ struct BridgeSocketEntry {
   sockaddr_storage remote_addr{};
   socklen_t remote_addr_len = 0;
   std::deque<std::uint8_t> stream_buffer{};
-  std::optional<swg::TunnelDatagram> pending_datagram{};
+  std::deque<swg::TunnelDatagram> pending_datagrams{};
+  std::optional<std::chrono::steady_clock::time_point> next_stream_receive_probe{};
+  std::optional<std::chrono::steady_clock::time_point> next_datagram_receive_probe{};
   std::string last_error{};
   std::mutex mutex{};
 };
@@ -570,8 +576,17 @@ ReceiveOutcome FillStreamBuffer(BridgeSocketEntry* entry, int timeout_ms) {
                                              std::chrono::milliseconds(timeout_ms)};
 
   while (entry->stream_buffer.empty() && !entry->peer_closed) {
+    const auto probe_time = std::chrono::steady_clock::now();
+    // Moonlight polls tunnel sockets with timeout=0 in tight loops on the main thread.
+    // Rate-limit empty probes so each poll slice does not turn into a real IPC receive.
+    if (timeout_ms == 0 && entry->next_stream_receive_probe.has_value() &&
+        probe_time < *entry->next_stream_receive_probe) {
+      return ReceiveOutcome::Timeout;
+    }
+
     const auto received = entry->stream_socket.Receive();
     if (received.ok()) {
+      entry->next_stream_receive_probe.reset();
       entry->peer_closed = entry->peer_closed || received.value.peer_closed;
       entry->stream_buffer.insert(entry->stream_buffer.end(),
                                   received.value.payload.begin(),
@@ -588,7 +603,13 @@ ReceiveOutcome FillStreamBuffer(BridgeSocketEntry* entry, int timeout_ms) {
       return ReceiveOutcome::Error;
     }
 
-    if (deadline.has_value() && std::chrono::steady_clock::now() >= *deadline) {
+    const auto not_found_time = std::chrono::steady_clock::now();
+    entry->next_stream_receive_probe = not_found_time + kCompatEmptyReceiveProbeBackoff;
+    if (deadline.has_value() && not_found_time >= *deadline) {
+      return ReceiveOutcome::Timeout;
+    }
+
+    if (timeout_ms == 0) {
       return ReceiveOutcome::Timeout;
     }
 
@@ -599,36 +620,44 @@ ReceiveOutcome FillStreamBuffer(BridgeSocketEntry* entry, int timeout_ms) {
 }
 
 ReceiveOutcome FillDatagram(BridgeSocketEntry* entry, int timeout_ms) {
-  if (entry->pending_datagram.has_value()) {
+  if (!entry->pending_datagrams.empty()) {
     return ReceiveOutcome::Ready;
   }
 
-  const auto deadline = timeout_ms < 0 ? std::optional<std::chrono::steady_clock::time_point>{}
-                                       : std::optional<std::chrono::steady_clock::time_point>{
-                                             std::chrono::steady_clock::now() +
-                                             std::chrono::milliseconds(timeout_ms)};
-
-  while (!entry->pending_datagram.has_value()) {
-    const auto received = entry->datagram_socket.Receive();
-    if (received.ok()) {
-      entry->pending_datagram = std::move(received.value);
-      return ReceiveOutcome::Ready;
-    }
-
-    if (received.error.code != swg::ErrorCode::NotFound) {
-      entry->last_error = received.error.message;
-      errno = ToErrno(received.error.code);
-      return ReceiveOutcome::Error;
-    }
-
-    if (deadline.has_value() && std::chrono::steady_clock::now() >= *deadline) {
-      return ReceiveOutcome::Timeout;
-    }
-
-    std::this_thread::sleep_for(10ms);
+  const auto probe_time = std::chrono::steady_clock::now();
+  if (timeout_ms == 0 && entry->next_datagram_receive_probe.has_value() &&
+      probe_time < *entry->next_datagram_receive_probe) {
+    return ReceiveOutcome::Timeout;
   }
 
-  return ReceiveOutcome::Ready;
+  const auto received = entry->datagram_socket.ReceiveBurst(
+      kCompatDatagramBurstMaxDatagrams, kCompatDatagramBurstMaxPayloadBytes, timeout_ms);
+  if (received.ok()) {
+    entry->next_datagram_receive_probe.reset();
+    swg::TunnelDatagramBurstResult burst = received.value;
+    for (swg::TunnelDatagram& datagram : burst.datagrams) {
+      entry->pending_datagrams.push_back(std::move(datagram));
+    }
+    if (!entry->pending_datagrams.empty()) {
+      return ReceiveOutcome::Ready;
+    }
+    return ReceiveOutcome::Timeout;
+  }
+
+  if (received.error.code != swg::ErrorCode::NotFound) {
+    entry->last_error = received.error.message;
+    errno = ToErrno(received.error.code);
+    return ReceiveOutcome::Error;
+  }
+
+  entry->next_datagram_receive_probe = std::chrono::steady_clock::now() +
+                                       kCompatEmptyReceiveProbeBackoff;
+  return ReceiveOutcome::Timeout;
+}
+
+bool UsesNonBlockingControlDatagramWait(const BridgeSocketEntry& entry) {
+  return entry.kind == BridgeSocketKind::Datagram && entry.datagram_socket.is_open() &&
+         entry.datagram_socket.info().traffic_class == swg::AppTrafficClass::StreamControl;
 }
 
 class CompatBridgeState {
@@ -919,13 +948,13 @@ class CompatBridgeState {
     if (outcome == ReceiveOutcome::Error) {
       return -1;
     }
-    if (!entry->pending_datagram.has_value()) {
+    if (entry->pending_datagrams.empty()) {
       errno = EWOULDBLOCK;
       return -1;
     }
 
-    swg::TunnelDatagram datagram = std::move(*entry->pending_datagram);
-    entry->pending_datagram.reset();
+    swg::TunnelDatagram datagram = std::move(entry->pending_datagrams.front());
+    entry->pending_datagrams.pop_front();
 
     const std::size_t copy_size = std::min(size, datagram.payload.size());
     if (copy_size != 0) {
@@ -961,6 +990,52 @@ class CompatBridgeState {
       return 0;
     }
 
+    if (UsesNonBlockingControlDatagramWait(*entry) && want_read && timeout_ms != 0) {
+      if (can_read) {
+        *can_read = 0;
+      }
+      if (can_write) {
+        *can_write = 0;
+      }
+      if (want_write && can_write) {
+        *can_write = 1;
+      }
+
+      const auto deadline = timeout_ms < 0
+                                ? std::optional<std::chrono::steady_clock::time_point>{}
+                                : std::optional<std::chrono::steady_clock::time_point>{
+                                      std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(timeout_ms)};
+
+      while (true) {
+        {
+          std::scoped_lock lock(entry->mutex);
+          const ReceiveOutcome outcome = FillDatagram(entry.get(), 0);
+          if (outcome == ReceiveOutcome::Error) {
+            return -1;
+          }
+          if (!entry->pending_datagrams.empty() && can_read) {
+            *can_read = 1;
+            return 1;
+          }
+        }
+
+        if (deadline.has_value()) {
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= *deadline) {
+            return 1;
+          }
+
+          const auto remaining =
+              std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
+          std::this_thread::sleep_for(std::min(kCompatControlDatagramPollInterval, remaining));
+          continue;
+        }
+
+        std::this_thread::sleep_for(kCompatControlDatagramPollInterval);
+      }
+    }
+
     std::scoped_lock lock(entry->mutex);
     if (can_read) {
       *can_read = 0;
@@ -988,7 +1063,7 @@ class CompatBridgeState {
         if (outcome == ReceiveOutcome::Error) {
           return -1;
         }
-        if (entry->pending_datagram.has_value() && can_read) {
+        if (!entry->pending_datagrams.empty() && can_read) {
           *can_read = 1;
         }
       }

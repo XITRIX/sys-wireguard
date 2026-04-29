@@ -44,6 +44,8 @@ Result<ByteBuffer> EncodePayload(const TunnelDatagramOpenRequest& value);
 Result<ByteBuffer> EncodePayload(const TunnelDatagramInfo& value);
 Result<ByteBuffer> EncodePayload(const TunnelDatagramSendRequest& value);
 Result<ByteBuffer> EncodePayload(const TunnelDatagram& value);
+Result<ByteBuffer> EncodePayload(const TunnelDatagramBurstRequest& value);
+Result<ByteBuffer> EncodePayload(const TunnelDatagramBurstResult& value);
 Result<ByteBuffer> EncodePayload(const TunnelStreamOpenRequest& value);
 Result<ByteBuffer> EncodePayload(const TunnelStreamInfo& value);
 Result<ByteBuffer> EncodePayload(const TunnelStreamSendRequest& value);
@@ -70,6 +72,8 @@ Result<TunnelDatagramOpenRequest> DecodeTunnelDatagramOpenRequestPayload(const B
 Result<TunnelDatagramInfo> DecodeTunnelDatagramInfoPayload(const ByteBuffer& payload);
 Result<TunnelDatagramSendRequest> DecodeTunnelDatagramSendRequestPayload(const ByteBuffer& payload);
 Result<TunnelDatagram> DecodeTunnelDatagramPayload(const ByteBuffer& payload);
+Result<TunnelDatagramBurstRequest> DecodeTunnelDatagramBurstRequestPayload(const ByteBuffer& payload);
+Result<TunnelDatagramBurstResult> DecodeTunnelDatagramBurstResultPayload(const ByteBuffer& payload);
 Result<TunnelStreamOpenRequest> DecodeTunnelStreamOpenRequestPayload(const ByteBuffer& payload);
 Result<TunnelStreamInfo> DecodeTunnelStreamInfoPayload(const ByteBuffer& payload);
 Result<TunnelStreamSendRequest> DecodeTunnelStreamSendRequestPayload(const ByteBuffer& payload);

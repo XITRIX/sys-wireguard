@@ -52,6 +52,7 @@ enum class ServiceCommandId : std::uint32_t {
   CloseTunnelStream,
   RecvTunnelStream,
   SendTunnelStream,
+  RecvTunnelDatagramBurst,
 };
 
 enum class TunnelState : std::uint32_t {
@@ -294,6 +295,20 @@ struct TunnelDatagram {
   std::string remote_address;
   std::uint16_t remote_port = 0;
   std::vector<std::uint8_t> payload;
+};
+
+struct TunnelDatagramBurstRequest {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t datagram_id = 0;
+  std::uint32_t max_datagrams = 0;
+  std::uint32_t max_payload_bytes = 0;
+  std::int32_t timeout_ms = 0;
+};
+
+struct TunnelDatagramBurstResult {
+  std::uint16_t abi_version = kAbiVersion;
+  std::uint64_t datagram_id = 0;
+  std::vector<TunnelDatagram> datagrams;
 };
 
 struct TunnelStreamOpenRequest {

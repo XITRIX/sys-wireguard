@@ -3170,6 +3170,124 @@ bool TestTunnelDatagramSocket() {
   return ok;
 }
 
+bool TestTunnelDatagramSocketReceiveBurst() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-datagram-burst-recv";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedVideoTunnelDatagramSourcePort = 50001;
+  constexpr std::uint16_t kMoonlightVideoPort = 47998;
+  const std::vector<std::uint8_t> outbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x04};
+  const std::vector<std::vector<std::uint8_t>> inbound_payloads = {
+      {0x56, 0x49, 0x44, 0x45, 0x4f, 0x2d, 0x42, 0x55, 0x52, 0x53, 0x54, 0x2d, 0x30},
+      {0x56, 0x49, 0x44, 0x45, 0x4f, 0x2d, 0x42, 0x55, 0x52, 0x53, 0x54, 0x2d, 0x31},
+      {0x56, 0x49, 0x44, 0x45, 0x4f, 0x2d, 0x42, 0x55, 0x52, 0x53, 0x54, 0x2d, 0x32},
+      {0x56, 0x49, 0x44, 0x45, 0x4f, 0x2d, 0x42, 0x55, 0x52, 0x53, 0x54, 0x2d, 0x33},
+  };
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.8", "remote_address");
+  if (!Require(local_address.ok(), "burst receive tunnel datagram local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "burst receive tunnel datagram remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4UdpPacketEndpoint outbound_endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, outbound_endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, outbound_endpoint.destination_ipv4.begin());
+  outbound_endpoint.source_port = kExpectedVideoTunnelDatagramSourcePort;
+  outbound_endpoint.destination_port = kMoonlightVideoPort;
+
+  swg::Ipv4UdpPacketEndpoint inbound_endpoint{};
+  inbound_endpoint.source_ipv4 = outbound_endpoint.destination_ipv4;
+  inbound_endpoint.destination_ipv4 = outbound_endpoint.source_ipv4;
+  inbound_endpoint.source_port = outbound_endpoint.destination_port;
+  inbound_endpoint.destination_port = outbound_endpoint.source_port;
+
+  const auto expected_outbound_packet = swg::BuildIpv4UdpPacket(outbound_endpoint, outbound_payload);
+  if (!Require(expected_outbound_packet.ok(), "burst receive tunnel datagram outbound packet must build")) {
+    return false;
+  }
+
+  std::vector<std::vector<std::uint8_t>> inbound_packets;
+  inbound_packets.reserve(inbound_payloads.size());
+  for (const auto& inbound_payload : inbound_payloads) {
+    const auto inbound_packet = swg::BuildIpv4UdpPacket(inbound_endpoint, inbound_payload);
+    if (!Require(inbound_packet.ok(), "burst receive tunnel datagram inbound packet must build")) {
+      return false;
+    }
+    inbound_packets.push_back(inbound_packet.value);
+  }
+
+  LocalHandshakeResponder responder(0, 0, inbound_packets,
+                                    MakePayloadSequence(expected_outbound_packet.value));
+  if (!Require(responder.ready(), "local handshake responder must start for tunnel datagram burst receive tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before tunnel datagram burst receive tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before tunnel datagram burst receive tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "tunnel datagram burst receive app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto video_socket = swg::TunnelDatagramSocket::Open(
+      session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", kMoonlightVideoPort));
+  ok &= Require(video_socket.ok(), "Moonlight video tunnel datagram burst receive socket must open");
+  if (!video_socket.ok()) {
+    return false;
+  }
+
+  ok &= Require(video_socket.value.info().local_port == kExpectedVideoTunnelDatagramSourcePort,
+                "Moonlight video tunnel datagram burst receive socket must use the advertised companion UDP source port");
+
+  const auto send_counter = video_socket.value.Send(outbound_payload);
+  ok &= Require(send_counter.ok(), "tunnel datagram burst receive send must succeed");
+
+  const auto burst = video_socket.value.ReceiveBurst(8, 8 * 1024);
+  ok &= Require(burst.ok(), "tunnel datagram burst receive must return queued inbound UDP payloads");
+  if (!burst.ok()) {
+    return false;
+  }
+
+  ok &= Require(burst.value.datagram_id == video_socket.value.info().datagram_id,
+                "tunnel datagram burst receive must preserve the datagram id");
+  ok &= Require(burst.value.datagrams.size() == inbound_payloads.size(),
+                "tunnel datagram burst receive must batch all queued inbound UDP payloads");
+
+  for (std::size_t index = 0; index < inbound_payloads.size() && index < burst.value.datagrams.size(); ++index) {
+    ok &= Require(burst.value.datagrams[index].payload == inbound_payloads[index],
+                  "tunnel datagram burst receive must preserve each inbound UDP payload");
+    ok &= Require(burst.value.datagrams[index].remote_address == "203.0.113.8",
+                  "tunnel datagram burst receive must preserve the remote IPv4 address");
+    ok &= Require(burst.value.datagrams[index].remote_port == kMoonlightVideoPort,
+                  "tunnel datagram burst receive must preserve the remote UDP port");
+  }
+
+  const auto empty = video_socket.value.Receive();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "tunnel datagram burst receive must report an empty queue after the batch drains");
+
+  ok &= Require(responder.Join(), responder.error().empty()
+                                      ? "local responder must validate the tunnel datagram burst receive exchange"
+                                      : responder.error());
+  ok &= Require(session.Close().ok(), "tunnel datagram burst receive app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(),
+                "service disconnect must succeed after tunnel datagram burst receive tests");
+  return ok;
+}
+
 bool TestTunnelDatagramSocketReassemblesIpv4Fragments() {
   const std::filesystem::path runtime_root =
       std::filesystem::current_path() / "test-runtime-tunnel-datagram-fragments";
@@ -3261,6 +3379,149 @@ bool TestTunnelDatagramSocketReassemblesIpv4Fragments() {
                 "fragmented tunnel datagram engine must validate the outbound UDP packet before releasing fragments");
   ok &= Require(session.Close().ok(), "fragmented tunnel datagram app session must close cleanly");
   ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after fragmented tunnel datagram tests");
+  return ok;
+}
+
+bool TestTunnelDatagramSocketReassemblesFragmentBurstBeyondLegacyEntryLimit() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-datagram-fragments-burst";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedVideoTunnelDatagramSourcePort = 50001;
+  constexpr std::uint16_t kMoonlightVideoPort = 47998;
+  constexpr std::size_t kFragmentedBurstPacketCount = 192;
+  const std::vector<std::uint8_t> outbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x03};
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.8", "remote_address");
+  if (!Require(local_address.ok(), "burst fragmented tunnel datagram local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "burst fragmented tunnel datagram remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4UdpPacketEndpoint outbound_endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, outbound_endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, outbound_endpoint.destination_ipv4.begin());
+  outbound_endpoint.source_port = kExpectedVideoTunnelDatagramSourcePort;
+  outbound_endpoint.destination_port = kMoonlightVideoPort;
+
+  swg::Ipv4UdpPacketEndpoint inbound_endpoint{};
+  inbound_endpoint.source_ipv4 = outbound_endpoint.destination_ipv4;
+  inbound_endpoint.destination_ipv4 = outbound_endpoint.source_ipv4;
+  inbound_endpoint.source_port = outbound_endpoint.destination_port;
+  inbound_endpoint.destination_port = outbound_endpoint.source_port;
+
+  const auto expected_outbound_packet = swg::BuildIpv4UdpPacket(outbound_endpoint, outbound_payload);
+  if (!Require(expected_outbound_packet.ok(),
+               "burst fragmented tunnel datagram outbound packet must build")) {
+    return false;
+  }
+
+  std::vector<std::vector<std::uint8_t>> queued_inbound_fragments;
+  queued_inbound_fragments.reserve(kFragmentedBurstPacketCount * 2u);
+  std::vector<std::vector<std::vector<std::uint8_t>>> fragmented_packets;
+  fragmented_packets.reserve(kFragmentedBurstPacketCount);
+  std::vector<std::vector<std::uint8_t>> expected_payloads;
+  expected_payloads.reserve(kFragmentedBurstPacketCount);
+
+  for (std::size_t index = 0; index < kFragmentedBurstPacketCount; ++index) {
+    std::vector<std::uint8_t> inbound_payload(1408, static_cast<std::uint8_t>(0x30u + (index % 10u)));
+    inbound_payload[0] = 0x56;
+    inbound_payload[1] = 0x49;
+    inbound_payload[2] = 0x44;
+    inbound_payload[3] = 0x45;
+    inbound_payload[4] = 0x4f;
+    inbound_payload[5] = static_cast<std::uint8_t>(index & 0xffu);
+    inbound_payload[6] = static_cast<std::uint8_t>((index >> 8u) & 0xffu);
+    expected_payloads.push_back(inbound_payload);
+
+    const auto inbound_packet = swg::BuildIpv4UdpPacket(inbound_endpoint, inbound_payload);
+    if (!Require(inbound_packet.ok(), "burst fragmented tunnel datagram inbound packet must build")) {
+      return false;
+    }
+
+    std::vector<std::uint8_t> identified_inbound_packet = inbound_packet.value;
+    Store16Be(&identified_inbound_packet, 4,
+              static_cast<std::uint16_t>(0x4000u + static_cast<std::uint16_t>(index)));
+
+    const auto fragmented_inbound = FragmentIpv4Packet(identified_inbound_packet, 24);
+    if (!Require(fragmented_inbound.ok(),
+                 "burst fragmented tunnel datagram inbound packet must split into IPv4 fragments")) {
+      return false;
+    }
+    if (!Require(fragmented_inbound.value.size() == 2,
+                 "burst fragmented tunnel datagram test packets must split into exactly two IPv4 fragments")) {
+      return false;
+    }
+
+    fragmented_packets.push_back(fragmented_inbound.value);
+  }
+
+  for (const auto& fragments : fragmented_packets) {
+    queued_inbound_fragments.push_back(fragments[1]);
+  }
+  for (const auto& fragments : fragmented_packets) {
+    queued_inbound_fragments.push_back(fragments[0]);
+  }
+
+  auto engine = std::make_unique<FragmentedTunnelDatagramEngine>(queued_inbound_fragments,
+                                                                 expected_outbound_packet.value);
+  FragmentedTunnelDatagramEngine* engine_ptr = engine.get();
+  const auto service = swg::sysmodule::CreateLocalControlServiceForTest(std::move(engine), runtime_root);
+  swg::Client client(swg::sysmodule::CreateHostInProcessTransport(service));
+
+  bool ok = true;
+  ok &= Require(client.SaveConfig(MakeValidConfig("127.0.0.1", 51820)).ok(),
+                "valid config must save before fragmented tunnel datagram burst tests");
+  ok &= Require(client.Connect().ok(),
+                "service connect must succeed before fragmented tunnel datagram burst tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "fragmented tunnel datagram burst app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto video_socket = swg::TunnelDatagramSocket::Open(
+      session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", kMoonlightVideoPort));
+  ok &= Require(video_socket.ok(), "fragmented Moonlight video tunnel datagram burst socket must open");
+  if (!video_socket.ok()) {
+    return false;
+  }
+
+  ok &= Require(video_socket.value.info().local_port == kExpectedVideoTunnelDatagramSourcePort,
+                "fragmented video tunnel datagram burst socket must use the advertised companion UDP source port");
+
+  const auto send_counter = video_socket.value.Send(outbound_payload);
+  ok &= Require(send_counter.ok(), "fragmented tunnel datagram burst send must succeed");
+
+  for (std::size_t index = 0; index < expected_payloads.size(); ++index) {
+    const auto received = video_socket.value.Receive();
+    ok &= Require(received.ok(),
+                  "fragmented tunnel datagram burst receive must succeed after queued IPv4 reassembly");
+    if (!received.ok()) {
+      return false;
+    }
+
+    ok &= Require(received.value.payload == expected_payloads[index],
+                  "fragmented tunnel datagram burst receive must preserve each reassembled UDP payload");
+    ok &= Require(received.value.remote_address == "203.0.113.8",
+                  "fragmented tunnel datagram burst receive must preserve the remote IPv4 address");
+    ok &= Require(received.value.remote_port == kMoonlightVideoPort,
+                  "fragmented tunnel datagram burst receive must preserve the remote UDP source port");
+  }
+
+  const auto empty = video_socket.value.Receive();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "fragmented tunnel datagram burst receive must report an empty queue after the burst drains");
+
+  ok &= Require(engine_ptr->outbound_payload_validated(),
+                "fragmented tunnel datagram burst engine must validate the outbound UDP packet before releasing fragments");
+  ok &= Require(session.Close().ok(), "fragmented tunnel datagram burst app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(),
+                "service disconnect must succeed after fragmented tunnel datagram burst tests");
   return ok;
 }
 
@@ -4061,7 +4322,10 @@ int main() {
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
   const bool tunnel_datagram_ok = TestTunnelDatagramSocket();
+  const bool tunnel_datagram_burst_ok = TestTunnelDatagramSocketReceiveBurst();
   const bool tunnel_datagram_fragments_ok = TestTunnelDatagramSocketReassemblesIpv4Fragments();
+  const bool tunnel_datagram_fragment_burst_ok =
+      TestTunnelDatagramSocketReassemblesFragmentBurstBeyondLegacyEntryLimit();
   const bool tunnel_stream_ok = TestTunnelStreamSocket();
   const bool tunnel_stream_payload_fin_ok = TestTunnelStreamSocketPayloadWithFin();
   const bool tunnel_stream_out_of_order_ok = TestTunnelStreamSocketOutOfOrder();
@@ -4078,7 +4342,9 @@ int main() {
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && app_policy_ok &&
            tunnel_dns_codec_ok && dns_resolution_ok &&
-            session_socket_ok && tunnel_datagram_ok && tunnel_datagram_fragments_ok &&
+            session_socket_ok && tunnel_datagram_ok && tunnel_datagram_burst_ok &&
+            tunnel_datagram_fragments_ok &&
+            tunnel_datagram_fragment_burst_ok &&
             tunnel_stream_ok && tunnel_stream_payload_fin_ok &&
             tunnel_stream_out_of_order_ok &&
            tunnel_stream_delayed_synack_ok && tunnel_stream_deferred_synack_ok &&

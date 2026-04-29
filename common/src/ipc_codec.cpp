@@ -1663,6 +1663,122 @@ Result<TunnelDatagram> DecodeTunnelDatagramPayload(const ByteBuffer& payload) {
   return MakeSuccess(std::move(value));
 }
 
+Result<ByteBuffer> EncodePayload(const TunnelDatagramBurstRequest& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.datagram_id);
+  writer.WritePod<std::uint32_t>(value.max_datagrams);
+  writer.WritePod<std::uint32_t>(value.max_payload_bytes);
+  writer.WritePod<std::int32_t>(value.timeout_ms);
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagramBurstRequest> DecodeTunnelDatagramBurstRequestPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagramBurstRequest value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagramBurstRequest>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> datagram_id = reader.ReadPod<std::uint64_t>();
+  if (!datagram_id.ok()) {
+    return MakeFailure<TunnelDatagramBurstRequest>(datagram_id.error.code, datagram_id.error.message);
+  }
+  value.datagram_id = datagram_id.value;
+
+  const Result<std::uint32_t> max_datagrams = reader.ReadPod<std::uint32_t>();
+  if (!max_datagrams.ok()) {
+    return MakeFailure<TunnelDatagramBurstRequest>(max_datagrams.error.code,
+                                                   max_datagrams.error.message);
+  }
+  value.max_datagrams = max_datagrams.value;
+
+  const Result<std::uint32_t> max_payload_bytes = reader.ReadPod<std::uint32_t>();
+  if (!max_payload_bytes.ok()) {
+    return MakeFailure<TunnelDatagramBurstRequest>(max_payload_bytes.error.code,
+                                                   max_payload_bytes.error.message);
+  }
+  value.max_payload_bytes = max_payload_bytes.value;
+
+  const Result<std::int32_t> timeout_ms = reader.ReadPod<std::int32_t>();
+  if (!timeout_ms.ok()) {
+    return MakeFailure<TunnelDatagramBurstRequest>(timeout_ms.error.code,
+                                                   timeout_ms.error.message);
+  }
+  value.timeout_ms = timeout_ms.value;
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagramBurstRequest>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
+Result<ByteBuffer> EncodePayload(const TunnelDatagramBurstResult& value) {
+  BufferWriter writer;
+  writer.WritePod<std::uint16_t>(value.abi_version);
+  writer.WritePod<std::uint64_t>(value.datagram_id);
+  writer.WritePod<std::uint32_t>(static_cast<std::uint32_t>(value.datagrams.size()));
+  for (const TunnelDatagram& datagram : value.datagrams) {
+    const Result<ByteBuffer> encoded = EncodePayload(datagram);
+    if (!encoded.ok()) {
+      return MakeFailure<ByteBuffer>(encoded.error.code, encoded.error.message);
+    }
+    writer.WriteByteVector(encoded.value);
+  }
+  return MakeSuccess(std::move(writer).Finish());
+}
+
+Result<TunnelDatagramBurstResult> DecodeTunnelDatagramBurstResultPayload(const ByteBuffer& payload) {
+  BufferReader reader(payload);
+  TunnelDatagramBurstResult value{};
+
+  const Result<std::uint16_t> abi_version = reader.ReadPod<std::uint16_t>();
+  if (!abi_version.ok()) {
+    return MakeFailure<TunnelDatagramBurstResult>(abi_version.error.code, abi_version.error.message);
+  }
+  value.abi_version = abi_version.value;
+
+  const Result<std::uint64_t> datagram_id = reader.ReadPod<std::uint64_t>();
+  if (!datagram_id.ok()) {
+    return MakeFailure<TunnelDatagramBurstResult>(datagram_id.error.code, datagram_id.error.message);
+  }
+  value.datagram_id = datagram_id.value;
+
+  const Result<std::uint32_t> datagram_count = reader.ReadPod<std::uint32_t>();
+  if (!datagram_count.ok()) {
+    return MakeFailure<TunnelDatagramBurstResult>(datagram_count.error.code,
+                                                  datagram_count.error.message);
+  }
+
+  value.datagrams.reserve(datagram_count.value);
+  for (std::uint32_t index = 0; index < datagram_count.value; ++index) {
+    const Result<std::vector<std::uint8_t>> encoded_datagram = reader.ReadByteVector();
+    if (!encoded_datagram.ok()) {
+      return MakeFailure<TunnelDatagramBurstResult>(encoded_datagram.error.code,
+                                                    encoded_datagram.error.message);
+    }
+
+    const Result<TunnelDatagram> datagram = DecodeTunnelDatagramPayload(encoded_datagram.value);
+    if (!datagram.ok()) {
+      return MakeFailure<TunnelDatagramBurstResult>(datagram.error.code, datagram.error.message);
+    }
+
+    value.datagrams.push_back(datagram.value);
+  }
+
+  const Error trailing = EnsureFullyConsumed(reader);
+  if (trailing) {
+    return MakeFailure<TunnelDatagramBurstResult>(trailing.code, trailing.message);
+  }
+
+  return MakeSuccess(std::move(value));
+}
+
 Result<ByteBuffer> EncodePayload(const TunnelStreamOpenRequest& value) {
   BufferWriter writer;
   writer.WritePod<std::uint16_t>(value.abi_version);
@@ -2184,6 +2300,14 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
         return EncodeResponseFromError(send_request.error);
       }
       return EncodeResponseFromResult(service.SendTunnelStream(send_request.value));
+    }
+    case ServiceCommandId::RecvTunnelDatagramBurst: {
+      const Result<TunnelDatagramBurstRequest> burst_request =
+          DecodeTunnelDatagramBurstRequestPayload(request.value.payload);
+      if (!burst_request.ok()) {
+        return EncodeResponseFromError(burst_request.error);
+      }
+      return EncodeResponseFromResult(service.RecvTunnelDatagramBurst(burst_request.value));
     }
   }
 

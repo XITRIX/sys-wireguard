@@ -68,4 +68,17 @@ Result<TunnelDatagram> TunnelDatagramSocket::Receive() const {
   return session_->ReceiveTunnelDatagram(info_.datagram_id);
 }
 
+Result<TunnelDatagramBurstResult> TunnelDatagramSocket::ReceiveBurst(
+    std::uint32_t max_datagrams,
+    std::uint32_t max_payload_bytes,
+    std::int32_t timeout_ms) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelDatagramBurstResult>(ErrorCode::InvalidState,
+                                                  "tunnel datagram socket is not open");
+  }
+
+  return session_->ReceiveTunnelDatagramBurst(info_.datagram_id, max_datagrams,
+                                              max_payload_bytes, timeout_ms);
+}
+
 }  // namespace swg

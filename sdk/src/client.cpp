@@ -403,6 +403,25 @@ Result<TunnelDatagram> Client::RecvTunnelDatagram(std::uint64_t datagram_id) con
       DecodeTunnelDatagramPayload);
 }
 
+Result<TunnelDatagramBurstResult> Client::RecvTunnelDatagramBurst(
+    const TunnelDatagramBurstRequest& request) const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->RecvTunnelDatagramBurst(request);
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  const Result<ByteBuffer> payload = EncodePayload(request);
+  if (!payload.ok()) {
+    return MakeFailure<TunnelDatagramBurstResult>(payload.error.code, payload.error.message);
+  }
+  return DecodeTransportResponse(
+      InvokeTransportRequest(
+          transport,
+          IpcRequestMessage{kAbiVersion, ServiceCommandId::RecvTunnelDatagramBurst, payload.value}),
+      DecodeTunnelDatagramBurstResultPayload);
+}
+
 Result<TunnelStreamInfo> Client::OpenTunnelStream(const TunnelStreamOpenRequest& request) const {
   const std::shared_ptr<IControlService> service = ResolveService();
   if (service) {

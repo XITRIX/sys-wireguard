@@ -25,6 +25,10 @@ class AppSession {
   Error CloseTunnelDatagram(std::uint64_t datagram_id) const;
   Result<std::uint64_t> SendTunnelDatagram(std::uint64_t datagram_id, const std::vector<std::uint8_t>& payload) const;
   Result<TunnelDatagram> ReceiveTunnelDatagram(std::uint64_t datagram_id) const;
+  Result<TunnelDatagramBurstResult> ReceiveTunnelDatagramBurst(std::uint64_t datagram_id,
+                                                               std::uint32_t max_datagrams,
+                                                               std::uint32_t max_payload_bytes,
+                                                               std::int32_t timeout_ms = 0) const;
   Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) const;
   Error CloseTunnelStream(std::uint64_t stream_id) const;
   Result<std::uint64_t> SendTunnelStream(std::uint64_t stream_id, const std::vector<std::uint8_t>& payload) const;

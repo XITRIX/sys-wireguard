@@ -135,6 +135,24 @@ Result<TunnelDatagram> AppSession::ReceiveTunnelDatagram(std::uint64_t datagram_
   return client_.RecvTunnelDatagram(datagram_id);
 }
 
+Result<TunnelDatagramBurstResult> AppSession::ReceiveTunnelDatagramBurst(
+    std::uint64_t datagram_id,
+    std::uint32_t max_datagrams,
+    std::uint32_t max_payload_bytes,
+    std::int32_t timeout_ms) const {
+  if (!is_open()) {
+    return MakeFailure<TunnelDatagramBurstResult>(ErrorCode::InvalidState,
+                                                  "app session is not open");
+  }
+
+  TunnelDatagramBurstRequest request{};
+  request.datagram_id = datagram_id;
+  request.max_datagrams = max_datagrams;
+  request.max_payload_bytes = max_payload_bytes;
+  request.timeout_ms = timeout_ms;
+  return client_.RecvTunnelDatagramBurst(request);
+}
+
 Result<TunnelStreamInfo> AppSession::OpenTunnelStream(const TunnelStreamOpenRequest& request) const {
   if (!is_open()) {
     return MakeFailure<TunnelStreamInfo>(ErrorCode::InvalidState, "app session is not open");
