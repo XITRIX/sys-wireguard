@@ -1051,6 +1051,179 @@ class RecoveringTunnelStreamEngine final : public swg::sysmodule::IWgTunnelEngin
   std::string last_recovery_reason_{};
 };
 
+void Store16Be(std::vector<std::uint8_t>* bytes, std::size_t offset, std::uint16_t value) {
+  (*bytes)[offset] = static_cast<std::uint8_t>((value >> 8) & 0xffu);
+  (*bytes)[offset + 1] = static_cast<std::uint8_t>(value & 0xffu);
+}
+
+swg::Result<std::vector<std::vector<std::uint8_t>>> FragmentIpv4Packet(const std::vector<std::uint8_t>& packet,
+                                                                       std::size_t first_fragment_payload_size) {
+  if (packet.size() < 20) {
+    return swg::MakeFailure<std::vector<std::vector<std::uint8_t>>>(swg::ErrorCode::ParseError,
+                                                                    "packet must contain a minimum IPv4 header");
+  }
+  if ((packet[0] >> 4) != 4) {
+    return swg::MakeFailure<std::vector<std::vector<std::uint8_t>>>(swg::ErrorCode::ParseError,
+                                                                    "packet must be IPv4");
+  }
+
+  const std::size_t header_size = static_cast<std::size_t>(packet[0] & 0x0fu) * 4;
+  if (header_size < 20 || packet.size() < header_size + 8) {
+    return swg::MakeFailure<std::vector<std::vector<std::uint8_t>>>(swg::ErrorCode::ParseError,
+                                                                    "packet must contain an IPv4 plus UDP header");
+  }
+
+  const std::uint16_t total_length =
+      static_cast<std::uint16_t>((static_cast<std::uint16_t>(packet[2]) << 8) | packet[3]);
+  if (total_length < header_size + 8 || total_length > packet.size()) {
+    return swg::MakeFailure<std::vector<std::vector<std::uint8_t>>>(swg::ErrorCode::ParseError,
+                                                                    "packet must carry a valid IPv4 total length");
+  }
+
+  const std::size_t payload_size = total_length - header_size;
+  if (first_fragment_payload_size == 0 || first_fragment_payload_size >= payload_size ||
+      (first_fragment_payload_size % 8u) != 0u) {
+    return swg::MakeFailure<std::vector<std::vector<std::uint8_t>>>(
+        swg::ErrorCode::ParseError,
+        "first fragment payload size must be non-zero, smaller than the packet payload, and 8-byte aligned");
+  }
+
+  const std::vector<std::uint8_t> header(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(header_size));
+  const std::vector<std::uint8_t> payload(packet.begin() + static_cast<std::ptrdiff_t>(header_size),
+                                          packet.begin() + static_cast<std::ptrdiff_t>(total_length));
+
+  std::vector<std::vector<std::uint8_t>> fragments;
+  fragments.emplace_back(header);
+  fragments.back().insert(fragments.back().end(), payload.begin(),
+                          payload.begin() + static_cast<std::ptrdiff_t>(first_fragment_payload_size));
+  Store16Be(&fragments.back(), 2, static_cast<std::uint16_t>(header_size + first_fragment_payload_size));
+  Store16Be(&fragments.back(), 6, 0x2000u);
+
+  fragments.emplace_back(header);
+  fragments.back().insert(fragments.back().end(),
+                          payload.begin() + static_cast<std::ptrdiff_t>(first_fragment_payload_size),
+                          payload.end());
+  Store16Be(&fragments.back(), 2, static_cast<std::uint16_t>(header_size + payload_size - first_fragment_payload_size));
+  Store16Be(&fragments.back(), 6, static_cast<std::uint16_t>(first_fragment_payload_size / 8u));
+
+  return swg::MakeSuccess(std::move(fragments));
+}
+
+class FragmentedTunnelDatagramEngine final : public swg::sysmodule::IWgTunnelEngine {
+ public:
+  FragmentedTunnelDatagramEngine(std::vector<std::vector<std::uint8_t>> inbound_packets,
+                                 std::vector<std::uint8_t> expected_outbound_packet)
+      : inbound_packets_(std::move(inbound_packets)),
+        expected_outbound_packet_(std::move(expected_outbound_packet)) {}
+
+  swg::Error Start(const swg::sysmodule::TunnelEngineStartRequest& request) override {
+    std::scoped_lock lock(mutex_);
+    running_ = true;
+    prepared_session_ = request.session;
+    queued_packets_.clear();
+    stats_ = {};
+    stats_.successful_handshakes = 1;
+    next_send_counter_ = 1;
+    next_receive_counter_ = 1;
+    inbound_packets_queued_ = false;
+    outbound_payload_validated_ = false;
+    last_error_.clear();
+    return swg::Error::None();
+  }
+
+  swg::Error Stop() override {
+    std::scoped_lock lock(mutex_);
+    running_ = false;
+    queued_packets_.clear();
+    return swg::Error::None();
+  }
+
+  swg::Error RecoverTransport(std::string_view reason) override {
+    std::scoped_lock lock(mutex_);
+    last_error_ = "unexpected datagram transport recovery request: " + std::string(reason);
+    return swg::MakeError(swg::ErrorCode::Unsupported, last_error_);
+  }
+
+  swg::Result<std::uint64_t> SendPacket(const std::vector<std::uint8_t>& payload) override {
+    std::scoped_lock lock(mutex_);
+    if (!running_) {
+      return swg::MakeFailure<std::uint64_t>(swg::ErrorCode::InvalidState,
+                                             "fragmented datagram engine is not running");
+    }
+    if (payload != expected_outbound_packet_) {
+      last_error_ = "fragmented datagram engine observed unexpected outbound payload bytes";
+      return swg::MakeFailure<std::uint64_t>(swg::ErrorCode::ParseError, last_error_);
+    }
+
+    outbound_payload_validated_ = true;
+
+    const std::uint64_t counter = next_send_counter_++;
+    stats_.bytes_out += payload.size();
+    ++stats_.packets_out;
+
+    if (!inbound_packets_queued_) {
+      for (const auto& inbound_packet : inbound_packets_) {
+        queued_packets_.push_back(swg::WireGuardConsumedTransportPacket{next_receive_counter_++, inbound_packet});
+        stats_.bytes_in += inbound_packet.size();
+        ++stats_.packets_in;
+      }
+      inbound_packets_queued_ = true;
+    }
+
+    return swg::MakeSuccess(counter);
+  }
+
+  swg::Result<swg::WireGuardConsumedTransportPacket> ReceivePacket() override {
+    std::scoped_lock lock(mutex_);
+    if (!running_) {
+      return swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::InvalidState,
+                                                                     "fragmented datagram engine is not running");
+    }
+    if (queued_packets_.empty()) {
+      return swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::NotFound,
+                                                                     "no fragmented datagram packets are queued");
+    }
+
+    swg::WireGuardConsumedTransportPacket packet = std::move(queued_packets_.front());
+    queued_packets_.pop_front();
+    return swg::MakeSuccess(std::move(packet));
+  }
+
+  swg::TunnelStats GetStats() const override {
+    std::scoped_lock lock(mutex_);
+    return stats_;
+  }
+
+  std::string GetLastError() const override {
+    std::scoped_lock lock(mutex_);
+    return last_error_;
+  }
+
+  bool IsRunning() const override {
+    std::scoped_lock lock(mutex_);
+    return running_;
+  }
+
+  [[nodiscard]] bool outbound_payload_validated() const {
+    std::scoped_lock lock(mutex_);
+    return outbound_payload_validated_;
+  }
+
+ private:
+  mutable std::mutex mutex_{};
+  bool running_ = false;
+  swg::sysmodule::PreparedTunnelSession prepared_session_{};
+  std::vector<std::vector<std::uint8_t>> inbound_packets_{};
+  std::vector<std::uint8_t> expected_outbound_packet_{};
+  std::deque<swg::WireGuardConsumedTransportPacket> queued_packets_{};
+  swg::TunnelStats stats_{};
+  std::uint64_t next_send_counter_ = 1;
+  std::uint64_t next_receive_counter_ = 1;
+  bool inbound_packets_queued_ = false;
+  bool outbound_payload_validated_ = false;
+  std::string last_error_{};
+};
+
 bool TestWireGuardCrypto() {
   bool ok = true;
 
@@ -1777,6 +1950,85 @@ bool TestEngineInboundPayloadQueue() {
                 "engine receive queue must report empty after the queued packet is drained");
 
   ok &= Require(engine->Stop().ok(), "engine stop must succeed after payload queue test");
+  return ok;
+}
+
+bool TestEngineInboundPayloadBurstQueue() {
+  constexpr std::size_t kBurstPacketCount = 64;
+  constexpr std::size_t kBurstPayloadSize = 1200;
+
+  std::vector<std::vector<std::uint8_t>> inbound_payloads;
+  inbound_payloads.reserve(kBurstPacketCount);
+  for (std::size_t index = 0; index < kBurstPacketCount; ++index) {
+    std::vector<std::uint8_t> payload(kBurstPayloadSize, static_cast<std::uint8_t>(0x40 + (index % 31)));
+    payload[0] = 0x56;
+    payload[1] = 0x49;
+    payload[2] = 0x44;
+    payload[3] = static_cast<std::uint8_t>(index & 0xFF);
+    payload[4] = static_cast<std::uint8_t>((index >> 8) & 0xFF);
+    inbound_payloads.push_back(std::move(payload));
+  }
+
+  LocalHandshakeResponder responder(0, 0, inbound_payloads, {});
+  if (!Require(responder.ready(), "local handshake responder must start for engine burst queue test")) {
+    return false;
+  }
+
+  const swg::Config valid_config = MakeValidConfig("127.0.0.1", responder.port());
+  const auto validated = swg::ValidateWireGuardProfileForConnect(valid_config.profiles.at("default"));
+
+  bool ok = true;
+  ok &= Require(validated.ok(), "validated profile must be available for engine burst queue test");
+  if (!validated.ok()) {
+    return false;
+  }
+
+  const auto prepared =
+      swg::sysmodule::PrepareTunnelSession(valid_config.active_profile, validated.value, valid_config.runtime_flags);
+  ok &= Require(prepared.ok(), "prepared session must be available for engine burst queue test");
+  if (!prepared.ok()) {
+    return false;
+  }
+
+  auto engine = swg::sysmodule::CreateWgTunnelEngine();
+  const swg::Error start_error = engine->Start(swg::sysmodule::TunnelEngineStartRequest{prepared.value});
+  ok &= Require(responder.Join(), responder.error().empty()
+                                      ? "local responder must send the inbound burst before engine drain"
+                                      : responder.error());
+  ok &= Require(start_error.ok(), "engine start must complete the burst queue handshake");
+  if (!start_error.ok()) {
+    return false;
+  }
+
+  for (std::size_t index = 0; index < inbound_payloads.size(); ++index) {
+    swg::Result<swg::WireGuardConsumedTransportPacket> packet =
+        swg::MakeFailure<swg::WireGuardConsumedTransportPacket>(swg::ErrorCode::NotFound, "not queued yet");
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      packet = engine->ReceivePacket();
+      if (packet.ok()) {
+        break;
+      }
+      if (packet.error.code != swg::ErrorCode::NotFound) {
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ok &= Require(packet.ok(), "engine must preserve a queued inbound burst payload");
+    if (packet.ok()) {
+      ok &= Require(packet.value.counter == index,
+                    "engine burst queue must preserve consecutive inbound counters");
+      ok &= Require(packet.value.payload == inbound_payloads[index],
+                    "engine burst queue must preserve each inbound payload byte-for-byte");
+    }
+  }
+
+  const auto empty = engine->ReceivePacket();
+  ok &= Require(!empty.ok() && empty.error.code == swg::ErrorCode::NotFound,
+                "engine burst queue must report empty after the queued burst is drained");
+
+  ok &= Require(engine->Stop().ok(), "engine stop must succeed after burst queue test");
   return ok;
 }
 
@@ -2806,7 +3058,9 @@ bool TestTunnelDatagramSocket() {
   std::error_code filesystem_error;
   std::filesystem::remove_all(runtime_root, filesystem_error);
 
-  constexpr std::uint16_t kExpectedFirstTunnelDatagramSourcePort = 20000;
+  constexpr std::uint16_t kExpectedControlTunnelDatagramSourcePort = 50000;
+  constexpr std::uint16_t kExpectedVideoTunnelDatagramSourcePort = 50001;
+  constexpr std::uint16_t kMoonlightControlPort = 47999;
   constexpr std::uint16_t kMoonlightVideoPort = 47998;
   const std::vector<std::uint8_t> outbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x01};
   const std::vector<std::uint8_t> inbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x52, 0x45, 0x43, 0x56};
@@ -2821,7 +3075,7 @@ bool TestTunnelDatagramSocket() {
   swg::Ipv4UdpPacketEndpoint outbound_endpoint{};
   std::copy_n(local_address.value.bytes.begin(), 4, outbound_endpoint.source_ipv4.begin());
   std::copy_n(remote_address.value.bytes.begin(), 4, outbound_endpoint.destination_ipv4.begin());
-  outbound_endpoint.source_port = kExpectedFirstTunnelDatagramSourcePort;
+  outbound_endpoint.source_port = kExpectedVideoTunnelDatagramSourcePort;
   outbound_endpoint.destination_port = kMoonlightVideoPort;
 
   swg::Ipv4UdpPacketEndpoint inbound_endpoint{};
@@ -2861,6 +3115,20 @@ bool TestTunnelDatagramSocket() {
   const auto local_bypass = session.OpenTunnelDatagram(swg::MakeMoonlightVideoDatagramRequest("192.168.1.50", kMoonlightVideoPort));
   ok &= Require(!local_bypass.ok(), "local-network video traffic should not open a tunnel datagram handle");
 
+  swg::TunnelDatagramOpenRequest control_request{};
+  control_request.remote_host = "203.0.113.8";
+  control_request.remote_port = kMoonlightControlPort;
+  control_request.traffic_class = swg::AppTrafficClass::StreamControl;
+  control_request.route_preference = swg::RoutePreference::RequireTunnel;
+
+  const auto control_socket = swg::TunnelDatagramSocket::Open(session, control_request);
+  ok &= Require(control_socket.ok(), "Moonlight control tunnel datagram socket must open");
+  if (control_socket.ok()) {
+    ok &= Require(control_socket.value.info().local_port ==
+                      kExpectedControlTunnelDatagramSourcePort,
+                  "Moonlight control tunnel datagram socket must use the advertised client UDP source port");
+  }
+
   const auto video_socket = swg::TunnelDatagramSocket::Open(
       session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", kMoonlightVideoPort));
   ok &= Require(video_socket.ok(), "Moonlight video tunnel datagram socket must open");
@@ -2868,8 +3136,8 @@ bool TestTunnelDatagramSocket() {
     return false;
   }
 
-  ok &= Require(video_socket.value.info().local_port == kExpectedFirstTunnelDatagramSourcePort,
-                "first tunnel datagram handle must use the expected deterministic local UDP source port");
+  ok &= Require(video_socket.value.info().local_port == kExpectedVideoTunnelDatagramSourcePort,
+                "Moonlight video tunnel datagram socket must use the advertised companion UDP source port");
   ok &= Require(video_socket.value.info().remote_address == "203.0.113.8",
                 "tunnel datagram info must report the resolved remote IPv4 address");
 
@@ -2899,6 +3167,100 @@ bool TestTunnelDatagramSocket() {
                                                             : responder.error());
   ok &= Require(session.Close().ok(), "tunnel datagram app session must close cleanly");
   ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after tunnel datagram tests");
+  return ok;
+}
+
+bool TestTunnelDatagramSocketReassemblesIpv4Fragments() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-datagram-fragments";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedVideoTunnelDatagramSourcePort = 50001;
+  constexpr std::uint16_t kMoonlightVideoPort = 47998;
+  const std::vector<std::uint8_t> outbound_payload = {0x56, 0x49, 0x44, 0x45, 0x4f, 0x02};
+  const std::vector<std::uint8_t> inbound_payload = {
+      0x56, 0x49, 0x44, 0x45, 0x4f, 0x2d, 0x46, 0x52, 0x41, 0x47, 0x2d, 0x52,
+      0x45, 0x41, 0x53, 0x53, 0x45, 0x4d, 0x42, 0x4c, 0x45, 0x44, 0x2d, 0x50,
+      0x41, 0x59, 0x4c, 0x4f, 0x41, 0x44, 0x2d, 0x30, 0x31, 0x32, 0x33, 0x34};
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.8", "remote_address");
+  if (!Require(local_address.ok(), "fragmented tunnel datagram local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "fragmented tunnel datagram remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4UdpPacketEndpoint outbound_endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, outbound_endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, outbound_endpoint.destination_ipv4.begin());
+  outbound_endpoint.source_port = kExpectedVideoTunnelDatagramSourcePort;
+  outbound_endpoint.destination_port = kMoonlightVideoPort;
+
+  swg::Ipv4UdpPacketEndpoint inbound_endpoint{};
+  inbound_endpoint.source_ipv4 = outbound_endpoint.destination_ipv4;
+  inbound_endpoint.destination_ipv4 = outbound_endpoint.source_ipv4;
+  inbound_endpoint.source_port = outbound_endpoint.destination_port;
+  inbound_endpoint.destination_port = outbound_endpoint.source_port;
+
+  const auto expected_outbound_packet = swg::BuildIpv4UdpPacket(outbound_endpoint, outbound_payload);
+  const auto inbound_packet = swg::BuildIpv4UdpPacket(inbound_endpoint, inbound_payload);
+  if (!Require(expected_outbound_packet.ok(), "fragmented tunnel datagram outbound packet must build") ||
+      !Require(inbound_packet.ok(), "fragmented tunnel datagram inbound packet must build")) {
+    return false;
+  }
+
+  const auto fragmented_inbound = FragmentIpv4Packet(inbound_packet.value, 24);
+  if (!Require(fragmented_inbound.ok(), "fragmented tunnel datagram inbound packet must split into IPv4 fragments")) {
+    return false;
+  }
+
+  auto engine =
+      std::make_unique<FragmentedTunnelDatagramEngine>(fragmented_inbound.value, expected_outbound_packet.value);
+  FragmentedTunnelDatagramEngine* engine_ptr = engine.get();
+  const auto service = swg::sysmodule::CreateLocalControlServiceForTest(std::move(engine), runtime_root);
+  swg::Client client(swg::sysmodule::CreateHostInProcessTransport(service));
+
+  bool ok = true;
+  ok &= Require(client.SaveConfig(MakeValidConfig("127.0.0.1", 51820)).ok(),
+                "valid config must save before fragmented tunnel datagram tests");
+  ok &= Require(client.Connect().ok(), "service connect must succeed before fragmented tunnel datagram tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "fragmented tunnel datagram app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto video_socket = swg::TunnelDatagramSocket::Open(
+      session, swg::MakeMoonlightVideoDatagramRequest("203.0.113.8", kMoonlightVideoPort));
+  ok &= Require(video_socket.ok(), "fragmented Moonlight video tunnel datagram socket must open");
+  if (!video_socket.ok()) {
+    return false;
+  }
+
+  ok &= Require(video_socket.value.info().local_port == kExpectedVideoTunnelDatagramSourcePort,
+                "fragmented video tunnel datagram socket must use the advertised companion UDP source port");
+
+  const auto send_counter = video_socket.value.Send(outbound_payload);
+  ok &= Require(send_counter.ok(), "fragmented tunnel datagram send must succeed");
+
+  const auto received = video_socket.value.Receive();
+  ok &= Require(received.ok(), "fragmented tunnel datagram receive must succeed after IPv4 reassembly");
+  if (received.ok()) {
+    ok &= Require(received.value.payload == inbound_payload,
+                  "fragmented tunnel datagram receive must preserve the reassembled UDP payload bytes");
+    ok &= Require(received.value.remote_address == "203.0.113.8",
+                  "fragmented tunnel datagram receive must preserve the remote IPv4 address");
+    ok &= Require(received.value.remote_port == kMoonlightVideoPort,
+                  "fragmented tunnel datagram receive must preserve the remote UDP source port");
+  }
+
+  ok &= Require(engine_ptr->outbound_payload_validated(),
+                "fragmented tunnel datagram engine must validate the outbound UDP packet before releasing fragments");
+  ok &= Require(session.Close().ok(), "fragmented tunnel datagram app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after fragmented tunnel datagram tests");
   return ok;
 }
 
@@ -3048,6 +3410,152 @@ bool TestTunnelStreamSocket() {
                                                             : responder.error());
   ok &= Require(session.Close().ok(), "tunnel stream app session must close cleanly");
   ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after tunnel stream tests");
+  return ok;
+}
+
+bool TestTunnelStreamSocketPayloadWithFin() {
+  const std::filesystem::path runtime_root =
+      std::filesystem::current_path() / "test-runtime-tunnel-stream-payload-fin";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  constexpr std::uint16_t kExpectedFirstTunnelStreamSourcePort = 30000;
+  constexpr std::uint16_t kMoonlightRtspPort = 48010;
+  constexpr std::uint32_t kExpectedFirstTunnelStreamInitialSequence = 0x53570000u;
+  constexpr std::uint32_t kRemoteInitialSequence = 0x40000000u;
+
+  const std::vector<std::uint8_t> request_payload = {'O', 'P', 'T', 'I', 'O', 'N', 'S'};
+  const std::vector<std::uint8_t> response_payload = {'R', 'T', 'S', 'P', '/', '1', '.', '0', ' ', '2', '0', '0'};
+
+  const auto local_address = swg::ParseIpAddress("10.0.0.2", "local_address");
+  const auto remote_address = swg::ParseIpAddress("203.0.113.44", "remote_address");
+  if (!Require(local_address.ok(), "payload+FIN tunnel stream local IPv4 address must parse") ||
+      !Require(remote_address.ok(), "payload+FIN tunnel stream remote IPv4 address must parse")) {
+    return false;
+  }
+
+  swg::Ipv4TcpPacketEndpoint endpoint{};
+  std::copy_n(local_address.value.bytes.begin(), 4, endpoint.source_ipv4.begin());
+  std::copy_n(remote_address.value.bytes.begin(), 4, endpoint.destination_ipv4.begin());
+  endpoint.source_port = kExpectedFirstTunnelStreamSourcePort;
+  endpoint.destination_port = kMoonlightRtspPort;
+
+  swg::Ipv4TcpPacket syn{};
+  syn.endpoint = endpoint;
+  syn.sequence_number = kExpectedFirstTunnelStreamInitialSequence;
+  syn.flags = swg::ToFlags(swg::TcpControlFlag::Syn);
+
+  swg::Ipv4TcpPacket synack{};
+  synack.endpoint.source_ipv4 = endpoint.destination_ipv4;
+  synack.endpoint.destination_ipv4 = endpoint.source_ipv4;
+  synack.endpoint.source_port = endpoint.destination_port;
+  synack.endpoint.destination_port = endpoint.source_port;
+  synack.sequence_number = kRemoteInitialSequence;
+  synack.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  synack.flags = swg::ToFlags(swg::TcpControlFlag::Syn) | swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket ack{};
+  ack.endpoint = endpoint;
+  ack.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  ack.acknowledgment_number = kRemoteInitialSequence + 1u;
+  ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  swg::Ipv4TcpPacket request{};
+  request.endpoint = endpoint;
+  request.sequence_number = kExpectedFirstTunnelStreamInitialSequence + 1u;
+  request.acknowledgment_number = kRemoteInitialSequence + 1u;
+  request.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh);
+  request.payload = request_payload;
+
+  swg::Ipv4TcpPacket response{};
+  response.endpoint = synack.endpoint;
+  response.sequence_number = kRemoteInitialSequence + 1u;
+  response.acknowledgment_number = kExpectedFirstTunnelStreamInitialSequence + 1u +
+                                   static_cast<std::uint32_t>(request_payload.size());
+  response.flags = swg::ToFlags(swg::TcpControlFlag::Ack) | swg::ToFlags(swg::TcpControlFlag::Psh) |
+                   swg::ToFlags(swg::TcpControlFlag::Fin);
+  response.payload = response_payload;
+
+  swg::Ipv4TcpPacket response_ack{};
+  response_ack.endpoint = endpoint;
+  response_ack.sequence_number = response.acknowledgment_number;
+  response_ack.acknowledgment_number =
+      kRemoteInitialSequence + 1u + static_cast<std::uint32_t>(response_payload.size()) + 1u;
+  response_ack.flags = swg::ToFlags(swg::TcpControlFlag::Ack);
+
+  const auto syn_packet = swg::BuildIpv4TcpPacket(syn);
+  const auto synack_packet = swg::BuildIpv4TcpPacket(synack);
+  const auto ack_packet = swg::BuildIpv4TcpPacket(ack);
+  const auto request_packet = swg::BuildIpv4TcpPacket(request);
+  const auto response_packet = swg::BuildIpv4TcpPacket(response);
+  const auto response_ack_packet = swg::BuildIpv4TcpPacket(response_ack);
+  if (!Require(syn_packet.ok(), "payload+FIN tunnel stream SYN packet must build") ||
+      !Require(synack_packet.ok(), "payload+FIN tunnel stream SYN-ACK packet must build") ||
+      !Require(ack_packet.ok(), "payload+FIN tunnel stream ACK packet must build") ||
+      !Require(request_packet.ok(), "payload+FIN tunnel stream request packet must build") ||
+      !Require(response_packet.ok(), "payload+FIN tunnel stream response packet must build") ||
+      !Require(response_ack_packet.ok(), "payload+FIN tunnel stream response ACK packet must build")) {
+    return false;
+  }
+
+  LocalHandshakeResponder responder(0, 0,
+                                    std::vector<std::vector<std::uint8_t>>{synack_packet.value, response_packet.value},
+                                    std::vector<std::vector<std::uint8_t>>{syn_packet.value, ack_packet.value,
+                                                                           request_packet.value, response_ack_packet.value});
+  if (!Require(responder.ready(), "payload+FIN local handshake responder must start for tunnel stream tests")) {
+    return false;
+  }
+
+  swg::Client client(swg::sysmodule::CreateLocalControlTransport(runtime_root));
+  if (!Require(client.SaveConfig(MakeValidConfig("127.0.0.1", responder.port())).ok(),
+               "valid config must save before payload+FIN tunnel stream tests")) {
+    return false;
+  }
+
+  bool ok = true;
+  ok &= Require(client.Connect().ok(), "service connect must succeed before payload+FIN tunnel stream tests");
+
+  swg::AppSession session(client);
+  const auto opened = session.Open(swg::MakeMoonlightSessionRequest("default", true));
+  ok &= Require(opened.ok(), "payload+FIN tunnel stream app session must open");
+  if (!opened.ok()) {
+    return false;
+  }
+
+  const auto control_stream = swg::TunnelStreamSocket::Open(
+      session, swg::MakeMoonlightStreamControlStreamRequest("203.0.113.44", kMoonlightRtspPort));
+  ok &= Require(control_stream.ok(), "RTSP-style tunnel stream must open for payload+FIN validation");
+  if (!control_stream.ok()) {
+    return false;
+  }
+
+  ok &= Require(control_stream.value.info().local_port == kExpectedFirstTunnelStreamSourcePort,
+                "payload+FIN tunnel stream must use the expected deterministic local TCP source port");
+
+  const auto send_counter = control_stream.value.Send(request_payload);
+  ok &= Require(send_counter.ok(), "payload+FIN tunnel stream send must succeed");
+  if (send_counter.ok()) {
+    ok &= Require(send_counter.value == 3,
+                  "payload+FIN outbound stream payload must follow the SYN and ACK transport packets");
+  }
+
+  const auto received = control_stream.value.Receive();
+  ok &= Require(received.ok(), "payload+FIN tunnel stream receive must succeed");
+  if (received.ok()) {
+    ok &= Require(received.value.peer_closed,
+                  "payload+FIN tunnel stream receive must surface the remote close together with payload");
+    ok &= Require(received.value.payload == response_payload,
+                  "payload+FIN tunnel stream receive must preserve the inner TCP payload bytes");
+  }
+
+  const auto post_close_send = control_stream.value.Send({'!'});
+  ok &= Require(!post_close_send.ok() && post_close_send.error.code == swg::ErrorCode::InvalidState,
+                "payload+FIN tunnel stream must reject additional sends after the remote close");
+
+  ok &= Require(responder.Join(), responder.error().empty() ? "payload+FIN responder must validate the tunnel stream exchange"
+                                                            : responder.error());
+  ok &= Require(session.Close().ok(), "payload+FIN tunnel stream app session must close cleanly");
+  ok &= Require(client.Disconnect().ok(), "service disconnect must succeed after payload+FIN tunnel stream tests");
   return ok;
 }
 
@@ -3532,6 +4040,7 @@ int main() {
   const bool endpoint_resolution_ok = TestTunnelEndpointResolution();
   const bool engine_handshake_ok = TestTunnelEngineHandshake();
   const bool engine_payload_queue_ok = TestEngineInboundPayloadQueue();
+  const bool engine_payload_burst_queue_ok = TestEngineInboundPayloadBurstQueue();
   const bool state_ok = TestStateMachine();
   const bool client_ok = TestClientHostBinding();
   const bool connect_handshake_ok = TestConnectHandshakeStats();
@@ -3552,22 +4061,27 @@ int main() {
   const bool dns_resolution_ok = TestAppSessionDnsResolution();
   const bool session_socket_ok = TestSessionSocketAbstraction();
   const bool tunnel_datagram_ok = TestTunnelDatagramSocket();
+  const bool tunnel_datagram_fragments_ok = TestTunnelDatagramSocketReassemblesIpv4Fragments();
   const bool tunnel_stream_ok = TestTunnelStreamSocket();
+  const bool tunnel_stream_payload_fin_ok = TestTunnelStreamSocketPayloadWithFin();
   const bool tunnel_stream_out_of_order_ok = TestTunnelStreamSocketOutOfOrder();
   const bool tunnel_stream_delayed_synack_ok = TestTunnelStreamSocketDelayedSynAck();
   const bool tunnel_stream_deferred_synack_ok = TestTunnelStreamSocketUsesDeferredSynAck();
   const bool tunnel_stream_idle_recovery_ok = TestTunnelStreamSocketRecoversAfterIdleTimeout();
   const bool tunnel_stream_disconnect_reset_ok = TestDisconnectReconnectInvalidatesOldTunnelStreamHandles();
-  return (endpoint_parser_ok && config_ok && mitm_scaffold_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
+    return (endpoint_parser_ok && config_ok && mitm_scaffold_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
+      engine_payload_burst_queue_ok &&
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
           codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && app_policy_ok &&
-          tunnel_dns_codec_ok && dns_resolution_ok &&
-          session_socket_ok && tunnel_datagram_ok && tunnel_stream_ok && tunnel_stream_out_of_order_ok &&
-          tunnel_stream_delayed_synack_ok && tunnel_stream_deferred_synack_ok &&
+           tunnel_dns_codec_ok && dns_resolution_ok &&
+            session_socket_ok && tunnel_datagram_ok && tunnel_datagram_fragments_ok &&
+            tunnel_stream_ok && tunnel_stream_payload_fin_ok &&
+            tunnel_stream_out_of_order_ok &&
+           tunnel_stream_delayed_synack_ok && tunnel_stream_deferred_synack_ok &&
           tunnel_stream_idle_recovery_ok && tunnel_stream_disconnect_reset_ok)
              ? 0
              : 1;

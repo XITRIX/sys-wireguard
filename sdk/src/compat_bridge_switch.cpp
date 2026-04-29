@@ -47,6 +47,10 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr std::string_view kLogComponent = "compat-bridge";
+constexpr std::string_view kCompatBridgeClientName = "Moonlight-Switch";
+constexpr std::string_view kCompatBridgeIntegrationTag = "moonlight-switch";
+constexpr int kCompatHttpTunnelAttempts = 3;
+constexpr auto kCompatHttpRetryDelay = 250ms;
 
 template <typename... Args>
 std::string BuildMessage(Args&&... args) {
@@ -535,7 +539,8 @@ swg::AppTrafficClass ToTrafficClass(int traffic_class) {
 }
 
 std::string DefaultCompatHttpUserAgent(std::string_view client_name) {
-  if (client_name == "Moonlight-Switch") {
+  if (client_name.size() >= std::string_view("Moonlight-Switch").size() &&
+      client_name.substr(0, std::string_view("Moonlight-Switch").size()) == "Moonlight-Switch") {
     return "Moonlight-Switch/1.4.1";
   }
   if (client_name.empty()) {
@@ -639,10 +644,10 @@ class CompatBridgeState {
     std::scoped_lock lock(mutex_);
 
     if (client_name.empty()) {
-      client_name = "Moonlight-Switch";
+      client_name = std::string(kCompatBridgeClientName);
     }
     if (integration_tag.empty()) {
-      integration_tag = "moonlight-switch";
+      integration_tag = std::string(kCompatBridgeIntegrationTag);
     }
     if (http_user_agent.empty()) {
       http_user_agent = DefaultCompatHttpUserAgent(client_name);
@@ -786,6 +791,15 @@ class CompatBridgeState {
                                      remote_port, ": ", opened.error.message));
       return SWG_COMPAT_ROUTE_ERROR;
     }
+
+    LogInfoMessage(BuildMessage("attached tunnel datagram socket ", socket_fd, " for ",
+                                remote_host, ":", remote_port,
+                                " datagram_id=", opened.value.info().datagram_id,
+                                " local=", opened.value.info().local_address, ":",
+                                opened.value.info().local_port,
+                                " remote=", opened.value.info().remote_address, ":",
+                                opened.value.info().remote_port,
+                                " traffic=", ToString(app_traffic_class)));
 
     entry.value->datagram_socket = std::move(opened.value);
     RegisterSocket(entry.value);
@@ -1174,6 +1188,10 @@ class CompatBridgeState {
       session = session_;
     }
 
+    const std::string request_text =
+        "GET " + parsed.target + " HTTP/1.1\r\nHost: " + parsed.host +
+        "\r\nConnection: close\r\nUser-Agent: " + http_user_agent + "\r\n\r\n";
+
     swg::TunnelStreamOpenRequest request{};
     request.remote_host = parsed.host;
     request.remote_port = parsed.port;
@@ -1181,47 +1199,56 @@ class CompatBridgeState {
     request.traffic_class = swg::AppTrafficClass::HttpsControl;
     request.route_preference = swg::RoutePreference::RequireTunnel;
 
-    auto stream = swg::TunnelStreamSocket::Open(*session, request);
-    if (!stream.ok()) {
-      if (error) {
-        *error = stream.error.message;
-      }
-      return swg::CompatHttpRoute::Failed;
-    }
+    std::string last_error;
+    for (int attempt = 1; attempt <= kCompatHttpTunnelAttempts; ++attempt) {
+      auto stream = swg::TunnelStreamSocket::Open(*session, request);
+      if (!stream.ok()) {
+        last_error = stream.error.message;
+      } else {
+        TunnelStreamIo io(std::move(stream.value), static_cast<int>(timeout_seconds * 1000));
+        std::vector<std::uint8_t> raw_response;
+        bool request_ok = false;
 
-    TunnelStreamIo io(std::move(stream.value), static_cast<int>(timeout_seconds * 1000));
-    const std::string request_text =
-        "GET " + parsed.target + " HTTP/1.1\r\nHost: " + parsed.host +
-        "\r\nConnection: close\r\nUser-Agent: " + http_user_agent + "\r\n\r\n";
-
-    std::vector<std::uint8_t> raw_response;
-    if (parsed.use_tls) {
-      if (!PerformTlsRequest(io, parsed.host, cert_path, key_path, request_text, &raw_response,
-                             error)) {
-        return swg::CompatHttpRoute::Failed;
-      }
-    } else {
-      if (!io.SendAll(request_text, error) || !io.ReadUntilClose(&raw_response, error)) {
-        if (error && error->empty()) {
-          *error = "failed to read HTTP response over swg tunnel stream";
+        if (parsed.use_tls) {
+          request_ok = PerformTlsRequest(io, parsed.host, cert_path, key_path, request_text,
+                                         &raw_response, &last_error);
+        } else {
+          request_ok = io.SendAll(request_text, &last_error) &&
+                       io.ReadUntilClose(&raw_response, &last_error);
+          if (!request_ok && last_error.empty()) {
+            last_error = "failed to read HTTP response over swg tunnel stream";
+          }
         }
-        return swg::CompatHttpRoute::Failed;
+
+        if (request_ok) {
+          HttpResponse response{};
+          if (!ParseHttpResponse(raw_response, &response, error)) {
+            return swg::CompatHttpRoute::Failed;
+          }
+          if (response.status_code >= 400) {
+            if (error) {
+              *error = "HTTP control request failed with status " + std::to_string(response.status_code);
+            }
+            return swg::CompatHttpRoute::Failed;
+          }
+
+          *response_body = std::move(response.body);
+          return swg::CompatHttpRoute::Success;
+        }
+      }
+
+      if (attempt < kCompatHttpTunnelAttempts) {
+        LogWarningMessage(BuildMessage("retrying tunnel HTTP control request ", attempt + 1,
+                                       "/", kCompatHttpTunnelAttempts, " for ", parsed.host,
+                                       ":", parsed.port, ": ", last_error));
+        std::this_thread::sleep_for(kCompatHttpRetryDelay);
       }
     }
 
-    HttpResponse response{};
-    if (!ParseHttpResponse(raw_response, &response, error)) {
-      return swg::CompatHttpRoute::Failed;
+    if (error) {
+      *error = last_error.empty() ? "tunnel HTTP control request failed" : last_error;
     }
-    if (response.status_code >= 400) {
-      if (error) {
-        *error = "HTTP control request failed with status " + std::to_string(response.status_code);
-      }
-      return swg::CompatHttpRoute::Failed;
-    }
-
-    *response_body = std::move(response.body);
-    return swg::CompatHttpRoute::Success;
+    return swg::CompatHttpRoute::Failed;
   }
 
  private:
@@ -1506,8 +1533,8 @@ class CompatBridgeState {
   std::unique_ptr<swg::Client> client_{};
   std::shared_ptr<swg::AppSession> session_{};
   std::string session_error_{};
-  std::string client_name_ = "Moonlight-Switch";
-  std::string integration_tag_ = "moonlight-switch";
+  std::string client_name_ = std::string(kCompatBridgeClientName);
+  std::string integration_tag_ = std::string(kCompatBridgeIntegrationTag);
   std::string http_user_agent_ = DefaultCompatHttpUserAgent(client_name_);
   std::string certificate_path_{};
   std::string key_path_{};

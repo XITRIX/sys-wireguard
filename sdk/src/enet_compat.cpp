@@ -45,6 +45,28 @@ size_t CopyBuffersToLinear(unsigned char* output,
     return copied;
 }
 
+int EnsureTunnelDatagramSocket(ENetSocket socket, const ENetAddress* peerAddress) {
+    if (swg_compat_is_tunnel_socket(socket) > 0) {
+        return SWG_COMPAT_ROUTE_TUNNEL;
+    }
+
+    if (peerAddress == nullptr) {
+        return SWG_COMPAT_ROUTE_DIRECT;
+    }
+
+    const unsigned short port = GetRemotePort(peerAddress);
+    if (port == 0) {
+        return SWG_COMPAT_ROUTE_DIRECT;
+    }
+
+    return swg_compat_attach_datagram_socket(
+        socket,
+        reinterpret_cast<const sockaddr_storage*>(&peerAddress->address),
+        peerAddress->addressLength,
+        port,
+        SWG_COMPAT_TRAFFIC_STREAM_CONTROL);
+}
+
 }  // namespace
 
 extern "C" {
@@ -132,8 +154,13 @@ int swg_enet_try_send(ENetSocket socket,
                       const ENetBuffer* buffers,
                       size_t bufferCount,
                       int* sentLength) {
-    if (swg_compat_is_tunnel_socket(socket) <= 0) {
+    const int attachResult = EnsureTunnelDatagramSocket(socket, peerAddress);
+    if (attachResult == SWG_COMPAT_ROUTE_DIRECT) {
         return 0;
+    }
+    if (attachResult == SWG_COMPAT_ROUTE_ERROR) {
+        *sentLength = -1;
+        return 1;
     }
 
     unsigned char* sendBuffer = nullptr;

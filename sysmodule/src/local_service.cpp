@@ -6,10 +6,12 @@
 #include <cctype>
 #include <chrono>
 #include <deque>
+#include <list>
 #include <map>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <optional>
 #include <sstream>
 #include <sys/socket.h>
 #include <thread>
@@ -55,6 +57,14 @@ struct TunnelDatagramHandleRecord {
   std::uint16_t local_port = 0;
   std::array<std::uint8_t, 4> remote_ipv4{};
   std::array<std::uint8_t, 4> local_ipv4{};
+  std::uint64_t send_calls = 0;
+  std::uint64_t recv_calls = 0;
+  std::uint64_t empty_recv_polls = 0;
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t bytes_received = 0;
+  std::uint64_t last_send_counter = 0;
+  std::uint64_t last_recv_counter = 0;
+  std::uint64_t unmatched_recv_packets = 0;
 };
 
 struct TunnelStreamHandleRecord {
@@ -79,6 +89,13 @@ struct TunnelStreamHandleRecord {
   std::uint32_t next_expected_remote_sequence = 0;
   bool peer_closed = false;
   std::map<std::uint32_t, BufferedSegment> buffered_remote_segments;
+  std::uint64_t send_calls = 0;
+  std::uint64_t recv_calls = 0;
+  std::uint64_t empty_recv_polls = 0;
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t bytes_received = 0;
+  std::uint64_t last_send_counter = 0;
+  std::uint64_t last_recv_counter = 0;
 };
 
 struct TunnelDnsLookupResult {
@@ -101,6 +118,33 @@ struct ClosedTunnelFlowRecord {
   std::uint16_t local_port = 0;
 };
 
+struct Ipv4FragmentKey {
+  std::array<std::uint8_t, 4> source_ipv4{};
+  std::array<std::uint8_t, 4> destination_ipv4{};
+  std::uint16_t identification = 0;
+  std::uint8_t protocol = 0;
+};
+
+struct ParsedIpv4Fragment {
+  Ipv4FragmentKey key;
+  std::size_t header_size = 0;
+  std::vector<std::uint8_t> header_bytes;
+  std::vector<std::uint8_t> payload_bytes;
+  std::size_t fragment_offset = 0;
+  bool more_fragments = false;
+};
+
+struct Ipv4FragmentAssembly {
+  Ipv4FragmentKey key;
+  std::vector<std::uint8_t> first_header_bytes;
+  std::vector<std::uint8_t> payload_bytes;
+  std::vector<std::uint8_t> received_mask;
+  std::optional<std::size_t> expected_payload_size;
+  std::uint64_t last_counter = 0;
+  std::uint32_t fragment_count = 0;
+  std::size_t received_payload_bytes = 0;
+};
+
 constexpr std::uint16_t kTunnelDnsSourcePortBase = 40000;
 constexpr std::uint16_t kTunnelDnsSourcePortSpan = 20000;
 constexpr std::uint16_t kTunnelDnsDestinationPort = 53;
@@ -108,6 +152,8 @@ constexpr std::uint16_t kTunnelDatagramSourcePortBase = 20000;
 constexpr std::uint16_t kTunnelDatagramSourcePortSpan = 10000;
 constexpr std::uint16_t kTunnelStreamSourcePortBase = 30000;
 constexpr std::uint16_t kTunnelStreamSourcePortSpan = 10000;
+constexpr std::uint16_t kMoonlightControlDatagramSourcePort = 50000;
+constexpr std::uint16_t kMoonlightVideoDatagramSourcePort = 50001;
 constexpr std::uint32_t kTunnelStreamInitialSequenceBase = 0x53570000u;
 constexpr std::chrono::milliseconds kTunnelDnsPollInterval(25);
 constexpr int kTunnelDnsPollAttemptsPerServer = 40;
@@ -116,6 +162,272 @@ constexpr std::chrono::milliseconds kTunnelStreamConnectTimeout(3000);
 constexpr std::chrono::milliseconds kTunnelStreamConnectSynRetransmitInterval(250);
 constexpr std::size_t kTunnelStreamBufferedSegmentLimit = 32;
 constexpr std::size_t kClosedTunnelFlowRecordLimit = 64;
+constexpr std::size_t kIpv4MinimumHeaderSize = 20;
+constexpr std::size_t kIpv4FragmentAssemblyLimit = 8;
+constexpr std::size_t kIpv4FragmentStorageByteLimit = 512 * 1024;
+
+std::uint16_t Load16Be(const std::uint8_t* bytes) {
+  return static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+}
+
+void Store16Be(std::uint8_t* bytes, std::uint16_t value) {
+  bytes[0] = static_cast<std::uint8_t>((value >> 8) & 0xffu);
+  bytes[1] = static_cast<std::uint8_t>(value & 0xffu);
+}
+
+std::uint16_t ComputeIpv4HeaderChecksum(const std::uint8_t* bytes, std::size_t size) {
+  std::uint32_t sum = 0;
+  for (std::size_t index = 0; index + 1 < size; index += 2) {
+    sum += static_cast<std::uint32_t>((bytes[index] << 8) | bytes[index + 1]);
+  }
+
+  while ((sum >> 16) != 0) {
+    sum = (sum & 0xffffu) + (sum >> 16);
+  }
+
+  return static_cast<std::uint16_t>(~sum & 0xffffu);
+}
+
+bool SameIpv4FragmentKey(const Ipv4FragmentKey& lhs, const Ipv4FragmentKey& rhs) {
+  return lhs.source_ipv4 == rhs.source_ipv4 && lhs.destination_ipv4 == rhs.destination_ipv4 &&
+         lhs.identification == rhs.identification && lhs.protocol == rhs.protocol;
+}
+
+std::size_t MeasureIpv4FragmentAssemblyStorage(const Ipv4FragmentAssembly& assembly) {
+  return assembly.first_header_bytes.size() + assembly.payload_bytes.size() + assembly.received_mask.size();
+}
+
+std::string DescribeIpv4Protocol(std::uint8_t protocol) {
+  switch (protocol) {
+    case 6:
+      return "tcp";
+    case 17:
+      return "udp";
+    default:
+      return std::to_string(protocol);
+  }
+}
+
+Result<ParsedIpv4Fragment> ParseIpv4Fragment(const std::vector<std::uint8_t>& packet) {
+  if (packet.size() < kIpv4MinimumHeaderSize) {
+    return MakeFailure<ParsedIpv4Fragment>(ErrorCode::ParseError, "IPv4 fragment packet is too short");
+  }
+  if ((packet[0] >> 4) != 4) {
+    return MakeFailure<ParsedIpv4Fragment>(ErrorCode::ParseError, "packet is not IPv4");
+  }
+
+  const std::size_t header_size = static_cast<std::size_t>(packet[0] & 0x0fu) * 4;
+  if (header_size < kIpv4MinimumHeaderSize || packet.size() < header_size) {
+    return MakeFailure<ParsedIpv4Fragment>(ErrorCode::ParseError, "packet has an invalid IPv4 header size");
+  }
+
+  const std::uint16_t total_length = Load16Be(packet.data() + 2);
+  if (total_length < header_size || total_length > packet.size()) {
+    return MakeFailure<ParsedIpv4Fragment>(ErrorCode::ParseError, "packet has an invalid IPv4 total length");
+  }
+
+  const std::uint16_t flags_and_offset = Load16Be(packet.data() + 6);
+
+  ParsedIpv4Fragment fragment{};
+  fragment.key.identification = Load16Be(packet.data() + 4);
+  fragment.key.protocol = packet[9];
+  std::copy(packet.begin() + static_cast<std::ptrdiff_t>(12),
+            packet.begin() + static_cast<std::ptrdiff_t>(16), fragment.key.source_ipv4.begin());
+  std::copy(packet.begin() + static_cast<std::ptrdiff_t>(16),
+            packet.begin() + static_cast<std::ptrdiff_t>(20), fragment.key.destination_ipv4.begin());
+  fragment.header_size = header_size;
+  fragment.header_bytes.assign(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(header_size));
+  fragment.payload_bytes.assign(packet.begin() + static_cast<std::ptrdiff_t>(header_size),
+                                packet.begin() + static_cast<std::ptrdiff_t>(total_length));
+  fragment.fragment_offset = static_cast<std::size_t>(flags_and_offset & 0x1fffu) * 8u;
+  fragment.more_fragments = (flags_and_offset & 0x2000u) != 0;
+  return MakeSuccess(std::move(fragment));
+}
+
+bool IsIpv4FragmentedPacket(const ParsedIpv4Fragment& fragment) {
+  return fragment.more_fragments || fragment.fragment_offset != 0;
+}
+
+std::string FormatHostPort(std::string_view host, std::uint16_t port) {
+  std::ostringstream stream;
+  stream << host;
+  if (port != 0) {
+    stream << ':' << port;
+  }
+  return stream.str();
+}
+
+std::chrono::milliseconds GetTunnelStreamConnectTimeout(const TunnelStreamOpenRequest& request) {
+  static_cast<void>(request);
+  return kTunnelStreamConnectTimeout;
+}
+
+std::string FormatTcpFlags(TcpControlFlags flags) {
+  std::string text;
+  const auto append_flag = [&](TcpControlFlag flag, const char* name) {
+    if (!HasFlag(flags, flag)) {
+      return;
+    }
+    if (!text.empty()) {
+      text += '|';
+    }
+    text += name;
+  };
+
+  append_flag(TcpControlFlag::Fin, "FIN");
+  append_flag(TcpControlFlag::Syn, "SYN");
+  append_flag(TcpControlFlag::Rst, "RST");
+  append_flag(TcpControlFlag::Psh, "PSH");
+  append_flag(TcpControlFlag::Ack, "ACK");
+  if (text.empty()) {
+    text = "none";
+  }
+  return text;
+}
+
+bool ShouldLogRtspStreamDebug(const TunnelStreamHandleRecord& stream) {
+  return stream.traffic_class == AppTrafficClass::StreamControl;
+}
+
+bool ShouldLogControlStreamLifecycle(const TunnelStreamHandleRecord& stream) {
+  return stream.traffic_class == AppTrafficClass::StreamControl ||
+         stream.traffic_class == AppTrafficClass::HttpsControl;
+}
+
+std::string ControlStreamLogLabel(const TunnelStreamHandleRecord& stream) {
+  switch (stream.traffic_class) {
+    case AppTrafficClass::StreamControl:
+      return "rtsp stream";
+    case AppTrafficClass::HttpsControl:
+      return "https control stream";
+    default:
+      return "control stream";
+  }
+}
+
+bool ShouldLogControlDatagramDebug(const TunnelDatagramHandleRecord& datagram) {
+  return datagram.traffic_class == AppTrafficClass::StreamControl;
+}
+
+bool ShouldLogMediaDatagramDebug(const TunnelDatagramHandleRecord& datagram) {
+  return datagram.traffic_class == AppTrafficClass::StreamAudio ||
+         datagram.traffic_class == AppTrafficClass::StreamVideo;
+}
+
+bool ShouldLogDatagramLifecycle(const TunnelDatagramHandleRecord& datagram) {
+  return ShouldLogControlDatagramDebug(datagram) || ShouldLogMediaDatagramDebug(datagram);
+}
+
+std::string DatagramLogLabel(const TunnelDatagramHandleRecord& datagram) {
+  switch (datagram.traffic_class) {
+    case AppTrafficClass::StreamControl:
+      return "control datagram";
+    case AppTrafficClass::StreamAudio:
+      return "audio datagram";
+    case AppTrafficClass::StreamVideo:
+      return "video datagram";
+    default:
+      return "datagram";
+  }
+}
+
+bool ShouldLogSparseControlPoll(std::uint64_t poll_count) {
+  return poll_count <= 4 || (poll_count & (poll_count - 1u)) == 0;
+}
+
+bool ShouldLogSparseDatagramPoll(const TunnelDatagramHandleRecord& datagram, std::uint64_t poll_count) {
+  static_cast<void>(datagram);
+  return ShouldLogSparseControlPoll(poll_count);
+}
+
+bool ShouldLogSparseDatagramReceive(const TunnelDatagramHandleRecord& datagram) {
+  if (ShouldLogControlDatagramDebug(datagram)) {
+    return true;
+  }
+
+  return datagram.recv_calls <= 4 || (datagram.recv_calls & (datagram.recv_calls - 1u)) == 0;
+}
+
+std::string DescribeDatagramMismatchHint(const TunnelDatagramHandleRecord& datagram,
+                                         const Ipv4UdpPacket& packet) {
+  const bool same_source_ipv4 = packet.endpoint.source_ipv4 == datagram.remote_ipv4;
+  const bool same_destination_ipv4 = packet.endpoint.destination_ipv4 == datagram.local_ipv4;
+  const bool same_source_port = packet.endpoint.source_port == datagram.remote_port;
+  const bool same_destination_port = packet.endpoint.destination_port == datagram.local_port;
+
+  if (same_source_ipv4 && same_destination_ipv4 && !same_source_port && same_destination_port) {
+    return "remote_port_mismatch";
+  }
+  if (same_source_ipv4 && same_destination_ipv4 && same_source_port && !same_destination_port) {
+    return "local_port_mismatch";
+  }
+  if (same_source_ipv4 && same_destination_ipv4) {
+    return "port_mismatch";
+  }
+  if (same_source_port || same_destination_port) {
+    return "ip_mismatch";
+  }
+
+  return "related_tuple_mismatch";
+}
+
+std::string FormatControlStreamSummary(const TunnelStreamHandleRecord& stream) {
+  return "send_calls=" + std::to_string(stream.send_calls) +
+         " recv_calls=" + std::to_string(stream.recv_calls) +
+         " empty_polls=" + std::to_string(stream.empty_recv_polls) +
+         " sent_bytes=" + std::to_string(stream.bytes_sent) +
+         " recv_bytes=" + std::to_string(stream.bytes_received) +
+         " last_send_counter=" + std::to_string(stream.last_send_counter) +
+         " last_recv_counter=" + std::to_string(stream.last_recv_counter) +
+         " peer_closed=" + std::string(stream.peer_closed ? "true" : "false") +
+         " buffered_segments=" + std::to_string(stream.buffered_remote_segments.size());
+}
+
+std::string FormatDatagramSummary(const TunnelDatagramHandleRecord& datagram) {
+  return "send_calls=" + std::to_string(datagram.send_calls) +
+         " recv_calls=" + std::to_string(datagram.recv_calls) +
+         " empty_polls=" + std::to_string(datagram.empty_recv_polls) +
+         " sent_bytes=" + std::to_string(datagram.bytes_sent) +
+         " recv_bytes=" + std::to_string(datagram.bytes_received) +
+         " last_send_counter=" + std::to_string(datagram.last_send_counter) +
+         " last_recv_counter=" + std::to_string(datagram.last_recv_counter) +
+         " unmatched_recv_packets=" + std::to_string(datagram.unmatched_recv_packets);
+}
+
+std::string DescribeEnetCommand(const std::vector<std::uint8_t>& payload) {
+  if (payload.size() < 5) {
+    return "short";
+  }
+
+  switch (payload[4] & 0x0fu) {
+    case 1:
+      return "ack";
+    case 2:
+      return "connect";
+    case 3:
+      return "verify_connect";
+    case 4:
+      return "disconnect";
+    case 5:
+      return "ping";
+    case 6:
+      return "send_reliable";
+    case 7:
+      return "send_unreliable";
+    case 8:
+      return "send_fragment";
+    case 9:
+      return "send_unsequenced";
+    case 10:
+      return "bandwidth_limit";
+    case 11:
+      return "throttle_configure";
+    case 12:
+      return "send_unreliable_fragment";
+    default:
+      return "unknown(" + std::to_string(payload[4] & 0x0fu) + ")";
+  }
+}
 
 ClosedTunnelFlowRecord MakeClosedTunnelFlowRecord(const TunnelDatagramHandleRecord& datagram) {
   ClosedTunnelFlowRecord record{};
@@ -826,7 +1138,8 @@ class LocalControlService final : public IControlService {
     info.notes = BuildAppSessionNotes(session, snapshot, granted_flags);
 
     LogInfo("sysmodule", "opened app session " + std::to_string(session_id) + " for " +
-                            (request.app.client_name.empty() ? std::string("unknown_app") : request.app.client_name));
+                            (request.app.client_name.empty() ? std::string("unknown_app") : request.app.client_name) +
+                            ": " + info.notes);
     return MakeSuccess(std::move(info));
   }
 
@@ -858,6 +1171,12 @@ class LocalControlService final : public IControlService {
     const StateSnapshot snapshot = state_machine_.snapshot();
     const RuntimeFlags granted_flags = ResolveGrantedFlags(config_.runtime_flags, session.requested_flags);
     NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, request);
+    LogInfo("sysmodule", "network plan session=" + std::to_string(request.session_id) +
+                 " target=" + FormatHostPort(request.remote_host, request.remote_port) +
+                 " transport=" + std::string(swg::ToString(request.transport)) +
+                 " class=" + std::string(swg::ToString(request.traffic_class)) +
+                 " preference=" + std::string(swg::ToString(request.route_preference)) +
+                 " -> " + std::string(swg::ToString(plan.action)) + ": " + plan.reason);
     return MakeSuccess(std::move(plan));
   }
 
@@ -1008,6 +1327,12 @@ class LocalControlService final : public IControlService {
 
     const NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, plan_request);
     if (plan.action != RouteAction::Tunnel) {
+      LogWarning("sysmodule", "rejected tunnel datagram open for session=" +
+                                 std::to_string(request.session_id) + " target=" +
+                                 FormatHostPort(request.remote_host, request.remote_port) +
+                                 " class=" + std::string(swg::ToString(request.traffic_class)) +
+                                 " -> " + std::string(swg::ToString(plan.action)) + ": " +
+                                 plan.reason);
       return MakeFailure<TunnelDatagramInfo>(ErrorCode::Unsupported,
                                              "tunnel UDP datagram requires a tunnel route: " + plan.reason);
     }
@@ -1028,6 +1353,13 @@ class LocalControlService final : public IControlService {
     if (!remote_ipv4.ok()) {
       return MakeFailure<TunnelDatagramInfo>(remote_ipv4.error.code, remote_ipv4.error.message);
     }
+
+    LogInfo("sysmodule", "opening tunnel datagram for session=" +
+                           std::to_string(request.session_id) + " target=" +
+                           FormatHostPort(request.remote_host, request.remote_port) + " resolved=" +
+                           FormatIpv4Address(remote_ipv4.value) + " profile=" +
+                           session.selected_profile + " class=" +
+                           std::string(swg::ToString(request.traffic_class)));
 
     TunnelDatagramInfo info{};
     {
@@ -1053,7 +1385,7 @@ class LocalControlService final : public IControlService {
       record.remote_address = FormatIpv4Address(remote_ipv4.value);
       record.remote_port = request.remote_port;
       record.local_address = FormatIpv4Address(prepared_session.value.interface_ipv4_addresses.front().address);
-      record.local_port = ReserveTunnelDatagramSourcePortLocked();
+      record.local_port = ReserveTunnelDatagramSourcePortLocked(request.traffic_class);
       record.remote_ipv4 = remote_ipv4.value;
       record.local_ipv4 = prepared_session.value.interface_ipv4_addresses.front().address;
 
@@ -1069,6 +1401,12 @@ class LocalControlService final : public IControlService {
       info.message = plan.reason + "; forward UDP payloads through this tunnel datagram handle";
 
       tunnel_datagrams_[record.datagram_id] = record;
+
+      LogInfo("sysmodule", "opened tunnel datagram " + std::to_string(info.datagram_id) +
+                             " for session=" + std::to_string(info.session_id) + " local=" +
+                             FormatHostPort(info.local_address, info.local_port) + " remote=" +
+                             FormatHostPort(info.remote_address, info.remote_port) + " class=" +
+                             std::string(swg::ToString(info.traffic_class)));
     }
 
     return MakeSuccess(std::move(info));
@@ -1080,6 +1418,13 @@ class LocalControlService final : public IControlService {
     const auto it = tunnel_datagrams_.find(datagram_id);
     if (it == tunnel_datagrams_.end()) {
       return MakeError(ErrorCode::NotFound, "tunnel datagram not found: " + std::to_string(datagram_id));
+    }
+
+    if (ShouldLogDatagramLifecycle(it->second)) {
+      LogInfo("sysmodule", DatagramLogLabel(it->second) + " close datagram=" +
+                               std::to_string(it->second.datagram_id) +
+                               " reason=client_close " +
+                               FormatDatagramSummary(it->second));
     }
 
     RememberAndPurgeClosedTunnelFlowLocked(it->second);
@@ -1123,7 +1468,23 @@ class LocalControlService final : public IControlService {
       return MakeFailure<std::uint64_t>(packet.error.code, packet.error.message);
     }
 
-    return tunnel_engine_->SendPacket(packet.value);
+    const Result<std::uint64_t> counter = tunnel_engine_->SendPacket(packet.value);
+    if (!counter.ok()) {
+      return MakeFailure<std::uint64_t>(counter.error.code, counter.error.message);
+    }
+
+    auto& datagram = datagram_it->second;
+    ++datagram.send_calls;
+    datagram.bytes_sent += request.payload.size();
+    datagram.last_send_counter = counter.value;
+    if (ShouldLogControlDatagramDebug(datagram)) {
+      LogInfo("sysmodule", "control datagram send datagram=" + std::to_string(datagram.datagram_id) +
+                               " send_call=" + std::to_string(datagram.send_calls) +
+                               " payload=" + std::to_string(request.payload.size()) +
+                               " counter=" + std::to_string(counter.value));
+    }
+
+    return counter;
   }
 
   Result<TunnelDatagram> RecvTunnelDatagram(std::uint64_t datagram_id) override {
@@ -1147,7 +1508,42 @@ class LocalControlService final : public IControlService {
                                          "tunnel is not connected for tunnel datagram receive");
     }
 
-    return PopTunnelDatagramLocked(datagram_it->second);
+    auto& datagram = datagram_it->second;
+    ++datagram.recv_calls;
+    const Result<TunnelDatagram> received = PopTunnelDatagramLocked(&datagram);
+    if (received.ok()) {
+      datagram.empty_recv_polls = 0;
+      datagram.bytes_received += received.value.payload.size();
+      datagram.last_recv_counter = received.value.counter;
+      if (ShouldLogDatagramLifecycle(datagram) && ShouldLogSparseDatagramReceive(datagram)) {
+        LogInfo("sysmodule", DatagramLogLabel(datagram) + " recv datagram=" +
+                                 std::to_string(datagram.datagram_id) +
+                                 " recv_call=" + std::to_string(datagram.recv_calls) +
+                                 " payload=" + std::to_string(received.value.payload.size()) +
+                                 " counter=" + std::to_string(received.value.counter) +
+                                 " deferred=" + std::to_string(deferred_packets_.size()));
+      }
+      return received;
+    }
+
+    if (ShouldLogDatagramLifecycle(datagram)) {
+      if (received.error.code == ErrorCode::NotFound) {
+        ++datagram.empty_recv_polls;
+        if (ShouldLogSparseDatagramPoll(datagram, datagram.empty_recv_polls)) {
+          LogDebug("sysmodule", DatagramLogLabel(datagram) + " recv pending datagram=" +
+                                    std::to_string(datagram.datagram_id) +
+                                    " recv_call=" + std::to_string(datagram.recv_calls) +
+                                    " empty_polls=" + std::to_string(datagram.empty_recv_polls) +
+                                    " deferred=" + std::to_string(deferred_packets_.size()));
+        }
+      } else {
+        LogWarning("sysmodule", DatagramLogLabel(datagram) + " recv failed datagram=" +
+                                     std::to_string(datagram.datagram_id) + ": " +
+                                     received.error.message);
+      }
+    }
+
+    return received;
   }
 
   Result<TunnelStreamInfo> OpenTunnelStream(const TunnelStreamOpenRequest& request) override {
@@ -1195,6 +1591,13 @@ class LocalControlService final : public IControlService {
 
     const NetworkPlan plan = BuildNetworkPlan(session, snapshot, granted_flags, plan_request);
     if (plan.action != RouteAction::Tunnel) {
+      LogWarning("sysmodule", "rejected tunnel stream open for session=" +
+                                 std::to_string(request.session_id) + " target=" +
+                                 FormatHostPort(request.remote_host, request.remote_port) +
+                                 " transport=" + std::string(swg::ToString(request.transport)) +
+                                 " class=" + std::string(swg::ToString(request.traffic_class)) +
+                                 " -> " + std::string(swg::ToString(plan.action)) +
+                                 ": " + plan.reason);
       return MakeFailure<TunnelStreamInfo>(ErrorCode::Unsupported,
                                            "tunnel stream requires a tunnel route: " + plan.reason);
     }
@@ -1215,6 +1618,16 @@ class LocalControlService final : public IControlService {
     if (!remote_ipv4.ok()) {
       return MakeFailure<TunnelStreamInfo>(remote_ipv4.error.code, remote_ipv4.error.message);
     }
+
+    const auto connect_timeout = GetTunnelStreamConnectTimeout(request);
+
+    LogInfo("sysmodule", "opening tunnel stream for session=" + std::to_string(request.session_id) +
+                           " target=" + FormatHostPort(request.remote_host, request.remote_port) +
+                           " resolved=" + FormatIpv4Address(remote_ipv4.value) + " profile=" +
+                           session.selected_profile + " class=" +
+                           std::string(swg::ToString(request.traffic_class)) + " transport=" +
+                           std::string(swg::ToString(request.transport)) + " connect_timeout_ms=" +
+                           std::to_string(connect_timeout.count()));
 
     TunnelStreamHandleRecord stream{};
     {
@@ -1268,7 +1681,7 @@ class LocalControlService final : public IControlService {
         return MakeFailure<TunnelStreamInfo>(syn_counter.error.code, syn_counter.error.message);
       }
 
-      const auto connect_deadline = std::chrono::steady_clock::now() + kTunnelStreamConnectTimeout;
+      const auto connect_deadline = std::chrono::steady_clock::now() + connect_timeout;
       auto next_syn_retransmit = std::chrono::steady_clock::now() + kTunnelStreamConnectSynRetransmitInterval;
       while (std::chrono::steady_clock::now() < connect_deadline) {
         Result<TunnelPacket> packet = MakeFailure<TunnelPacket>(ErrorCode::NotFound, "no packet available");
@@ -1341,11 +1754,15 @@ class LocalControlService final : public IControlService {
       if (!connected) {
         connect_timeout_message = "timed out waiting for tunnel stream SYN-ACK from " + stream.remote_host + ":" +
                                   std::to_string(stream.remote_port) + " after " +
-                                  std::to_string(kTunnelStreamConnectTimeout.count()) + " ms";
+                                  std::to_string(connect_timeout.count()) + " ms";
       }
     }
 
     if (!connected) {
+      LogWarning("sysmodule", "tunnel stream open failed for session=" +
+                                 std::to_string(request.session_id) + " target=" +
+                                 FormatHostPort(request.remote_host, request.remote_port) + ": " +
+                                 connect_timeout_message);
       return MakeFailure<TunnelStreamInfo>(ErrorCode::ServiceUnavailable, connect_timeout_message);
     }
 
@@ -1370,6 +1787,13 @@ class LocalControlService final : public IControlService {
       info.local_address = stream.local_address;
       info.local_port = stream.local_port;
       info.message = plan.reason + "; tunnel TCP stream handshake completed";
+
+      LogInfo("sysmodule", "opened tunnel stream " + std::to_string(info.stream_id) +
+                             " for session=" + std::to_string(info.session_id) + " local=" +
+                             FormatHostPort(info.local_address, info.local_port) + " remote=" +
+                             FormatHostPort(info.remote_address, info.remote_port) + " class=" +
+                             std::string(swg::ToString(info.traffic_class)) + " transport=" +
+                             std::string(swg::ToString(info.transport)));
     }
 
     return MakeSuccess(std::move(info));
@@ -1385,6 +1809,13 @@ class LocalControlService final : public IControlService {
 
     if (tunnel_engine_->IsRunning()) {
       static_cast<void>(SendTunnelStreamPacket(it->second, ToFlags(TcpControlFlag::Fin) | ToFlags(TcpControlFlag::Ack), {}));
+    }
+
+    if (ShouldLogControlStreamLifecycle(it->second)) {
+      LogInfo("sysmodule", ControlStreamLogLabel(it->second) + " close stream=" +
+                               std::to_string(it->second.stream_id) +
+                               " reason=client_close " +
+                               FormatControlStreamSummary(it->second));
     }
 
     RememberAndPurgeClosedTunnelFlowLocked(it->second);
@@ -1421,10 +1852,23 @@ class LocalControlService final : public IControlService {
                                         "tunnel stream peer has already closed the connection");
     }
 
+    const std::uint32_t send_sequence = stream_it->second.next_send_sequence;
     const Result<std::uint64_t> counter =
         SendTunnelStreamPacket(stream_it->second, ToFlags(TcpControlFlag::Ack) | ToFlags(TcpControlFlag::Psh), request.payload);
     if (!counter.ok()) {
       return MakeFailure<std::uint64_t>(counter.error.code, counter.error.message);
+    }
+
+    ++stream_it->second.send_calls;
+    stream_it->second.bytes_sent += request.payload.size();
+    stream_it->second.last_send_counter = counter.value;
+    if (ShouldLogControlStreamLifecycle(stream_it->second)) {
+      LogInfo("sysmodule", ControlStreamLogLabel(stream_it->second) + " send stream=" +
+                               std::to_string(stream_it->second.stream_id) +
+                               " send_call=" + std::to_string(stream_it->second.send_calls) +
+                               " payload=" + std::to_string(request.payload.size()) +
+                               " counter=" + std::to_string(counter.value) +
+                               " seq=" + std::to_string(send_sequence));
     }
 
     stream_it->second.next_send_sequence += static_cast<std::uint32_t>(request.payload.size());
@@ -1452,7 +1896,48 @@ class LocalControlService final : public IControlService {
                                                  "tunnel is not connected for tunnel stream receive");
     }
 
-    return PopTunnelStreamReadLocked(&stream_it->second);
+    auto& stream = stream_it->second;
+    ++stream.recv_calls;
+    const Result<TunnelStreamReadResult> read = PopTunnelStreamReadLocked(&stream);
+    if (read.ok()) {
+      stream.empty_recv_polls = 0;
+      stream.bytes_received += read.value.payload.size();
+      stream.last_recv_counter = read.value.counter;
+      if (ShouldLogControlStreamLifecycle(stream)) {
+        LogInfo("sysmodule", ControlStreamLogLabel(stream) + " recv stream=" +
+                                 std::to_string(stream.stream_id) +
+                                 " recv_call=" + std::to_string(stream.recv_calls) +
+                                 " payload=" + std::to_string(read.value.payload.size()) +
+                                 " counter=" + std::to_string(read.value.counter) +
+                                 " peer_closed=" +
+                                 std::string(read.value.peer_closed ? "true" : "false"));
+      }
+      return read;
+    }
+
+    if (ShouldLogControlStreamLifecycle(stream)) {
+      if (read.error.code == ErrorCode::NotFound) {
+        ++stream.empty_recv_polls;
+        if (ShouldLogSparseControlPoll(stream.empty_recv_polls)) {
+          LogDebug("sysmodule", ControlStreamLogLabel(stream) + " recv pending stream=" +
+                                    std::to_string(stream.stream_id) +
+                                    " recv_call=" + std::to_string(stream.recv_calls) +
+                                    " empty_polls=" + std::to_string(stream.empty_recv_polls) +
+                                    " peer_closed=" +
+                                    std::string(stream.peer_closed ? "true" : "false") +
+                                    " buffered_segments=" +
+                                    std::to_string(stream.buffered_remote_segments.size()) +
+                                    " next_expected=" +
+                                    std::to_string(stream.next_expected_remote_sequence));
+        }
+      } else {
+        LogWarning("sysmodule", ControlStreamLogLabel(stream) + " recv failed stream=" +
+                                     std::to_string(stream.stream_id) + ": " +
+                                     read.error.message);
+      }
+    }
+
+    return read;
   }
 
   Result<std::uint64_t> SendPacket(const TunnelSendRequest& request) override {
@@ -1549,15 +2034,177 @@ class LocalControlService final : public IControlService {
   }
 
   Result<TunnelPacket> PopEnginePacketLocked() const {
-    const Result<WireGuardConsumedTransportPacket> packet = tunnel_engine_->ReceivePacket();
-    if (!packet.ok()) {
-      return MakeFailure<TunnelPacket>(packet.error.code, packet.error.message);
+    while (true) {
+      const Result<WireGuardConsumedTransportPacket> packet = tunnel_engine_->ReceivePacket();
+      if (!packet.ok()) {
+        return MakeFailure<TunnelPacket>(packet.error.code, packet.error.message);
+      }
+
+      const Result<TunnelPacket> received = ReassembleIpv4FragmentsIfNeededLocked(packet.value);
+      if (received.ok()) {
+        return received;
+      }
+      if (received.error.code != ErrorCode::NotFound) {
+        return received;
+      }
+    }
+  }
+
+  Result<TunnelPacket> ReassembleIpv4FragmentsIfNeededLocked(
+      const WireGuardConsumedTransportPacket& packet) const {
+    const Result<ParsedIpv4Fragment> fragment = ParseIpv4Fragment(packet.payload);
+    if (!fragment.ok() || !IsIpv4FragmentedPacket(fragment.value)) {
+      TunnelPacket received{};
+      received.counter = packet.counter;
+      received.payload = packet.payload;
+      return MakeSuccess(std::move(received));
     }
 
-    TunnelPacket received{};
-    received.counter = packet.value.counter;
-    received.payload = packet.value.payload;
-    return MakeSuccess(std::move(received));
+    auto assembly_it = ipv4_fragment_assemblies_.end();
+    for (auto it = ipv4_fragment_assemblies_.begin(); it != ipv4_fragment_assemblies_.end(); ++it) {
+      if (SameIpv4FragmentKey(it->key, fragment.value.key)) {
+        assembly_it = it;
+        break;
+      }
+    }
+
+    if (assembly_it == ipv4_fragment_assemblies_.end()) {
+      while (ipv4_fragment_assemblies_.size() >= kIpv4FragmentAssemblyLimit) {
+        DropIpv4FragmentAssemblyLocked(ipv4_fragment_assemblies_.begin(), "fragment entry limit");
+      }
+
+      Ipv4FragmentAssembly assembly{};
+      assembly.key = fragment.value.key;
+      ipv4_fragment_assemblies_.push_back(std::move(assembly));
+      assembly_it = std::prev(ipv4_fragment_assemblies_.end());
+    }
+
+    if (fragment.value.fragment_offset == 0 && assembly_it->first_header_bytes.empty()) {
+      if (!EnsureIpv4FragmentStorageLocked(assembly_it, fragment.value.header_bytes.size())) {
+        DropIpv4FragmentAssemblyLocked(assembly_it, "fragment storage exhausted before saving first fragment header");
+        return MakeFailure<TunnelPacket>(ErrorCode::NotFound, "waiting for more IPv4 fragments");
+      }
+
+      assembly_it->first_header_bytes = fragment.value.header_bytes;
+      queued_ipv4_fragment_storage_bytes_ += fragment.value.header_bytes.size();
+    }
+
+    const std::size_t fragment_end = fragment.value.fragment_offset + fragment.value.payload_bytes.size();
+    if (fragment_end > 65535u) {
+      DropIpv4FragmentAssemblyLocked(assembly_it, "fragment payload exceeds the IPv4 maximum packet size");
+      return MakeFailure<TunnelPacket>(ErrorCode::NotFound, "waiting for more IPv4 fragments");
+    }
+
+    if (fragment_end > assembly_it->payload_bytes.size()) {
+      const std::size_t growth = fragment_end - assembly_it->payload_bytes.size();
+      if (!EnsureIpv4FragmentStorageLocked(assembly_it, growth * 2u)) {
+        DropIpv4FragmentAssemblyLocked(assembly_it, "fragment storage exhausted while growing reassembly buffer");
+        return MakeFailure<TunnelPacket>(ErrorCode::NotFound, "waiting for more IPv4 fragments");
+      }
+
+      assembly_it->payload_bytes.resize(fragment_end);
+      assembly_it->received_mask.resize(fragment_end, 0);
+      queued_ipv4_fragment_storage_bytes_ += growth * 2u;
+    }
+
+    for (std::size_t index = 0; index < fragment.value.payload_bytes.size(); ++index) {
+      const std::size_t payload_index = fragment.value.fragment_offset + index;
+      assembly_it->payload_bytes[payload_index] = fragment.value.payload_bytes[index];
+      if (assembly_it->received_mask[payload_index] == 0) {
+        assembly_it->received_mask[payload_index] = 1;
+        ++assembly_it->received_payload_bytes;
+      }
+    }
+
+    ++assembly_it->fragment_count;
+    assembly_it->last_counter = packet.counter;
+
+    if (!fragment.value.more_fragments) {
+      assembly_it->expected_payload_size = fragment_end;
+    }
+
+    if (assembly_it->first_header_bytes.empty() || !assembly_it->expected_payload_size.has_value()) {
+      return MakeFailure<TunnelPacket>(ErrorCode::NotFound, "waiting for more IPv4 fragments");
+    }
+
+    const std::size_t expected_payload_size = *assembly_it->expected_payload_size;
+    if (assembly_it->received_payload_bytes < expected_payload_size ||
+        expected_payload_size > assembly_it->received_mask.size() ||
+        !std::all_of(assembly_it->received_mask.begin(),
+                     assembly_it->received_mask.begin() + static_cast<std::ptrdiff_t>(expected_payload_size),
+                     [](std::uint8_t received) { return received != 0; })) {
+      return MakeFailure<TunnelPacket>(ErrorCode::NotFound, "waiting for more IPv4 fragments");
+    }
+
+    TunnelPacket reassembled{};
+    reassembled.counter = assembly_it->last_counter;
+    reassembled.payload.resize(assembly_it->first_header_bytes.size() + expected_payload_size);
+    std::copy(assembly_it->first_header_bytes.begin(), assembly_it->first_header_bytes.end(),
+              reassembled.payload.begin());
+    std::copy(assembly_it->payload_bytes.begin(),
+              assembly_it->payload_bytes.begin() + static_cast<std::ptrdiff_t>(expected_payload_size),
+              reassembled.payload.begin() + static_cast<std::ptrdiff_t>(assembly_it->first_header_bytes.size()));
+
+    Store16Be(reassembled.payload.data() + 2,
+              static_cast<std::uint16_t>(assembly_it->first_header_bytes.size() + expected_payload_size));
+    reassembled.payload[6] = 0;
+    reassembled.payload[7] = 0;
+    reassembled.payload[10] = 0;
+    reassembled.payload[11] = 0;
+    const std::uint16_t checksum =
+        ComputeIpv4HeaderChecksum(reassembled.payload.data(), assembly_it->first_header_bytes.size());
+    Store16Be(reassembled.payload.data() + 10, checksum);
+
+    if (ShouldLogSparseControlPoll(++ipv4_fragment_reassembly_count_)) {
+      LogInfo("sysmodule",
+              "reassembled fragmented IPv4 packet counter=" + std::to_string(reassembled.counter) +
+                  " protocol=" + DescribeIpv4Protocol(assembly_it->key.protocol) +
+                  " from=" + FormatIpv4Address(assembly_it->key.source_ipv4) +
+                  " to=" + FormatIpv4Address(assembly_it->key.destination_ipv4) +
+                  " payload=" + std::to_string(expected_payload_size) +
+                  " fragments=" + std::to_string(assembly_it->fragment_count));
+    }
+
+    queued_ipv4_fragment_storage_bytes_ -= MeasureIpv4FragmentAssemblyStorage(*assembly_it);
+    ipv4_fragment_assemblies_.erase(assembly_it);
+    return MakeSuccess(std::move(reassembled));
+  }
+
+  bool EnsureIpv4FragmentStorageLocked(std::list<Ipv4FragmentAssembly>::iterator keep,
+                                       std::size_t additional_storage) const {
+    while (queued_ipv4_fragment_storage_bytes_ + additional_storage > kIpv4FragmentStorageByteLimit) {
+      auto evict_it = ipv4_fragment_assemblies_.begin();
+      while (evict_it != ipv4_fragment_assemblies_.end() && evict_it == keep) {
+        ++evict_it;
+      }
+      if (evict_it == ipv4_fragment_assemblies_.end()) {
+        return false;
+      }
+
+      DropIpv4FragmentAssemblyLocked(evict_it, "fragment storage limit");
+    }
+
+    return true;
+  }
+
+  void DropIpv4FragmentAssemblyLocked(std::list<Ipv4FragmentAssembly>::iterator assembly_it,
+                                      std::string_view reason) const {
+    if (assembly_it == ipv4_fragment_assemblies_.end()) {
+      return;
+    }
+
+    if (ShouldLogSparseControlPoll(++ipv4_fragment_drop_count_)) {
+      LogWarning("sysmodule",
+                 "dropping fragmented IPv4 reassembly reason=" + std::string(reason) +
+                     " protocol=" + DescribeIpv4Protocol(assembly_it->key.protocol) +
+                     " from=" + FormatIpv4Address(assembly_it->key.source_ipv4) +
+                     " to=" + FormatIpv4Address(assembly_it->key.destination_ipv4) +
+                     " fragments=" + std::to_string(assembly_it->fragment_count) +
+                     " buffered_payload=" + std::to_string(assembly_it->payload_bytes.size()));
+    }
+
+    queued_ipv4_fragment_storage_bytes_ -= MeasureIpv4FragmentAssemblyStorage(*assembly_it);
+    ipv4_fragment_assemblies_.erase(assembly_it);
   }
 
   void RememberClosedTunnelFlowLocked(const ClosedTunnelFlowRecord& flow) const {
@@ -1629,17 +2276,31 @@ class LocalControlService final : public IControlService {
   void InvalidateAllTunnelFlowsLocked() const {
     for (const auto& [unused_id, datagram] : tunnel_datagrams_) {
       static_cast<void>(unused_id);
+      if (ShouldLogDatagramLifecycle(datagram)) {
+        LogInfo("sysmodule", DatagramLogLabel(datagram) + " close datagram=" +
+                                 std::to_string(datagram.datagram_id) +
+                                 " reason=transport_invalidate " +
+                                 FormatDatagramSummary(datagram));
+      }
       RememberClosedTunnelFlowLocked(MakeClosedTunnelFlowRecord(datagram));
     }
 
     for (const auto& [unused_id, stream] : tunnel_streams_) {
       static_cast<void>(unused_id);
+      if (ShouldLogControlStreamLifecycle(stream)) {
+        LogInfo("sysmodule", ControlStreamLogLabel(stream) + " close stream=" +
+                                 std::to_string(stream.stream_id) +
+                                 " reason=transport_invalidate " +
+                                 FormatControlStreamSummary(stream));
+      }
       RememberClosedTunnelFlowLocked(MakeClosedTunnelFlowRecord(stream));
     }
 
     tunnel_datagrams_.clear();
     tunnel_streams_.clear();
     deferred_packets_.clear();
+    ipv4_fragment_assemblies_.clear();
+    queued_ipv4_fragment_storage_bytes_ = 0;
   }
 
   void DeferPacketLocked(TunnelPacket packet) const {
@@ -1687,10 +2348,42 @@ class LocalControlService final : public IControlService {
     return next_dns_query_id_++;
   }
 
-  std::uint16_t ReserveTunnelDatagramSourcePortLocked() const {
+  bool IsTunnelDatagramSourcePortInUseLocked(std::uint16_t port) const {
+    for (const auto& entry : tunnel_datagrams_) {
+      if (entry.second.local_port == port) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  std::uint16_t ReserveTunnelDatagramSourcePortLocked(swg::AppTrafficClass traffic_class) const {
+    if (traffic_class == swg::AppTrafficClass::StreamControl &&
+        !IsTunnelDatagramSourcePortInUseLocked(kMoonlightControlDatagramSourcePort)) {
+      return kMoonlightControlDatagramSourcePort;
+    }
+
+    if (traffic_class == swg::AppTrafficClass::StreamVideo &&
+        !IsTunnelDatagramSourcePortInUseLocked(kMoonlightVideoDatagramSourcePort)) {
+      return kMoonlightVideoDatagramSourcePort;
+    }
+
     if (next_tunnel_datagram_source_port_ < kTunnelDatagramSourcePortBase ||
         next_tunnel_datagram_source_port_ >= kTunnelDatagramSourcePortBase + kTunnelDatagramSourcePortSpan) {
       next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
+    }
+
+    for (std::uint16_t attempts = 0; attempts < kTunnelDatagramSourcePortSpan; ++attempts) {
+      const std::uint16_t candidate = next_tunnel_datagram_source_port_++;
+      if (next_tunnel_datagram_source_port_ >=
+          kTunnelDatagramSourcePortBase + kTunnelDatagramSourcePortSpan) {
+        next_tunnel_datagram_source_port_ = kTunnelDatagramSourcePortBase;
+      }
+
+      if (!IsTunnelDatagramSourcePortInUseLocked(candidate)) {
+        return candidate;
+      }
     }
 
     return next_tunnel_datagram_source_port_++;
@@ -1718,6 +2411,12 @@ class LocalControlService final : public IControlService {
   void RemoveTunnelDatagramsForSessionLocked(std::uint64_t session_id) {
     for (auto it = tunnel_datagrams_.begin(); it != tunnel_datagrams_.end();) {
       if (it->second.session_id == session_id) {
+        if (ShouldLogDatagramLifecycle(it->second)) {
+          LogInfo("sysmodule", DatagramLogLabel(it->second) + " close datagram=" +
+                                   std::to_string(it->second.datagram_id) +
+                                   " reason=session_close " +
+                                   FormatDatagramSummary(it->second));
+        }
         RememberAndPurgeClosedTunnelFlowLocked(it->second);
         it = tunnel_datagrams_.erase(it);
       } else {
@@ -1729,6 +2428,12 @@ class LocalControlService final : public IControlService {
   void RemoveTunnelStreamsForSessionLocked(std::uint64_t session_id) {
     for (auto it = tunnel_streams_.begin(); it != tunnel_streams_.end();) {
       if (it->second.session_id == session_id) {
+        if (ShouldLogControlStreamLifecycle(it->second)) {
+          LogInfo("sysmodule", ControlStreamLogLabel(it->second) + " close stream=" +
+                                   std::to_string(it->second.stream_id) +
+                                   " reason=session_close " +
+                                   FormatControlStreamSummary(it->second));
+        }
         RememberAndPurgeClosedTunnelFlowLocked(it->second);
         it = tunnel_streams_.erase(it);
       } else {
@@ -1852,19 +2557,65 @@ class LocalControlService final : public IControlService {
     return true;
   }
 
-  Result<TunnelDatagram> PopTunnelDatagramLocked(const TunnelDatagramHandleRecord& datagram) const {
+  void MaybeLogDatagramMismatch(TunnelDatagramHandleRecord* datagram,
+                                const TunnelPacket& packet) const {
+    if (!ShouldLogDatagramLifecycle(*datagram)) {
+      return;
+    }
+
+    const Result<Ipv4UdpPacket> parsed = ParseIpv4UdpPacket(packet.payload);
+    if (!parsed.ok()) {
+      return;
+    }
+
+    const bool same_source_ipv4 = parsed.value.endpoint.source_ipv4 == datagram->remote_ipv4;
+    const bool same_destination_ipv4 = parsed.value.endpoint.destination_ipv4 == datagram->local_ipv4;
+    const bool same_source_port = parsed.value.endpoint.source_port == datagram->remote_port;
+    const bool same_destination_port = parsed.value.endpoint.destination_port == datagram->local_port;
+    if (!(same_source_ipv4 || same_destination_ipv4 || same_source_port || same_destination_port)) {
+      return;
+    }
+
+    ++datagram->unmatched_recv_packets;
+    if (!ShouldLogSparseControlPoll(datagram->unmatched_recv_packets)) {
+      return;
+    }
+
+    std::string message = DatagramLogLabel(*datagram) + " unmatched packet datagram=" +
+                          std::to_string(datagram->datagram_id) +
+                          " counter=" + std::to_string(packet.counter) + " from=" +
+                          FormatHostPort(FormatIpv4Address(parsed.value.endpoint.source_ipv4),
+                                         parsed.value.endpoint.source_port) +
+                          " to=" +
+                          FormatHostPort(FormatIpv4Address(parsed.value.endpoint.destination_ipv4),
+                                         parsed.value.endpoint.destination_port) +
+                          " expected=" +
+                          FormatHostPort(datagram->remote_address, datagram->remote_port) +
+                          " -> " + FormatHostPort(datagram->local_address, datagram->local_port) +
+                          " payload=" + std::to_string(parsed.value.payload.size()) +
+                          " hint=" + DescribeDatagramMismatchHint(*datagram, parsed.value);
+    if (ShouldLogControlDatagramDebug(*datagram)) {
+      message += " enet=" + DescribeEnetCommand(parsed.value.payload);
+    }
+    message += " unmatched=" + std::to_string(datagram->unmatched_recv_packets);
+    LogWarning("sysmodule", message);
+  }
+
+  Result<TunnelDatagram> PopTunnelDatagramLocked(TunnelDatagramHandleRecord* datagram) const {
     std::deque<TunnelPacket> unmatched_deferred;
     while (!deferred_packets_.empty()) {
       TunnelPacket packet = std::move(deferred_packets_.front());
       deferred_packets_.pop_front();
 
       TunnelDatagram matched{};
-      if (TryMatchTunnelDatagramPacket(datagram, packet, &matched)) {
+      if (TryMatchTunnelDatagramPacket(*datagram, packet, &matched)) {
         for (TunnelPacket& deferred : unmatched_deferred) {
           deferred_packets_.push_back(std::move(deferred));
         }
         return MakeSuccess(std::move(matched));
       }
+
+      MaybeLogDatagramMismatch(datagram, packet);
 
       unmatched_deferred.push_back(std::move(packet));
     }
@@ -1880,9 +2631,11 @@ class LocalControlService final : public IControlService {
       }
 
       TunnelDatagram matched{};
-      if (TryMatchTunnelDatagramPacket(datagram, packet.value, &matched)) {
+      if (TryMatchTunnelDatagramPacket(*datagram, packet.value, &matched)) {
         return MakeSuccess(std::move(matched));
       }
+
+      MaybeLogDatagramMismatch(datagram, packet.value);
 
       DeferPacketLocked(packet.value);
     }
@@ -2003,6 +2756,17 @@ class LocalControlService final : public IControlService {
       }
     };
 
+    if (ShouldLogRtspStreamDebug(*stream)) {
+      LogDebug("sysmodule", "rtsp stream packet stream=" + std::to_string(stream->stream_id) +
+                                " remote=" + FormatHostPort(stream->remote_address, stream->remote_port) +
+                                " flags=" + FormatTcpFlags(segment.flags) +
+                                " seq=" + std::to_string(segment.sequence_number) +
+                                " ack=" + std::to_string(segment.acknowledgment_number) +
+                                " payload=" + std::to_string(segment.payload.size()) +
+                                " expected_remote_seq=" +
+                                std::to_string(stream->next_expected_remote_sequence));
+    }
+
     if (HasFlag(segment.flags, TcpControlFlag::Rst)) {
       stream->peer_closed = true;
       stream->buffered_remote_segments.clear();
@@ -2010,6 +2774,10 @@ class LocalControlService final : public IControlService {
       reset.stream_id = stream->stream_id;
       reset.counter = counter;
       reset.peer_closed = true;
+      if (ShouldLogRtspStreamDebug(*stream)) {
+        LogDebug("sysmodule", "rtsp stream reset stream=" + std::to_string(stream->stream_id) +
+                                  " counter=" + std::to_string(counter));
+      }
       return MakeSuccess(std::move(reset));
     }
 
@@ -2020,6 +2788,11 @@ class LocalControlService final : public IControlService {
         const Error ack_error = send_ack(stream->next_expected_remote_sequence);
         if (ack_error) {
           return MakeFailure<TunnelStreamReadResult>(ack_error.code, ack_error.message);
+        }
+        if (ShouldLogRtspStreamDebug(*stream)) {
+          LogDebug("sysmodule", "rtsp stream duplicate segment ignored stream=" +
+                                    std::to_string(stream->stream_id) + " next_expected=" +
+                                    std::to_string(stream->next_expected_remote_sequence));
         }
         return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound,
                                                    "duplicate TCP stream segment already consumed");
@@ -2034,6 +2807,11 @@ class LocalControlService final : public IControlService {
         const Error ack_error = send_ack(stream->next_expected_remote_sequence);
         if (ack_error) {
           return MakeFailure<TunnelStreamReadResult>(ack_error.code, ack_error.message);
+        }
+        if (ShouldLogRtspStreamDebug(*stream)) {
+          LogDebug("sysmodule", "rtsp stream trimmed-to-empty duplicate ignored stream=" +
+                                    std::to_string(stream->stream_id) + " next_expected=" +
+                                    std::to_string(stream->next_expected_remote_sequence));
         }
         return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound,
                                                    "duplicate TCP stream segment already consumed");
@@ -2058,6 +2836,14 @@ class LocalControlService final : public IControlService {
         if (ack_error) {
           return MakeFailure<TunnelStreamReadResult>(ack_error.code, ack_error.message);
         }
+        if (ShouldLogRtspStreamDebug(*stream)) {
+          LogDebug("sysmodule", "rtsp stream buffered out-of-order segment stream=" +
+                                    std::to_string(stream->stream_id) + " segment_seq=" +
+                                    std::to_string(working.sequence_number) + " next_expected=" +
+                                    std::to_string(stream->next_expected_remote_sequence) +
+                                    " buffered=" +
+                                    std::to_string(stream->buffered_remote_segments.size()));
+        }
         return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound,
                                                    "buffered out-of-order TCP stream segment");
       }
@@ -2081,7 +2867,22 @@ class LocalControlService final : public IControlService {
     }
 
     if (read.payload.empty() && !read.peer_closed) {
+      if (ShouldLogRtspStreamDebug(*stream)) {
+        LogDebug("sysmodule", "rtsp stream produced no readable payload stream=" +
+                                  std::to_string(stream->stream_id) + " counter=" +
+                                  std::to_string(counter) + " next_expected=" +
+                                  std::to_string(stream->next_expected_remote_sequence));
+      }
       return MakeFailure<TunnelStreamReadResult>(ErrorCode::NotFound, "no stream payload available");
+    }
+
+    if (ShouldLogRtspStreamDebug(*stream)) {
+      LogDebug("sysmodule", "rtsp stream read ready stream=" + std::to_string(stream->stream_id) +
+                                " counter=" + std::to_string(counter) + " payload=" +
+                                std::to_string(read.payload.size()) + " peer_closed=" +
+                                std::string(read.peer_closed ? "true" : "false") +
+                                " next_expected=" +
+                                std::to_string(stream->next_expected_remote_sequence));
     }
 
     return MakeSuccess(std::move(read));
@@ -2260,7 +3061,8 @@ class LocalControlService final : public IControlService {
     }
 
     ApplyConfigToState();
-    LogInfo("sysmodule", "control service ready: " + DescribeConfig(config_));
+    LogInfo("sysmodule", "control service ready: version=" + VersionString() + ", build=" +
+                             std::string(kBuildMarker) + ", " + DescribeConfig(config_));
     return Error::None();
   }
 
@@ -2298,6 +3100,10 @@ class LocalControlService final : public IControlService {
   mutable std::unordered_map<std::uint64_t, AppSessionRecord> app_sessions_{};
   mutable std::unordered_map<std::uint64_t, TunnelDatagramHandleRecord> tunnel_datagrams_{};
   mutable std::unordered_map<std::uint64_t, TunnelStreamHandleRecord> tunnel_streams_{};
+  mutable std::list<Ipv4FragmentAssembly> ipv4_fragment_assemblies_{};
+  mutable std::size_t queued_ipv4_fragment_storage_bytes_ = 0;
+  mutable std::uint64_t ipv4_fragment_reassembly_count_ = 0;
+  mutable std::uint64_t ipv4_fragment_drop_count_ = 0;
 };
 
 }  // namespace

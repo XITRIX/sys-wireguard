@@ -7,9 +7,12 @@ Host mode:
 
 Planned Switch mode:
 - `sdmc:/atmosphere/logs/swg/swg.log`
+- `sdmc:/atmosphere/logs/swg/moonlight.log`
 - `sdmc:/atmosphere/logs/swg/boot_marker.log`
 
 The logger currently flushes every line. On Switch builds it now closes the file after each write so the log can be copied while the sysmodule is still running.
+
+Moonlight-Switch now mirrors its Borealis and connection-callback logs into `moonlight.log` in the same directory, so on-device RTSP and bridge diagnostics can be collected from the SWG log folder without hunting through separate app output channels.
 
 ## Basic triage
 

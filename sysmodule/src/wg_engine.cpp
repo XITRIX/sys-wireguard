@@ -28,8 +28,11 @@ constexpr std::uint32_t kReconnectRetryCount = 3;
 constexpr std::uint32_t kReconnectInitialBackoffMs = 100;
 constexpr std::uint32_t kReconnectMaxBackoffMs = 1000;
 constexpr std::uint32_t kTransportReceiveTimeoutMs = 250;
-constexpr std::size_t kMaxQueuedTransportPackets = 8;
-constexpr std::size_t kMaxQueuedTransportPayloadBytes = 8 * 1024;
+// Moonlight media can burst dozens of authenticated UDP payloads before the
+// app-side video/audio threads drain them. Keep the queue bounded, but large
+// enough to absorb short bursts without dropping tunnel media immediately.
+constexpr std::size_t kMaxQueuedTransportPackets = 256;
+constexpr std::size_t kMaxQueuedTransportPayloadBytes = 512 * 1024;
 constexpr std::size_t kMaxHandshakeDatagramSize = 256;
 constexpr std::size_t kMaxTransportDatagramSize = 2048;
 constexpr std::size_t kWireGuardTransportAeadOverhead = 16;
@@ -810,7 +813,13 @@ class WgTunnelEngine final : public IWgTunnelEngine {
               queued_transport_packets_.size() >= kMaxQueuedTransportPackets ||
               queued_transport_payload_bytes_ + payload_size > kMaxQueuedTransportPayloadBytes) {
             if (!receive_queue_overflow_logged_) {
-              LogWarning("wg_engine", "dropping authenticated transport payload because the bounded receive queue is full");
+              LogWarning("wg_engine", "dropping authenticated transport payload because the bounded receive queue is full"
+                                          ": queued_packets=" +
+                                          std::to_string(queued_transport_packets_.size()) +
+                                          ", queued_bytes=" +
+                                          std::to_string(queued_transport_payload_bytes_) +
+                                          ", dropped_payload=" +
+                                          std::to_string(payload_size));
               receive_queue_overflow_logged_ = true;
             }
           } else {

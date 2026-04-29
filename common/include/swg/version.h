@@ -9,9 +9,10 @@ inline constexpr std::uint16_t kAbiVersion = 1;
 inline constexpr std::uint16_t kVersionMajor = 0;
 inline constexpr std::uint16_t kVersionMinor = 1;
 inline constexpr std::uint16_t kVersionPatch = 0;
+inline constexpr char kBuildMarker[] = "dbg0417a";
 
 inline std::string VersionString() {
-  return "0.1.0";
+  return "0.1.0+dbg0417a";
 }
 
 }  // namespace swg
