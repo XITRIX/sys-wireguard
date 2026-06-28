@@ -908,22 +908,55 @@ class CompatBridgeState {
       return 0;
     }
 
-    std::scoped_lock lock(entry->mutex);
-    if (entry->kind != BridgeSocketKind::Datagram) {
-      errno = EINVAL;
-      return -1;
-    }
+    const auto validate_send = [&]() -> bool {
+      if (entry->kind != BridgeSocketKind::Datagram) {
+        errno = EINVAL;
+        return false;
+      }
 
-    if (remote_addr != nullptr && remote_addr_len > 0 && remote_addr->sa_family != AF_INET) {
-      errno = EAFNOSUPPORT;
-      return -1;
+      if (remote_addr != nullptr && remote_addr_len > 0 && remote_addr->sa_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return false;
+      }
+
+      return true;
+    };
+
+    bool unlock_during_send = false;
+    {
+      std::scoped_lock lock(entry->mutex);
+      if (!validate_send()) {
+        return -1;
+      }
+
+      unlock_during_send = UsesNonBlockingControlDatagramWait(*entry);
     }
 
     const auto* bytes = static_cast<const std::uint8_t*>(buffer);
     std::vector<std::uint8_t> payload(bytes, bytes + size);
+
+    if (!unlock_during_send) {
+      std::scoped_lock lock(entry->mutex);
+      if (!validate_send()) {
+        return -1;
+      }
+
+      const auto sent = entry->datagram_socket.Send(payload);
+      if (!sent.ok()) {
+        entry->last_error = sent.error.message;
+        errno = ToErrno(sent.error.code);
+        return -1;
+      }
+
+      return static_cast<int>(size);
+    }
+
     const auto sent = entry->datagram_socket.Send(payload);
     if (!sent.ok()) {
-      entry->last_error = sent.error.message;
+      {
+        std::scoped_lock lock(entry->mutex);
+        entry->last_error = sent.error.message;
+      }
       errno = ToErrno(sent.error.code);
       return -1;
     }

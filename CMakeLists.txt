@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(WGSysModule VERSION 0.1.0 LANGUAGES CXX)
+project(WGSysModule VERSION 0.1.0 LANGUAGES C CXX)
 
 option(SWG_BUILD_HOST_TOOLS "Build host-side development stubs and CLIs" ON)
 option(SWG_BUILD_SWITCH_TARGETS "Enable Switch-targeted configuration slices" OFF)
@@ -44,6 +44,7 @@ endfunction()
 if(SWG_BUILD_INTEGRATION_SERVER_ONLY)
   add_subdirectory(integration)
 else()
+  add_subdirectory(third_party)
   add_subdirectory(common)
   add_subdirectory(sdk)
   add_subdirectory(sysmodule)

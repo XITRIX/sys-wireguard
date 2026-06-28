@@ -35,6 +35,10 @@ Current implementation boundaries:
 - The new Switch integration app is the current device-side SDK validation surface; it is intentionally separate from the manager so operator controls and app-consumer scenarios do not collapse into one UI.
 - Compatibility reporting now probes HOS version and live service reachability on Switch so device-side diagnostics reflect the actual firmware surface.
 - `swg_common` now performs real X25519 key derivation and static peer shared-secret validation through mbedTLS PSA as part of WireGuard profile preflight.
+- The WireGuard protocol backend is now `smartalock/wireguard-lwip`, vendored as `third_party/wireguard-lwip` and built through the local `wireguard_lwip_core` target. SWG compiles only the upstream protocol/crypto core, not the lwIP netif glue.
+- `common/src/wg_handshake.cpp` is now a narrow adapter from SWG's existing handshake/transport API onto `wireguard-lwip`; the sysmodule still owns sockets, retries, packet queues, stats, DNS, and policy.
+- The local `wireguard_lwip_platform.cpp` wrapper provides host/Switch time and PSA-backed randomness to upstream, while deterministic host fixtures use thread-local overrides instead of carrying a second in-house protocol implementation.
+- `docs/wireguard-backend.md` records the backend-replacement intent, touched files, constraints, implementation notes, verification, and follow-up tasks for this milestone.
 - Prepared tunnel sessions now separate profile validation from endpoint resolution, so a later UDP backend can resolve IPv4 hostnames without coupling DNS behavior to the config parser.
 - The current engine owns a small BSD socket runtime boundary, resolves IPv4 endpoints, sends a WireGuard initiation packet, validates the handshake response, sends an authenticated post-handshake keepalive, schedules further keepalives from `persistent_keepalive`, moves authenticated transport payloads through bounded send/receive paths that are regression-covered under repeated app-session traffic, and performs a bounded reconnect with backoff for outbound send failures plus worker-path receive and keepalive transport failures.
 - The Switch sysmodule now relies on a 4 MiB `svcSetHeapSize`-managed heap rather than a tiny inner fake heap so BSD transfer memory can be allocated in-process.
@@ -95,5 +99,6 @@ The current tunnel DNS implementation is intentionally conservative: it crafts I
 
 - Tesla overlay parity, rendering, and input handling
 - WireGuard cookie handling plus later rekey or roaming policy
+- Broader use of upstream `wireguard-lwip` session lifecycle features beyond the current initiation/response and transport AEAD adapter
 - Switch-side service MITM activation for `sfdnsres` and later `bsd:*` work
 - policy-driven transparent routing

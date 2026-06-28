@@ -11,7 +11,7 @@ Current scope:
 - A compatibility report backed by real HOS version and service reachability probes so device-side tools can surface the current firmware/service baseline.
 - A placeholder connection state machine with persistence and diagnostics.
 - Real X25519-based WireGuard cryptographic preflight using mbedTLS PSA, including local public-key derivation and static peer shared-secret validation.
-- A real WireGuard transport path that builds an initiation packet, exchanges the handshake response over UDP, sends an authenticated post-handshake keepalive, continues scheduled keepalives while connected when `persistent_keepalive` is configured, moves authenticated transport payloads through bounded send/receive paths, and performs a bounded reconnect with backoff when an outbound transport send fails.
+- A real WireGuard transport path backed by `third_party/wireguard-lwip` for handshake and transport packet cryptography. SWG still owns UDP sockets, retries, bounded queues, stats, DNS helpers, and policy.
 - An app-facing session, route-planning, and packet API designed for low-friction consumers such as Moonlight-Switch.
 
 Not implemented yet:
@@ -28,6 +28,7 @@ Not implemented yet:
 - `manager`: host-side manager CLI for heavier config operations.
 - `docs`: architecture, tasks, compatibility, debugging, and test notes.
 - `tests`: host-side regression coverage for config and state behavior.
+- `third_party`: vendored protocol dependency wrappers, currently `wireguard-lwip`.
 
 ## Build
 
@@ -99,7 +100,7 @@ Right now, the Switch manager can read and use an existing config, but it cannot
 The practical way to try the current connect path is to manually create `sdmc:/config/swg/config.ini` using the example in [docs/sample-config.ini](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/sample-config.ini).
 
 Current constraints:
-- `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet, validates the response, and then sends one authenticated keepalive before the service enters `Connected`.
+- `Connect()` now validates real X25519 key material, resolves the IPv4 endpoint, sends a real WireGuard initiation packet through `wireguard-lwip`, validates the response, and then sends one authenticated keepalive before the service enters `Connected`.
 - While connected, `GetStats()` now includes live engine counters and scheduled keepalives when `persistent_keepalive` is non-zero.
 - The engine now also accepts inbound authenticated transport packets from the validated peer endpoint and folds them into live stats.
 - Non-empty transport payloads are authenticated, can be sent through `swg:ctl`, are queued in a bounded receive queue, and are available to SDK consumers through `swg::AppSession::SendPacket()` / `ReceivePacket()`.
@@ -107,6 +108,8 @@ Current constraints:
 - Bounded reconnect with backoff now covers outbound payload sends, receive-loop transport failures, and periodic keepalive send failures.
 - It still does not implement cookie replies, rekeying, or endpoint roaming yet.
 - The keys in the sample file are real X25519 test fixtures for cryptographic preflight, not a real peer configuration.
+
+See [docs/wireguard-backend.md](/Users/xitrix/Documents/Dev/Switch/WGSysModule/docs/wireguard-backend.md) for the backend replacement notes, cleanup details, constraints, verification, and follow-up tasks.
 
 If you want a real peer-ready config for later milestones, generate actual keys on a desktop machine with WireGuard tools and replace the sample values before copying the file to the SD card.
 

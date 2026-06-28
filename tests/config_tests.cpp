@@ -709,9 +709,10 @@ class ScriptedReconnectSocketRuntime final : public swg::sysmodule::IUdpSocketRu
     const auto message_type = static_cast<swg::WireGuardMessageType>(buffer[0]);
     switch (message_type) {
       case swg::WireGuardMessageType::HandshakeInitiation: {
+        swg::WireGuardHandshakeResponseOptions response_options{};
+        response_options.sender_index = static_cast<std::uint32_t>(0x4000u + handshake_count_);
         const auto response = swg::RespondToHandshakeInitiationForTest(
-            responder_config_result_.value, buffer, size,
-            swg::WireGuardHandshakeResponseOptions{.sender_index = static_cast<std::uint32_t>(0x4000u + handshake_count_)});
+            responder_config_result_.value, buffer, size, response_options);
         if (!response.ok()) {
           return swg::MakeFailure<std::size_t>(response.error.code, response.error.message);
         }

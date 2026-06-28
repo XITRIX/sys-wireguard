@@ -17,6 +17,11 @@ target_include_directories(swg_common
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+target_link_libraries(swg_common
+  PRIVATE
+    wireguard_lwip_core
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
   target_compile_definitions(swg_common PUBLIC SWG_PLATFORM_SWITCH=1)
 endif()
