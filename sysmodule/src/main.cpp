@@ -61,6 +61,15 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (command == "shutdown") {
+    const swg::Error error = client.RequestShutdown();
+    if (error) {
+      std::cerr << error.message << '\n';
+      return 1;
+    }
+    return 0;
+  }
+
   std::cerr << "unknown command: " << command << "\n";
   return 1;
 }

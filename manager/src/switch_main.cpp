@@ -124,7 +124,7 @@ void DrawScreen(const ScreenModel& model, const std::string& action_message) {
   }
 
   std::printf("\ncontrols:\n");
-  std::printf("  A connect/disconnect   B refresh   + exit\n");
+  std::printf("  A connect/disconnect   B refresh   - stop sysmodule   + exit\n");
   std::printf("  Left/Right change active profile\n");
   std::printf("  X toggle dns-through-tunnel\n");
   std::printf("  Y toggle transparent-mode\n");
@@ -209,6 +209,20 @@ int main(int argc, char** argv) {
 
     if ((buttons_down & HidNpadButton_Plus) != 0) {
       break;
+    }
+
+    if ((buttons_down & HidNpadButton_Minus) != 0) {
+      const swg::Error error = client.RequestShutdown();
+      if (error) {
+        action_message = "sysmodule stop failed: " + error.message;
+        refresh_requested = true;
+      } else {
+        action_message = "sysmodule stop requested";
+        DrawScreen(model, action_message);
+        consoleUpdate(nullptr);
+        svcSleepThread(500'000'000ull);
+        break;
+      }
     }
 
     if ((buttons_down & HidNpadButton_B) != 0) {

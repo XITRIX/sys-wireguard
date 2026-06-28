@@ -25,6 +25,7 @@ class IControlService {
   virtual Error Disconnect() = 0;
   virtual Result<TunnelStats> GetStats() const = 0;
   virtual Error SetRuntimeFlags(RuntimeFlags flags) = 0;
+  virtual Error RequestShutdown() = 0;
   virtual Result<CompatibilityInfo> GetCompatibilityInfo() const = 0;
   virtual Result<AppSessionInfo> OpenAppSession(const AppTunnelRequest& request) = 0;
   virtual Error CloseAppSession(std::uint64_t session_id) = 0;

@@ -8,6 +8,7 @@ namespace swg::sysmodule {
 
 bool IsExperimentalMitmObserverBuildEnabled();
 ::Result StartExperimentalMitmObserverThread();
+void ShutdownExperimentalMitmObserver();
 
 }  // namespace swg::sysmodule
 

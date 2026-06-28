@@ -64,6 +64,8 @@
 - The normal `switch-debug` package now enables the Atmosphere MITM observer for `sfdnsres`; the no-MITM path remains only a manual CMake configuration option, and `bsd:u` remains off unless explicitly enabled.
 - The DNS MITM core now includes a clean-room Atmosphere-compatible hosts rules layer: default telemetry redirections, `%` environment substitution, `*` wildcard matching, last-rule-wins behavior, add-defaults opt-out support, and emummc/sysmmc/default hosts search order are covered by host tests.
 - The Switch sysmodule now loads Atmosphere-compatible DNS settings/hosts on-device, creates the default telemetry hosts file when missing, installs an active `sfdnsres` proxy, handles `GetHostByName*`/`GetAddrInfo*` redirects, forwards unsupported resolver traffic, and supports runtime reload command `65000`.
+- The sysmodule now calls Atmosphere `UninstallMitm` on graceful exit so stop/start can release `sfdnsres` ownership instead of leaking the active MITM registration.
+- The control service now exposes a `RequestShutdown` command and the Switch manager maps it to `- stop sysmodule`, giving MITM builds a graceful stop path before restart.
 - The runtime config and IPC path now carry a dedicated `[integration_test]` section so on-device diagnostics can target a routed LAN test host independently from the WireGuard endpoint.
 - The integration component now builds a passive host-side harness server (`swg_integration_server`) with TCP echo, UDP echo, and plain HTTP probe listeners.
 - The Switch integration NRO now exposes a one-button `Y` path that ensures the tunnel and app session are ready, then runs DNS, session-socket, TCP stream, HTTP stream, and UDP datagram checks against the configured integration target.
@@ -75,6 +77,7 @@
 - Revisit rekey/session-rotation integration now that upstream `wireguard-lwip` owns keypair lifecycle primitives.
 - Audit whether exact-payload transport helpers should adopt WireGuard's usual 16-byte inner-packet padding once all app-facing packet consumers carry parseable IPv4 payloads.
 - Validate the active resolver-only DNS MITM replacement on hardware with Atmosphere's built-in DNS MITM disabled. Confirm SWG owns `sfdnsres`, accepts Moonlight resolver sessions, and does not freeze the console.
+- After rebooting once to clear any stale owner from older builds, stop the sysmodule with the manager `- stop sysmodule` action and confirm the next launch can own `sfdnsres` again without `0x815`.
 - Capture `mitm-observer` and `dns-mitm` log lines for Moonlight-Switch, especially the `program=0x...` value that identifies whether Moonlight is visible directly or through hbloader/a forwarder host title.
 - Add a direct `bsd:u` availability probe before promoting the separately gated observer into an active socket MITM prototype.
 - Verify telemetry hosts still resolve to loopback through SWG's replacement before treating it as a safe Atmosphere DNS MITM substitute.

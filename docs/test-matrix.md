@@ -9,6 +9,7 @@
 | Config round-trip | Verified | Covered by `swg_tests` |
 | State transitions | Verified | Covered by `swg_tests` |
 | IPC codec round-trip | Verified | Covered by `swg_tests` using request/response encoding helpers |
+| Sysmodule shutdown IPC | Verified | `swg_tests` sends `RequestShutdown` through the marshalled host transport and verifies the local shutdown callback fires |
 | SDK client host binding | Verified | Regression-covered in `swg_tests` |
 | WireGuard handshake round-trip | Verified | `swg_tests` now covers initiation build, responder processing, and initiator response validation in-process |
 | WireGuard keepalive scheduling | Verified | `swg_tests` now validates the immediate post-handshake keepalive plus one scheduled keepalive and checks live stats growth |
@@ -24,6 +25,7 @@
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Atmosphere DNS MITM compatibility core | Verified | `swg_tests` covers `sfdnsres` policy selection, hosts matching, resolver serialization, and unsupported IPv6-hint forwarding behavior |
 | Active Switch `sfdnsres` replacement | Build verified | Normal `switch-debug` builds an active DNS MITM proxy; on-device ownership and Moonlight launch still need hardware validation |
+| MITM uninstall on sysmodule exit | Build verified | The Switch build now calls Atmosphere `UninstallMitm` for installed hooks during graceful exit; manager-driven `RequestShutdown` stop/start release still needs hardware validation |
 | Atmosphere DNS hosts compatibility | Verified | `swg_tests` covers default telemetry redirections, wildcard and `%` matching, last-rule-wins behavior, add-defaults opt-out, and emummc/sysmmc/default hosts search order |
 | Integration config round-trip | Verified | `swg_tests` now covers `[integration_test]` settings through config save/load |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |

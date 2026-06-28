@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -209,7 +210,9 @@ struct InvokeBuffers {
 
 class SwitchControlServer {
  public:
-  explicit SwitchControlServer(std::shared_ptr<swg::IControlService> service) : service_(std::move(service)) {
+  explicit SwitchControlServer(std::shared_ptr<swg::IControlService> service,
+                               std::shared_ptr<std::atomic_bool> shutdown_requested)
+      : service_(std::move(service)), shutdown_requested_(std::move(shutdown_requested)) {
     handles_.fill(INVALID_HANDLE);
   }
 
@@ -233,7 +236,7 @@ class SwitchControlServer {
   }
 
   ::Result Run() {
-    while (true) {
+    while (!IsShutdownRequested()) {
       const ::Result rc = ProcessNextHandle();
       if (R_FAILED(rc)) {
         if (rc == KERNELRESULT(ConnectionClosed)) {
@@ -242,6 +245,7 @@ class SwitchControlServer {
         return rc;
       }
     }
+    return 0;
   }
 
  private:
@@ -384,7 +388,12 @@ class SwitchControlServer {
     return DispatchEnvelopeRequest(*service_, buffers, out_response);
   }
 
+  bool IsShutdownRequested() const {
+    return shutdown_requested_ && shutdown_requested_->load(std::memory_order_acquire);
+  }
+
   std::shared_ptr<swg::IControlService> service_;
+  std::shared_ptr<std::atomic_bool> shutdown_requested_;
   std::array<Handle, kMaxSessionCount + 1> handles_{};
   std::size_t handle_count_ = 0;
 };
@@ -405,6 +414,7 @@ void __appInit(void) {
 }
 
 void __appExit(void) {
+  swg::sysmodule::ShutdownExperimentalMitmObserver();
   if (g_sdmc_mounted) {
     fsdevUnmountAll();
   }
@@ -424,7 +434,11 @@ int main(int argc, char** argv) {
 
   WriteBootMarker("main: entered");
 
-  std::shared_ptr<swg::IControlService> service = swg::sysmodule::CreateLocalControlService();
+  auto shutdown_requested = std::make_shared<std::atomic_bool>(false);
+  std::shared_ptr<swg::IControlService> service =
+      swg::sysmodule::CreateLocalControlService({}, [shutdown_requested]() {
+        shutdown_requested->store(true, std::memory_order_release);
+      });
   WriteBootMarker("main: service created");
 
   if (swg::sysmodule::IsExperimentalMitmObserverBuildEnabled()) {
@@ -439,12 +453,13 @@ int main(int argc, char** argv) {
     swg::LogWarning("sysmodule", "experimental MITM observer disabled in this build");
   }
 
-  SwitchControlServer server(std::move(service));
+  SwitchControlServer server(std::move(service), shutdown_requested);
 
   const ::Result init_result = server.Initialize();
   if (R_FAILED(init_result)) {
     WriteBootMarker("main: service registration failed");
     swg::LogError("sysmodule", "failed to register swg:ctl: " + FormatLibnxResult(init_result));
+    swg::sysmodule::ShutdownExperimentalMitmObserver();
     return 1;
   }
 
@@ -454,8 +469,12 @@ int main(int argc, char** argv) {
   if (R_FAILED(run_result)) {
     WriteBootMarker("main: service loop exited");
     swg::LogError("sysmodule", "swg:ctl service loop exited: " + FormatLibnxResult(run_result));
+    swg::sysmodule::ShutdownExperimentalMitmObserver();
     return 1;
   }
 
+  WriteBootMarker("main: service loop stopped");
+  swg::LogInfo("sysmodule", "swg:ctl service loop stopped");
+  swg::sysmodule::ShutdownExperimentalMitmObserver();
   return 0;
 }

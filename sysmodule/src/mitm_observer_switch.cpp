@@ -109,6 +109,7 @@ struct ObserverRuntime {
   Thread dns_thread{};
   QueryResponderContext query_context{};
   DnsMitmServerContext dns_context{};
+  std::array<ObservedService, 2> installed_services{};
   bool started = false;
   bool query_thread_started = false;
   bool dns_thread_started = false;
@@ -193,6 +194,12 @@ std::string FormatHex(std::uint64_t value, int width) {
   const SmServiceName name = smEncodeName(service_name);
   TipcDispatchParams params{};
   return tipcDispatchImpl(sm_session, 65007, &name, sizeof(name), nullptr, 0, params);
+}
+
+::Result UninstallAtmosphereMitm(TipcService* sm_session, const char* service_name) {
+  const SmServiceName name = smEncodeName(service_name);
+  TipcDispatchParams params{};
+  return tipcDispatchImpl(sm_session, 65001, &name, sizeof(name), nullptr, 0, params);
 }
 
 ::Result AcknowledgeAtmosphereMitmSession(TipcService* sm_session,
@@ -953,6 +960,10 @@ void TryInstallObservedService(TipcService* sm_session, ObservedService& service
   }
 
   service.installed = true;
+  if (service.target == MitmServiceTarget::DnsResolver || service.target == MitmServiceTarget::BsdUser) {
+    const std::size_t slot = service.target == MitmServiceTarget::DnsResolver ? 0 : 1;
+    g_observer_runtime.installed_services[slot] = service;
+  }
   const char* mode = service.target == MitmServiceTarget::DnsResolver ? "active DNS replacement" : "observe-only";
   LogInfo("mitm-observer", std::string("installed ") + mode + " MitM handles for " + service.service_name);
 }
@@ -1280,12 +1291,62 @@ void MitmObserverThreadMain(void*) {
   return 0;
 }
 
+void ShutdownExperimentalMitmObserver() {
+  TipcService sm_session{};
+  bool sm_open = false;
+  for (ObservedService& service : g_observer_runtime.installed_services) {
+    if (!service.installed) {
+      continue;
+    }
+
+    if (!sm_open) {
+      const ::Result open_result = OpenAtmosphereSession(&sm_session);
+      if (R_FAILED(open_result)) {
+        LogWarning("mitm-observer", "failed to open Atmosphere SM session for MITM shutdown: " +
+                                      FormatLibnxResult(open_result));
+        break;
+      }
+      sm_open = true;
+    }
+
+    const ::Result clear_result = ClearFutureMitm(&sm_session, service.service_name);
+    if (R_FAILED(clear_result) && !IsSmResult(clear_result, 7)) {
+      LogWarning("mitm-observer", std::string("failed to clear future MitM declaration during shutdown for ") +
+                                      service.service_name + ": " + FormatLibnxResult(clear_result));
+    }
+
+    const ::Result uninstall_result = UninstallAtmosphereMitm(&sm_session, service.service_name);
+    if (R_FAILED(uninstall_result) && !IsSmResult(uninstall_result, 7)) {
+      LogWarning("mitm-observer", std::string("failed to uninstall MitM hook for ") +
+                                      service.service_name + ": " + FormatLibnxResult(uninstall_result));
+    } else {
+      LogInfo("mitm-observer", std::string("uninstalled MitM hook for ") + service.service_name);
+    }
+
+    if (service.mitm_port != INVALID_HANDLE) {
+      svcCloseHandle(service.mitm_port);
+      service.mitm_port = INVALID_HANDLE;
+    }
+    if (service.query_session != INVALID_HANDLE) {
+      svcCloseHandle(service.query_session);
+      service.query_session = INVALID_HANDLE;
+    }
+    service.installed = false;
+  }
+
+  if (sm_open) {
+    tipcClose(&sm_session);
+  }
+}
+
 #else
 
 ::Result StartExperimentalMitmObserverThread() {
   LogWarning("mitm-observer", "experimental MitM service-open observer is disabled in this build");
   return 0;
 }
+
+void ShutdownExperimentalMitmObserver() {}
 
 #endif
 

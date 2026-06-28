@@ -2177,6 +2177,24 @@ bool TestIpcCodecRoundTrip() {
   return ok;
 }
 
+bool TestShutdownRequestCallback() {
+  const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-shutdown-request";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(runtime_root, filesystem_error);
+
+  bool shutdown_requested = false;
+  std::shared_ptr<swg::IControlService> service =
+      swg::sysmodule::CreateLocalControlService(runtime_root, [&shutdown_requested]() {
+        shutdown_requested = true;
+      });
+  swg::Client client(swg::sysmodule::CreateHostInProcessTransport(service));
+
+  bool ok = true;
+  ok &= Require(client.RequestShutdown().ok(), "shutdown request must succeed through the IPC transport");
+  ok &= Require(shutdown_requested, "shutdown request must invoke the local service callback");
+  return ok;
+}
+
 bool TestAppSessionReceivePacket() {
   const std::filesystem::path runtime_root = std::filesystem::current_path() / "test-runtime-app-session-recv";
   std::error_code filesystem_error;
@@ -4313,6 +4331,7 @@ int main() {
   const bool inbound_payload_ok = TestInboundPayloadStats();
   const bool invalid_connect_ok = TestInvalidWireGuardConnectFails();
   const bool codec_ok = TestIpcCodecRoundTrip();
+  const bool shutdown_request_ok = TestShutdownRequestCallback();
   const bool app_session_send_ok = TestAppSessionSendPacket();
   const bool app_session_recv_ok = TestAppSessionReceivePacket();
   const bool sustained_app_session_ok = TestAppSessionSustainedTraffic();
@@ -4343,7 +4362,8 @@ int main() {
       state_ok && client_ok &&
           connect_handshake_ok && periodic_keepalive_ok && inbound_keepalive_ok && inbound_payload_ok &&
           invalid_connect_ok &&
-          codec_ok && app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
+          codec_ok && shutdown_request_ok &&
+          app_session_send_ok && app_session_recv_ok && sustained_app_session_ok && reconnect_ok &&
           receive_reconnect_ok && keepalive_reconnect_ok && moonlight_ok && app_policy_ok &&
            tunnel_dns_codec_ok && dns_resolution_ok &&
             session_socket_ok && tunnel_datagram_ok && tunnel_datagram_burst_ok &&

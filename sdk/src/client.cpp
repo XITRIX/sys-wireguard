@@ -232,6 +232,17 @@ Error Client::SetRuntimeFlags(RuntimeFlags flags) const {
       transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::SetRuntimeFlags, payload.value}));
 }
 
+Error Client::RequestShutdown() const {
+  const std::shared_ptr<IControlService> service = ResolveService();
+  if (service) {
+    return service->RequestShutdown();
+  }
+
+  const std::shared_ptr<IClientTransport> transport = ResolveTransport();
+  return DecodeTransportMutationResponse(
+      InvokeTransportRequest(transport, IpcRequestMessage{kAbiVersion, ServiceCommandId::RequestShutdown, {}}));
+}
+
 Result<CompatibilityInfo> Client::GetCompatibilityInfo() const {
   const std::shared_ptr<IControlService> service = ResolveService();
   if (service) {

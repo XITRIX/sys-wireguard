@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <list>
 #include <map>
 #include <mutex>
@@ -871,9 +872,11 @@ NetworkPlan BuildNetworkPlan(const AppSessionRecord& session,
 class LocalControlService final : public IControlService {
  public:
   explicit LocalControlService(std::filesystem::path runtime_root,
-                               std::unique_ptr<IWgTunnelEngine> tunnel_engine = {})
+                               std::unique_ptr<IWgTunnelEngine> tunnel_engine = {},
+                               ShutdownCallback shutdown_callback = {})
       : paths_(DetectRuntimePaths(runtime_root)),
-        tunnel_engine_(tunnel_engine ? std::move(tunnel_engine) : CreateWgTunnelEngine()) {
+        tunnel_engine_(tunnel_engine ? std::move(tunnel_engine) : CreateWgTunnelEngine()),
+        shutdown_callback_(std::move(shutdown_callback)) {
     const Error init_error = Initialize();
     if (init_error) {
       initialization_error_ = init_error;
@@ -1092,6 +1095,14 @@ class LocalControlService final : public IControlService {
     }
 
     LogInfo("sysmodule", "runtime flags set to " + RuntimeFlagsToString(flags));
+    return Error::None();
+  }
+
+  Error RequestShutdown() override {
+    LogInfo("sysmodule", "graceful shutdown requested through swg:ctl");
+    if (shutdown_callback_) {
+      shutdown_callback_();
+    }
     return Error::None();
   }
 
@@ -3336,12 +3347,14 @@ class LocalControlService final : public IControlService {
   mutable std::size_t queued_ipv4_fragment_storage_bytes_ = 0;
   mutable std::uint64_t ipv4_fragment_reassembly_count_ = 0;
   mutable std::uint64_t ipv4_fragment_drop_count_ = 0;
+  ShutdownCallback shutdown_callback_{};
 };
 
 }  // namespace
 
-std::shared_ptr<IControlService> CreateLocalControlService(const std::filesystem::path& runtime_root) {
-  return std::make_shared<LocalControlService>(runtime_root);
+std::shared_ptr<IControlService> CreateLocalControlService(const std::filesystem::path& runtime_root,
+                                                           ShutdownCallback shutdown_callback) {
+  return std::make_shared<LocalControlService>(runtime_root, nullptr, std::move(shutdown_callback));
 }
 
 std::shared_ptr<IControlService> CreateLocalControlServiceForTest(std::unique_ptr<IWgTunnelEngine> tunnel_engine,

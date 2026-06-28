@@ -30,6 +30,7 @@ class Client {
   Error Disconnect() const;
   Result<TunnelStats> GetStats() const;
   Error SetRuntimeFlags(RuntimeFlags flags) const;
+  Error RequestShutdown() const;
   Result<CompatibilityInfo> GetCompatibilityInfo() const;
   Result<AppSessionInfo> OpenAppSession(const AppTunnelRequest& request) const;
   Error CloseAppSession(std::uint64_t session_id) const;

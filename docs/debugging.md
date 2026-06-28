@@ -52,6 +52,10 @@ If the observer reports `0x815 (module=21, description=4)`, Atmosphere is return
 
 For SWG replacement builds, `atmosphere!enable_dns_mitm=false` is expected. That setting disables Atmosphere's built-in DNS MITM so `sfdnsres` is free; SWG still enables its own DNS replacement from the `switch-debug` build configuration.
 
+SWG now calls Atmosphere's `UninstallMitm` during graceful sysmodule exit. A stale `sfdnsres` MITM left by an older build cannot be reclaimed by a newly started process because Atmosphere only lets the original owner process id uninstall it; reboot once after deploying the fixed build if the old owner is already stranded.
+
+For MITM-enabled builds, stop the sysmodule through SWG's own control path before restarting it. The Switch manager has a `- stop sysmodule` action that sends `RequestShutdown` over `swg:ctl`; the sysmodule replies, leaves the service loop, and then runs the MITM uninstall path. External hard-kill toggles can still bypass `__appExit` and leave Atmosphere's `sfdnsres` MITM registration owned by a dead process until the next reboot.
+
 If the log says `experimental MITM observer disabled in this build`, the package was configured manually with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=OFF`; the normal `switch-debug` preset should not produce that package anymore. If a MITM-enabled build logs `bsd:u MitM observer disabled in this build`, only the resolver replacement is active.
 
 In MITM-enabled packages, the safe startup sequence is:

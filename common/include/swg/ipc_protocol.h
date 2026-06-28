@@ -53,6 +53,7 @@ enum class ServiceCommandId : std::uint32_t {
   RecvTunnelStream,
   SendTunnelStream,
   RecvTunnelDatagramBurst,
+  RequestShutdown,
 };
 
 enum class TunnelState : std::uint32_t {

@@ -2194,6 +2194,11 @@ Result<ByteBuffer> DispatchIpcCommand(IControlService& service, const ByteBuffer
       }
       return EncodeResponseFromConfigMutation(service.SetRuntimeFlags(flags.value));
     }
+    case ServiceCommandId::RequestShutdown:
+      if (!request.value.payload.empty()) {
+        return EncodeResponseFromError(MakeError(ErrorCode::ParseError, "RequestShutdown does not accept a payload"));
+      }
+      return EncodeResponseFromConfigMutation(service.RequestShutdown());
     case ServiceCommandId::GetCompatibilityInfo:
       if (!request.value.payload.empty()) {
         return EncodeResponseFromError(MakeError(ErrorCode::ParseError, "GetCompatibilityInfo does not accept a payload"));
