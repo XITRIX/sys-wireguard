@@ -61,6 +61,7 @@
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
 - Switch preset configure and deployable sysmodule build verified with devkitPro.
 - External transparent-routing research now points the first MITM slice at `sfdnsres`, informed mainly by Atmosphere's `dns_mitm`, and `swg_sysmodule_core` now includes a dormant experimental MITM scaffold plus host policy tests without changing `swg:ctl` runtime behavior.
+- The Switch sysmodule now has a build-gated query-only Atmosphere MITM observer for `sfdnsres` and `bsd:u`; default packages leave it disabled after a Moonlight launch freeze, while unsafe lab builds can still enable it to log `process_id`, `program_id`, override flags, service name, and policy decision.
 - The runtime config and IPC path now carry a dedicated `[integration_test]` section so on-device diagnostics can target a routed LAN test host independently from the WireGuard endpoint.
 - The integration component now builds a passive host-side harness server (`swg_integration_server`) with TCP echo, UDP echo, and plain HTTP probe listeners.
 - The Switch integration NRO now exposes a one-button `Y` path that ensures the tunnel and app session are ready, then runs DNS, session-socket, TCP stream, HTTP stream, and UDP datagram checks against the configured integration target.
@@ -71,8 +72,10 @@
 - Add WireGuard cookie reply handling on top of the current one-shot handshake path.
 - Revisit rekey/session-rotation integration now that upstream `wireguard-lwip` owns keypair lifecycle primitives.
 - Audit whether exact-payload transport helpers should adopt WireGuard's usual 16-byte inner-packet padding once all app-facing packet consumers carry parseable IPv4 payloads.
-- Wire the experimental DNS scaffold into a Switch-only `sfdnsres` observe-only MITM server behind a feature flag.
-- Add a direct `bsd:u` availability probe before any socket MITM implementation work.
+- Validate the reworked resolver-only MITM observer query/reply loop on hardware first; it now starts a dedicated responder before clearing future declarations and replies before logging, addressing the likely SM service-open deadlock seen during Moonlight launch. Test the separately gated `bsd:u` observer only after resolver-only observation is stable.
+- In an unsafe lab build only, run Moonlight-Switch with transparent mode enabled and capture `mitm-observer` log lines for `sfdnsres` and `bsd:u`, especially the `program=0x...` value that identifies whether Moonlight is visible directly or through hbloader/a forwarder host title.
+- Add a direct `bsd:u` availability probe before promoting the current query-only observer into an active socket MITM prototype.
+- Add an active forwarding/proxy slice for `sfdnsres` before using tunnel DNS answers transparently.
 - Reuse the existing `ResolveDns()` and tunnel-DNS path for DNS MITM answers instead of building a second resolver stack.
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.
 - Run the new Switch integration app against a working VPN peer and record on-device connect, route-plan, and diagnostic payload results.

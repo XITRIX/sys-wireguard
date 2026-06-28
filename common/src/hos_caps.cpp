@@ -5,6 +5,7 @@
 
 #if defined(SWG_PLATFORM_SWITCH)
 #include <switch.h>
+#include <switch/kernel/detect.h>
 #endif
 
 namespace swg {
@@ -82,7 +83,7 @@ HosCapabilities DetectHosCapabilities() {
 #if defined(SWG_PLATFORM_SWITCH)
   capabilities.switch_target = true;
   capabilities.hos_version = hosversionGet();
-  capabilities.atmosphere = hosversionIsAtmosphere();
+  capabilities.atmosphere = hosversionIsAtmosphere() || detectMesosphere();
   capabilities.has_bsd_a = ProbeAnyService({"bsd:a"}, &capabilities.bsd_a_probe_result);
   capabilities.has_dns_priv = ProbeAnyService({"dns:priv", "sfdnsres"}, &capabilities.dns_priv_probe_result);
   capabilities.has_ifcfg = ProbeAnyService({"ifcfg", "nifm:a", "nifm:s"}, &capabilities.ifcfg_probe_result);

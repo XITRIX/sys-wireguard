@@ -56,6 +56,7 @@ if(SWG_BUILD_SWITCH_TARGETS AND CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
   )
 
   add_executable(swg_control_sysmodule
+    src/mitm_observer_switch.cpp
     src/switch_main.cpp
   )
 
@@ -63,6 +64,20 @@ if(SWG_BUILD_SWITCH_TARGETS AND CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     PRIVATE
       swg_sysmodule_core
   )
+
+  if(SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER)
+    target_compile_definitions(swg_control_sysmodule
+      PRIVATE
+        SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=1
+    )
+  endif()
+
+  if(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER)
+    target_compile_definitions(swg_control_sysmodule
+      PRIVATE
+        SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=1
+    )
+  endif()
 
   swg_apply_defaults(swg_control_sysmodule)
 

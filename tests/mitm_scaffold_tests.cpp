@@ -71,10 +71,10 @@ bool TestExperimentalMitmHarness() {
   const auto* bsd_user_service = harness.FindService(swg::sysmodule::MitmServiceTarget::BsdUser);
   ok &= Expect(bsd_user_service != nullptr, "bsd:u MITM descriptor must be present");
   if (bsd_user_service != nullptr) {
-    ok &= Expect(!bsd_user_service->requested,
-                 "bsd:u MITM must stay disabled by default until DNS MITM proves stable");
-    ok &= Expect(bsd_user_service->implementation_state == swg::sysmodule::MitmImplementationState::Planned,
-                 "bsd:u MITM must still be a planned slot in the current scaffold");
+    ok &= Expect(bsd_user_service->requested,
+                 "bsd:u service-open observation must be requested when transparent mode is enabled");
+    ok &= Expect(bsd_user_service->implementation_state == swg::sysmodule::MitmImplementationState::Scaffolded,
+                 "bsd:u MITM must expose the service-open observation scaffold");
   }
 
   ok &= Expect(!harness.dns_plan().ready,
@@ -82,8 +82,8 @@ bool TestExperimentalMitmHarness() {
   ok &= Expect(!harness.dns_plan().blockers.empty(),
                "dns MITM plan must explain why activation is still blocked");
   if (!harness.dns_plan().blockers.empty()) {
-    ok &= Expect(harness.dns_plan().blockers.back().find("switch_main") != std::string::npos,
-                 "dns MITM blockers must mention the missing switch_main installation step");
+    ok &= Expect(harness.dns_plan().blockers.back().find("service-open") != std::string::npos,
+                 "dns MITM blockers must clarify that only service-open observation is active");
   }
 
   const swg::sysmodule::MitmClientInfo app_client{
@@ -104,6 +104,21 @@ bool TestExperimentalMitmHarness() {
   const auto app_decision = harness.EvaluateClient(swg::sysmodule::MitmServiceTarget::DnsResolver, app_client);
   ok &= Expect(app_decision.should_mitm,
                "observe-only dns MITM scaffold must select application clients by default");
+
+  swg::sysmodule::MitmServiceOpenObservation observation{};
+  observation.target = swg::sysmodule::MitmServiceTarget::BsdUser;
+  observation.service_name = "bsd:u";
+  observation.client = app_client;
+  observation.policy_decision = harness.EvaluateClient(swg::sysmodule::MitmServiceTarget::BsdUser, app_client);
+  observation.active_interception = false;
+  observation.mode = "service_open_observe_only";
+  const std::string observation_log = swg::sysmodule::FormatMitmServiceOpenObservation(observation);
+  ok &= Expect(observation_log.find("service=bsd:u") != std::string::npos,
+               "service-open observation log must include the service name");
+  ok &= Expect(observation_log.find("program=0x0100000000001000") != std::string::npos,
+               "service-open observation log must include the caller program id");
+  ok &= Expect(observation_log.find("active_mitm=false") != std::string::npos,
+               "service-open observation log must show that active interception remains disabled");
 
   const auto system_decision =
       harness.EvaluateClient(swg::sysmodule::MitmServiceTarget::DnsResolver, system_client);

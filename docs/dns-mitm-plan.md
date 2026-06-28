@@ -76,9 +76,15 @@ The scaffold is intentionally dormant. It does not change `swg:ctl` behavior unt
 - dormant scaffold compiled into `swg_sysmodule_core`
 - host tests cover policy and planning logic only
 
-### Stage 1
+### Stage 1a
 
-- Switch-only `sfdnsres` MITM server installs behind an explicit feature flag
+- Switch-only `sfdnsres` and `bsd:u` MITM query hooks install when transparent mode is requested
+- service-open observation logs client program IDs, process IDs, override flags, service name, and policy decision
+- the query hook returns `false`, so the original service is handed to the client and command traffic is untouched
+
+### Stage 1b
+
+- Switch-only `sfdnsres` active observe proxy accepts selected sessions behind an explicit feature flag
 - observe-only mode logs client program IDs, hostnames, request kind, and decision
 - unmatched or unsupported requests forward untouched
 
@@ -107,7 +113,8 @@ The scaffold is intentionally dormant. It does not change `swg:ctl` behavior unt
 
 ## Immediate next implementation tasks
 
-1. add a Switch-only `sfdnsres` MITM server shell that installs through Atmosphere SM MITM APIs
-2. map only the core resolver commands listed above
-3. forward everything while emitting structured logs
-4. connect the forwarded-path decision layer to the current `ResolveDns()` and tunnel-DNS stats once observe-only logging is stable
+1. run the query-only observer on hardware and record which `program_id` appears for Moonlight-Switch
+2. add a Switch-only `sfdnsres` active observe proxy that installs through Atmosphere SM MITM APIs
+3. map only the core resolver commands listed above
+4. forward everything while emitting structured logs
+5. connect the forwarded-path decision layer to the current `ResolveDns()` and tunnel-DNS stats once observe-only logging is stable

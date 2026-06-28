@@ -29,6 +29,33 @@ Moonlight-Switch now mirrors its Borealis and connection-callback logs into `moo
 - active profile changes
 - runtime flag changes
 - connect/disconnect requests
+- observe-only transparent-mode service opens for `sfdnsres` and `bsd:u`
+
+## MITM Observer Triage
+
+When the Switch sysmodule is built with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=ON` and `transparent_mode` is enabled on a profile or in `[runtime] runtime_flags`, it starts an observe-only Atmosphere MITM query hook for `sfdnsres`. The `bsd:u` observer is additionally gated by `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=ON` because it sits directly in Moonlight's socket service-open path.
+
+Resolver-only lab builds should show activation and later snapshot lines like:
+
+```text
+[INFO] [mitm-observer] activated observe-only MitM query hook for sfdnsres
+[INFO] [mitm-observer] observe-only MitM query stats service=sfdnsres total=... unsupported=... reply_failures=... last_pid=0x... last_program=0x...
+```
+
+For the current slice, the query responder always returns the original Nintendo service instead of proxying commands. If Moonlight-Switch does not appear in these snapshots, first check whether it is launched through hbloader or a forwarder title, because the logged `last_program=0x...` value may belong to that host title rather than a unique Moonlight title.
+
+If the observer repeats `MitM service-open observer install pending ... 0x1015 (module=21, description=8)`, Atmosphere is returning `sm::ResultNotAllowed`. For MITM install, that usually means the sysmodule NPDM does not have `service_host` access for the target service. The packaged sysmodule now grants host access for `swg:ctl`, `sfdnsres`, and `bsd:u`; after deploying an older package, rebuild and replace `exefs.nsp`.
+
+If the observer reports `0x815 (module=21, description=4)`, Atmosphere is returning `sm::ResultAlreadyRegistered`. Another MITM already owns that service name, commonly Atmosphere's built-in DNS MITM for `sfdnsres`. SWG cannot observe that service-open path at the same time; current builds mark the hook blocked and stop retrying.
+
+The default Switch build keeps `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=OFF`. If the log says `experimental MITM observer disabled in this build`, transparent service-open hooks are intentionally not installed; VPN connection and SDK/bridge tunnel traffic can still run without the observer. If a MITM-enabled build logs `bsd:u MitM observer disabled in this build`, only the lower-risk resolver hook is active.
+
+In MITM-enabled lab builds, the safe startup sequence is:
+- `installed observe-only MitM query handles for ...`
+- `activated observe-only MitM query hook for ...`
+- optional `observe-only MitM query stats service=...` snapshots after clients start opening the hooked service
+
+The responder must be ready before future MITM declarations are cleared. Query handling must not write logs in the synchronous SM query path; the responder only replies and updates counters, while the observer thread writes periodic snapshots later. Logging in the synchronous query path can deadlock service opens because SM is waiting for the query response.
 
 ## Current connect semantics
 

@@ -1,7 +1,9 @@
 #include "swg_sysmodule/experimental_mitm.h"
 
 #include <algorithm>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string_view>
 #include <utility>
 
@@ -31,12 +33,15 @@ std::string DescribeUnavailableTarget(const HosCapabilities& capabilities, std::
 }  // namespace
 
 MitmRuntimeSettings BuildDefaultMitmRuntimeSettings(const Config& config) {
+  const bool transparent_requested = ConfigRequestsTransparentMitm(config);
+
   MitmRuntimeSettings settings{};
-  settings.enable_dns_mitm = ConfigRequestsTransparentMitm(config);
-  settings.enable_bsd_user_mitm = false;
+  settings.enable_dns_mitm = transparent_requested;
+  settings.enable_bsd_user_mitm = transparent_requested;
   settings.enable_bsd_system_mitm = false;
   settings.mitm_all_clients = false;
   settings.log_client_sessions = true;
+  settings.observe_service_opens_only = true;
   settings.dump_session_bytes = false;
   settings.session_mode = MitmSessionMode::ObserveOnly;
   return settings;
@@ -59,7 +64,9 @@ std::vector<MitmServiceDescriptor> DescribeExperimentalMitmServices(const Config
   dns.experimental = true;
   dns.implementation_state = MitmImplementationState::Scaffolded;
   if (dns.available) {
-    dns.note = "Resolver MITM scaffold exists in swg_sysmodule_core, but switch_main does not install it yet.";
+    dns.note = settings.observe_service_opens_only
+                   ? "Resolver MITM service-open observer can log caller identities while returning the original service."
+                   : "Resolver MITM scaffold exists in swg_sysmodule_core, but active forwarding is not installed yet.";
   } else {
     dns.note = DescribeUnavailableTarget(capabilities, dns.service_name) +
                "; current compatibility notes only confirm dns access through has_dns_priv.";
@@ -76,8 +83,11 @@ std::vector<MitmServiceDescriptor> DescribeExperimentalMitmServices(const Config
   bsd_user.requested = settings.enable_bsd_user_mitm;
   bsd_user.ready = false;
   bsd_user.experimental = true;
-  bsd_user.implementation_state = MitmImplementationState::Planned;
-  bsd_user.note = "Future socket MITM slot only. The current repo has no bsd:u command adapter, and live capability reporting does not probe bsd:u directly yet.";
+  bsd_user.implementation_state = settings.observe_service_opens_only ? MitmImplementationState::Scaffolded
+                                                                      : MitmImplementationState::Planned;
+  bsd_user.note = settings.observe_service_opens_only
+                      ? "Socket service-open observer can log bsd:u caller identities while returning the original service."
+                      : "Future socket MITM slot only. The current repo has no bsd:u command adapter, and live capability reporting does not probe bsd:u directly yet.";
   services.push_back(std::move(bsd_user));
 
   MitmServiceDescriptor bsd_system{};
@@ -119,7 +129,11 @@ DnsMitmPlan BuildDnsMitmPlan(const Config& config,
   if (!capabilities.has_dns_priv) {
     plan.blockers.push_back("current compatibility probes did not confirm resolver access");
   }
-  plan.blockers.push_back("the scaffold is not wired into switch_main yet");
+  if (settings.observe_service_opens_only) {
+    plan.blockers.push_back("DNS service-open observation does not inspect individual resolver commands yet");
+  } else {
+    plan.blockers.push_back("the scaffold is not wired into switch_main yet");
+  }
 
   return plan;
 }
@@ -189,6 +203,26 @@ const char* ToString(MitmSessionMode mode) {
   }
 
   return "unknown";
+}
+
+std::string FormatMitmServiceOpenObservation(const MitmServiceOpenObservation& observation) {
+  std::ostringstream stream;
+  stream << "service=" << observation.service_name;
+  stream << " target=" << ToString(observation.target);
+  stream << " pid=0x" << std::hex << std::setw(16) << std::setfill('0') << observation.client.process_id;
+  stream << " program=0x" << std::setw(16) << observation.client.program_id;
+  stream << std::dec << std::setfill(' ');
+  stream << " app=" << (observation.client.is_application ? "true" : "false");
+  stream << " hbl=" << (observation.client.atmosphere_hbl ? "true" : "false");
+  stream << " program_specific=" << (observation.client.atmosphere_program_specific ? "true" : "false");
+  stream << " override_flags=0x" << std::hex << observation.client.override_flags << std::dec;
+  stream << " mode=" << observation.mode;
+  stream << " policy_mitm=" << (observation.policy_decision.should_mitm ? "true" : "false");
+  stream << " active_mitm=" << (observation.active_interception ? "true" : "false");
+  if (!observation.policy_decision.reason.empty()) {
+    stream << " reason=\"" << observation.policy_decision.reason << "\"";
+  }
+  return stream.str();
 }
 
 ExperimentalMitmHarness::ExperimentalMitmHarness(Config config,

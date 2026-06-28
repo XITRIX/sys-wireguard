@@ -33,6 +33,7 @@ struct MitmRuntimeSettings {
   bool enable_bsd_system_mitm = false;
   bool mitm_all_clients = false;
   bool log_client_sessions = true;
+  bool observe_service_opens_only = true;
   bool dump_session_bytes = false;
   MitmSessionMode session_mode = MitmSessionMode::ObserveOnly;
 };
@@ -43,6 +44,10 @@ struct MitmClientInfo {
   bool is_application = false;
   std::string client_name;
   std::string integration_tag;
+  std::uint64_t override_keys_held = 0;
+  std::uint64_t override_flags = 0;
+  bool atmosphere_hbl = false;
+  bool atmosphere_program_specific = false;
 };
 
 struct MitmDecision {
@@ -73,6 +78,15 @@ struct DnsMitmPlan {
   std::vector<std::string> blockers;
 };
 
+struct MitmServiceOpenObservation {
+  MitmServiceTarget target = MitmServiceTarget::DnsResolver;
+  std::string service_name;
+  MitmClientInfo client;
+  MitmDecision policy_decision;
+  bool active_interception = false;
+  std::string mode;
+};
+
 MitmRuntimeSettings BuildDefaultMitmRuntimeSettings(const Config& config);
 std::vector<MitmServiceDescriptor> DescribeExperimentalMitmServices(const Config& config,
                                                                     const HosCapabilities& capabilities,
@@ -87,6 +101,7 @@ MitmDecision EvaluateMitmClient(const MitmServiceDescriptor& service,
 const char* ToString(MitmServiceTarget target);
 const char* ToString(MitmImplementationState state);
 const char* ToString(MitmSessionMode mode);
+std::string FormatMitmServiceOpenObservation(const MitmServiceOpenObservation& observation);
 
 class ExperimentalMitmHarness {
  public:

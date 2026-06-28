@@ -14,6 +14,7 @@
 #include "swg/ipc_codec.h"
 #include "swg/ipc_protocol.h"
 #include "swg/log.h"
+#include "swg_sysmodule/mitm_observer_switch.h"
 #include "swg_sysmodule/local_service.h"
 
 namespace {
@@ -425,6 +426,19 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<swg::IControlService> service = swg::sysmodule::CreateLocalControlService();
   WriteBootMarker("main: service created");
+
+  if (swg::sysmodule::IsExperimentalMitmObserverBuildEnabled()) {
+    const ::Result observer_result = swg::sysmodule::StartExperimentalMitmObserverThread();
+    if (R_FAILED(observer_result)) {
+      swg::LogWarning("sysmodule", "failed to start experimental MITM observer: " +
+                                       FormatLibnxResult(observer_result));
+    } else {
+      swg::LogInfo("sysmodule", "experimental MITM observer thread started");
+    }
+  } else {
+    swg::LogWarning("sysmodule", "experimental MITM observer disabled in this build");
+  }
+
   SwitchControlServer server(std::move(service));
 
   const ::Result init_result = server.Initialize();
