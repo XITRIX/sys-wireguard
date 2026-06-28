@@ -30,18 +30,18 @@ Moonlight-Switch now mirrors its Borealis and connection-callback logs into `moo
 - runtime flag changes
 - connect/disconnect requests
 - active DNS MITM service opens and resolver proxying for `sfdnsres`
-- optional observe-only `bsd:u` service-open logging in separately gated builds
+- experimental `bsd:u` service-open query logging in `switch-debug` builds
 
 ## MITM Observer Triage
 
-The normal `switch-debug` preset now builds with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=ON` and starts an active Atmosphere-compatible `sfdnsres` replacement. The `bsd:u` observer is additionally gated by `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=ON` because it sits directly in Moonlight's socket service-open path.
+The normal `switch-debug` preset now builds with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=ON` and `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=ON`, but keeps `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=OFF`. It starts an active Atmosphere-compatible `sfdnsres` replacement and installs a `bsd:u` query hook that fails open. The old raw BSD pass-through lab crashed Moonlight during BSD initialization; the manual lab mode now uses explicit BSD command adapters and returns unsupported BSD errors for commands that are not implemented yet.
 
 Resolver-replacement builds should show activation and later snapshot lines like:
 
 ```text
 [INFO] [mitm-observer] activated active DNS replacement MitM hook for sfdnsres
 [INFO] [dns-mitm] active sfdnsres MITM proxy ready
-[INFO] [mitm-observer] MitM query stats service=sfdnsres total=... unsupported=... reply_failures=... last_pid=0x... last_program=0x...
+[INFO] [mitm-observer] MitM query stats service=sfdnsres total=... selected=... unsupported=... reply_failures=... last_pid=0x... last_program=0x...
 ```
 
 For the current slice, matching Atmosphere hosts rules are answered by SWG and unmatched or unsupported resolver calls are forwarded to Nintendo's original resolver session. If Moonlight-Switch does not appear in these snapshots, first check whether it is launched through hbloader or a forwarder title, because the logged `last_program=0x...` value may belong to that host title rather than a unique Moonlight title.
@@ -62,7 +62,13 @@ In MITM-enabled packages, the safe startup sequence is:
 - `installed active DNS replacement MitM handles for sfdnsres`
 - `active sfdnsres MITM proxy ready`
 - `activated active DNS replacement MitM hook for sfdnsres`
+- `installed query-only MitM handles for bsd:u`
+- `bsd:u adapter lab disabled; query hook will fail open`
+- `activated query-only MitM hook for bsd:u`
 - optional `MitM query stats service=sfdnsres ...` snapshots after clients start opening the hooked service
+- optional `MitM query stats service=bsd:u ... selected=0 ...` lines after application or homebrew clients open the socket service
+
+The current hardware baseline is healthy when Moonlight-Switch opens `bsd:u` with `selected=0`, opens `sfdnsres` with `selected` increasing, exits without app or console freeze, and SWG stop logs `uninstalled MitM hook for sfdnsres` plus `uninstalled MitM hook for bsd:u`.
 
 The DNS replacement also writes `sdmc:/atmosphere/logs/dns_mitm_startup.log` when it loads settings and host rules. If `atmosphere!enable_dns_mitm_debug_log` is enabled, per-query redirect decisions are appended to `sdmc:/atmosphere/logs/dns_mitm_debug.log`.
 

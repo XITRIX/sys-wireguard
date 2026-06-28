@@ -9,8 +9,19 @@ option(SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER
   "Install experimental Atmosphere service-open MITM observer hooks in Switch sysmodule builds"
   OFF)
 option(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER
-  "Also install the experimental bsd:u service-open MITM observer hook"
+  "Also install the experimental bsd:u MITM query hook"
   OFF)
+option(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB
+  "Select bsd:u clients into the experimental command-adapter lab"
+  OFF)
+option(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_PASSTHROUGH
+  "Deprecated alias for SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB"
+  OFF)
+if(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_PASSTHROUGH)
+  message(WARNING "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_PASSTHROUGH is deprecated; enabling SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB instead")
+  set(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB ON CACHE BOOL
+    "Select bsd:u clients into the experimental command-adapter lab" FORCE)
+endif()
 option(SWG_BUILD_INTEGRATION_SERVER_ONLY
   "Build only the passive host integration server and skip core libraries"
   OFF)
@@ -67,4 +78,5 @@ message(STATUS "SWG host tools: ${SWG_BUILD_HOST_TOOLS}")
 message(STATUS "SWG Switch-target configuration: ${SWG_BUILD_SWITCH_TARGETS}")
 message(STATUS "SWG experimental MITM observer: ${SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER}")
 message(STATUS "SWG experimental bsd:u MITM observer: ${SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER}")
+message(STATUS "SWG experimental bsd:u MITM adapter lab: ${SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB}")
 message(STATUS "SWG integration server only: ${SWG_BUILD_INTEGRATION_SERVER_ONLY}")

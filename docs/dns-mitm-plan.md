@@ -91,8 +91,9 @@ The normal Switch debug preset now builds this activation path. A non-MITM build
 ### Stage 1a
 
 - `sfdnsres` MITM query hook installs in the normal Switch debug build
-- `bsd:u` remains behind `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER`
+- `bsd:u` query-only MITM installs in the normal Switch debug build
 - service-open observation logs client program IDs, process IDs, override flags, service name, and query counters
+- hardware logs confirm Moonlight-Switch opens `bsd:u` with `selected=0` and does not crash or freeze
 
 ### Stage 1a.5
 
@@ -121,7 +122,7 @@ The normal Switch debug preset now builds this activation path. A non-MITM build
 
 ### Stage 4
 
-- only after DNS MITM is stable, begin `bsd:u` observation work
+- keep the normal `bsd:u` query lab fail-open, then replace individual socket commands in the manual adapter lab with tunnel-backed adapters
 
 ## Key constraints
 
@@ -132,8 +133,7 @@ The normal Switch debug preset now builds this activation path. A non-MITM build
 
 ## Immediate next implementation tasks
 
-1. deploy the normal `switch-debug` package with `atmosphere!enable_dns_mitm=false` and confirm SWG owns `sfdnsres`
-2. launch Moonlight-Switch and verify resolver clients are accepted without freezing
-3. confirm telemetry hosts still resolve to loopback through the SWG replacement
-4. connect matched non-Atmosphere DNS policy to the current `ResolveDns()` and tunnel-DNS stats
-5. only after DNS replacement is stable, begin the separately gated `bsd:u` observation work
+1. confirm telemetry hosts still resolve to loopback through the SWG replacement
+2. connect matched non-Atmosphere DNS policy to the current `ResolveDns()` and tunnel-DNS stats
+3. implement tunnel-backed UDP `bsd:u` adapters for `sendto`/`recvfrom` plus poll/select readiness in the manual adapter lab
+4. add TCP `connect`/`send`/`recv` adapters after the UDP path has a clean hardware trace

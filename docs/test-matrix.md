@@ -24,8 +24,10 @@
 | Engine reconnect after keepalive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one periodic keepalive send failure, then verifies the engine re-handshakes and remains usable |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
 | Atmosphere DNS MITM compatibility core | Verified | `swg_tests` covers `sfdnsres` policy selection, hosts matching, resolver serialization, and unsupported IPv6-hint forwarding behavior |
-| Active Switch `sfdnsres` replacement | Build verified | Normal `switch-debug` builds an active DNS MITM proxy; on-device ownership and Moonlight launch still need hardware validation |
-| MITM uninstall on sysmodule exit | Build verified | The Switch build now calls Atmosphere `UninstallMitm` for installed hooks during graceful exit; manager-driven `RequestShutdown` stop/start release still needs hardware validation |
+| Active Switch `sfdnsres` replacement | Hardware verified | Normal `switch-debug` owns `sfdnsres`, accepts Moonlight resolver sessions, and reports `selected` query stats without freezing the console |
+| Switch `bsd:u` query hook | Hardware verified | Normal `switch-debug` installs the BSD MITM query hook, fails open with `selected=0`, launches Moonlight without crash/freeze, and allows Sphaira to reopen |
+| BSD adapter lab build | Build verified | `build/switch-debug-bsd-adapter-lab` compiles with `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=ON`; hardware testing is intentionally deferred until UDP/TCP command adapters are added |
+| MITM uninstall on sysmodule exit | Hardware verified | Manager-driven `RequestShutdown` stop logs `uninstalled MitM hook for sfdnsres` and `uninstalled MitM hook for bsd:u` |
 | Atmosphere DNS hosts compatibility | Verified | `swg_tests` covers default telemetry redirections, wildcard and `%` matching, last-rule-wins behavior, add-defaults opt-out, and emummc/sysmmc/default hosts search order |
 | Integration config round-trip | Verified | `swg_tests` now covers `[integration_test]` settings through config save/load |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |

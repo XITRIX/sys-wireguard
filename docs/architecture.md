@@ -8,7 +8,7 @@ Current implementation boundaries:
 - `swg_common`: config schema, logging, state machine, compatibility probes, and IPC-facing structs.
 - `swg_common` also owns the request/response codec and command dispatcher used by the current `swg:ctl` ABI.
 - `swg_sysmodule_core`: a local control-service stub that behaves like the future `swg:ctl` owner.
-- `swg_sysmodule_core` carries the experimental MITM policy scaffold for `sfdnsres` and `bsd:u`, plus the Atmosphere-compatible DNS hosts/rules core. The normal Switch debug package now installs an active `sfdnsres` replacement; Atmosphere's built-in DNS MITM should be disabled so SWG can own the service.
+- `swg_sysmodule_core` carries the experimental MITM policy scaffold for `sfdnsres` and `bsd:u`, plus the Atmosphere-compatible DNS hosts/rules core. The normal Switch debug package now installs an active `sfdnsres` replacement and a fail-open `bsd:u` query hook; Atmosphere's built-in DNS MITM should be disabled so SWG can own the resolver service.
 - `swg_sdk`: the client layer used by overlay and manager code, including a libnx-backed transport for Switch builds.
 - `swg_sdk` also owns the reusable compat bridge layer for tunnel-aware HTTP control, stream-host DNS, and tunnel socket attachment, with Moonlight kept as one compatibility consumer rather than the implementation center.
 - `swg::AppSession`: an app-facing lifecycle wrapper for route planning, send/receive packet calls, and future per-app tunnel control.
@@ -24,8 +24,8 @@ Current implementation boundaries:
 - The overlay stub talks through the SDK client, not by mutating files directly.
 - Host execution is a first-class development mode so the control plane can be tested without device-only dependencies.
 - A dedicated host live-handshake probe now exists for Milestone 4 diagnosis so a real config can be exercised through the same local control service and tunnel engine path without deploying to hardware.
-- Experimental service MITM work is isolated from the stable control plane. The current Switch build actively owns `sfdnsres`, loads Atmosphere-compatible hosts/settings, redirects matching hosts, and forwards unmatched resolver commands to the original service.
-- `bsd:u` remains behind a separate build gate and is not produced by the normal `switch-debug` preset.
+- Experimental service MITM work is isolated from the stable control plane. The current Switch build actively owns `sfdnsres`, loads Atmosphere-compatible hosts/settings, redirects matching hosts, forwards unmatched resolver commands to the original service, and observes `bsd:u` service-open queries without selecting clients in the normal build.
+- The `bsd:u` path is not final transparent VPN routing yet; the normal build is query-only and the manual adapter lab handles only BSD bootstrap plus virtual socket bookkeeping before UDP/TCP command adapters are added.
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.

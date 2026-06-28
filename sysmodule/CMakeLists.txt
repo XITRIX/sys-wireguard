@@ -79,6 +79,13 @@ if(SWG_BUILD_SWITCH_TARGETS AND CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     )
   endif()
 
+  if(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+    target_compile_definitions(swg_control_sysmodule
+      PRIVATE
+        SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=1
+    )
+  endif()
+
   swg_apply_defaults(swg_control_sysmodule)
 
   nx_create_exefs(swg_control_sysmodule_package

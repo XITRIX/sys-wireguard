@@ -61,11 +61,13 @@
 - Host configure, build, test, and control-plane smoke checks verified on macOS.
 - Switch preset configure and deployable sysmodule build verified with devkitPro.
 - External transparent-routing research now points the first MITM slice at `sfdnsres`, informed mainly by Atmosphere's `dns_mitm`, and `swg_sysmodule_core` includes the experimental DNS/`bsd:u` MITM planning scaffold plus host policy tests.
-- The normal `switch-debug` package now enables the Atmosphere MITM observer for `sfdnsres`; the no-MITM path remains only a manual CMake configuration option, and `bsd:u` remains off unless explicitly enabled.
+- The normal `switch-debug` package now enables Atmosphere MITM hooks for `sfdnsres` and `bsd:u`; the no-MITM path remains only a manual CMake configuration option.
 - The DNS MITM core now includes a clean-room Atmosphere-compatible hosts rules layer: default telemetry redirections, `%` environment substitution, `*` wildcard matching, last-rule-wins behavior, add-defaults opt-out support, and emummc/sysmmc/default hosts search order are covered by host tests.
 - The Switch sysmodule now loads Atmosphere-compatible DNS settings/hosts on-device, creates the default telemetry hosts file when missing, installs an active `sfdnsres` proxy, handles `GetHostByName*`/`GetAddrInfo*` redirects, forwards unsupported resolver traffic, and supports runtime reload command `65000`.
 - The sysmodule now calls Atmosphere `UninstallMitm` on graceful exit so stop/start can release `sfdnsres` ownership instead of leaking the active MITM registration.
 - The control service now exposes a `RequestShutdown` command and the Switch manager maps it to `- stop sysmodule`, giving MITM builds a graceful stop path before restart.
+- The Switch MITM lab now includes a `bsd:u` query-only hook in the normal build. Hardware logs confirm Moonlight opens it with `selected=0`, does not crash or freeze, and graceful SWG stop uninstalls both `sfdnsres` and `bsd:u`.
+- The manual `bsd:u` adapter lab now replaces the old raw pass-through proxy. It handles `RegisterClient`, `StartMonitoring`, virtual `Socket`/`SocketExempt`, and `Close`, while unsupported commands return a BSD unsupported error instead of being blindly forwarded.
 - The runtime config and IPC path now carry a dedicated `[integration_test]` section so on-device diagnostics can target a routed LAN test host independently from the WireGuard endpoint.
 - The integration component now builds a passive host-side harness server (`swg_integration_server`) with TCP echo, UDP echo, and plain HTTP probe listeners.
 - The Switch integration NRO now exposes a one-button `Y` path that ensures the tunnel and app session are ready, then runs DNS, session-socket, TCP stream, HTTP stream, and UDP datagram checks against the configured integration target.
@@ -76,10 +78,10 @@
 - Add WireGuard cookie reply handling on top of the current one-shot handshake path.
 - Revisit rekey/session-rotation integration now that upstream `wireguard-lwip` owns keypair lifecycle primitives.
 - Audit whether exact-payload transport helpers should adopt WireGuard's usual 16-byte inner-packet padding once all app-facing packet consumers carry parseable IPv4 payloads.
-- Validate the active resolver-only DNS MITM replacement on hardware with Atmosphere's built-in DNS MITM disabled. Confirm SWG owns `sfdnsres`, accepts Moonlight resolver sessions, and does not freeze the console.
 - After rebooting once to clear any stale owner from older builds, stop the sysmodule with the manager `- stop sysmodule` action and confirm the next launch can own `sfdnsres` again without `0x815`.
 - Capture `mitm-observer` and `dns-mitm` log lines for Moonlight-Switch, especially the `program=0x...` value that identifies whether Moonlight is visible directly or through hbloader/a forwarder host title.
-- Add a direct `bsd:u` availability probe before promoting the separately gated observer into an active socket MITM prototype.
+- Test the manual `bsd:u` adapter lab on hardware only after deploying a clearly labeled lab build. Expected first failure is clean networking failure with `unsupported bsd:u adapter command`, not an app or console freeze.
+- Continue replacing specific `bsd:u` commands behind the adapter lab: UDP `sendto`/`recvfrom` and poll/select readiness first, then TCP `connect`/`send`/`recv`.
 - Verify telemetry hosts still resolve to loopback through SWG's replacement before treating it as a safe Atmosphere DNS MITM substitute.
 - Reuse the existing `ResolveDns()` and tunnel-DNS path for DNS MITM answers instead of building a second resolver stack.
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.

@@ -48,6 +48,19 @@ constexpr std::size_t kDnsMitmMaxSessions = 8;
 constexpr std::size_t kDnsMitmMaxHostsFileSize = 0x8000;
 constexpr const char* kDnsMitmStartupLogPath = "sdmc:/atmosphere/logs/dns_mitm_startup.log";
 constexpr const char* kDnsMitmDebugLogPath = "sdmc:/atmosphere/logs/dns_mitm_debug.log";
+constexpr std::size_t kBsdMitmMaxVirtualSockets = 64;
+constexpr std::int32_t kBsdMitmFirstVirtualFd = 4;
+constexpr std::int32_t kLinuxErrnoBadFileDescriptor = 9;
+constexpr std::int32_t kLinuxErrnoTooManyOpenFiles = 24;
+constexpr std::int32_t kLinuxErrnoOperationNotSupported = 95;
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+constexpr std::size_t kBsdMitmStackSize = 0x10000;
+constexpr std::size_t kBsdMitmMaxSessions = 8;
+constexpr std::uint64_t kApplicationProgramIdStart = 0x0100000000010000ULL;
+constexpr std::uint64_t kApplicationProgramIdEnd = 0x01FFFFFFFFFFFFFFULL;
+constexpr std::uint64_t kOverrideStatusFlagHbl = 1ULL << 0;
+constexpr std::uint64_t kOverrideStatusFlagProgramSpecific = 1ULL << 1;
+#endif
 
 struct AtmosphereMitmProcessInfo {
   std::uint64_t process_id;
@@ -94,8 +107,26 @@ struct DnsMitmServerContext {
   DnsMitmRuntimeState runtime{};
 };
 
+struct BsdMitmClientSession {
+  Handle client_session = INVALID_HANDLE;
+  Handle forward_session = INVALID_HANDLE;
+  AtmosphereMitmProcessInfo client_info{};
+  std::array<std::int32_t, kBsdMitmMaxVirtualSockets> virtual_fds{};
+  std::int32_t next_virtual_fd = kBsdMitmFirstVirtualFd;
+  std::uint64_t request_count = 0;
+  std::uint64_t handled_count = 0;
+  std::uint64_t unsupported_count = 0;
+  bool registered = false;
+  bool monitoring_started = false;
+};
+
+struct BsdMitmServerContext {
+  ObservedService service{};
+};
+
 struct QueryCounters {
   std::atomic<std::uint64_t> total{0};
+  std::atomic<std::uint64_t> selected{0};
   std::atomic<std::uint64_t> unsupported{0};
   std::atomic<std::uint64_t> reply_failures{0};
   std::atomic<std::uint64_t> last_process_id{0};
@@ -107,12 +138,15 @@ struct ObserverRuntime {
   Thread thread{};
   Thread query_thread{};
   Thread dns_thread{};
+  Thread bsd_thread{};
   QueryResponderContext query_context{};
   DnsMitmServerContext dns_context{};
+  BsdMitmServerContext bsd_context{};
   std::array<ObservedService, 2> installed_services{};
   bool started = false;
   bool query_thread_started = false;
   bool dns_thread_started = false;
+  bool bsd_thread_started = false;
 };
 
 ObserverRuntime g_observer_runtime{};
@@ -152,6 +186,41 @@ std::string FormatHex(std::uint64_t value, int width) {
   char buffer[32]{};
   std::snprintf(buffer, sizeof(buffer), "%0*llx", width, static_cast<unsigned long long>(value));
   return buffer;
+}
+
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+bool IsApplicationProgramId(std::uint64_t program_id) {
+  return program_id >= kApplicationProgramIdStart && program_id <= kApplicationProgramIdEnd;
+}
+
+bool HasOverrideFlag(const AtmosphereMitmProcessInfo& info, std::uint64_t flag) {
+  return (info.override_flags & flag) != 0;
+}
+#endif
+
+bool ShouldSelectBsdMitmClient(const AtmosphereMitmProcessInfo& info) {
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+  return IsApplicationProgramId(info.program_id) ||
+         HasOverrideFlag(info, kOverrideStatusFlagHbl) ||
+         HasOverrideFlag(info, kOverrideStatusFlagProgramSpecific);
+#else
+  (void)info;
+  return false;
+#endif
+}
+
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+bool ShouldLogSparseCount(std::uint64_t count) {
+  return count <= 8 || (count & (count - 1)) == 0;
+}
+#endif
+
+const char* DescribeBsdMitmMode() {
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+  return "adapter lab";
+#else
+  return "query-only";
+#endif
 }
 
 ::Result OpenAtmosphereSession(TipcService* out) {
@@ -680,12 +749,22 @@ void ProcessQuerySession(std::size_t service_index, ObservedService& service) {
   const HipcParsedRequest request = hipcParseRequest(armGetTls());
   const bool parsed = ParseMitmQueryRequest(request, &raw_info);
 
-  const bool should_mitm = parsed && service.target == MitmServiceTarget::DnsResolver;
+  bool should_mitm = false;
+  if (parsed) {
+    if (service.target == MitmServiceTarget::DnsResolver) {
+      should_mitm = true;
+    } else if (service.target == MitmServiceTarget::BsdUser) {
+      should_mitm = ShouldSelectBsdMitmClient(raw_info);
+    }
+  }
   PrepareMitmQueryResponse(0, should_mitm);
   const ::Result reply_result = ReplyToQuerySession(service.query_session);
 
   QueryCounters& counters = g_query_counters[service_index];
   counters.total.fetch_add(1, std::memory_order_relaxed);
+  if (should_mitm) {
+    counters.selected.fetch_add(1, std::memory_order_relaxed);
+  }
   if (parsed) {
     counters.last_process_id.store(raw_info.process_id, std::memory_order_relaxed);
     counters.last_program_id.store(raw_info.program_id, std::memory_order_relaxed);
@@ -772,7 +851,7 @@ bool HandleDnsMitmRequest(DnsMitmRuntimeState& runtime,
   }
 }
 
-::Result ForwardCurrentDnsRequest(Handle forward_session) {
+::Result ForwardCurrentMitmRequest(Handle forward_session) {
   return svcSendSyncRequest(forward_session);
 }
 
@@ -890,14 +969,14 @@ class DnsMitmServer {
     } else if (request.meta.type == CmifCommandType_Request ||
                request.meta.type == CmifCommandType_RequestWithContext) {
       if (!HandleDnsMitmRequest(context_->runtime, session.client_info, request)) {
-        rc = ForwardCurrentDnsRequest(session.forward_session);
+        rc = ForwardCurrentMitmRequest(session.forward_session);
         if (R_FAILED(rc)) {
           LogWarning("dns-mitm", "failed to forward sfdnsres request: " + FormatLibnxResult(rc));
           PrepareCmifResponseWithToken(rc, 0, nullptr, 0);
         }
       }
     } else {
-      rc = ForwardCurrentDnsRequest(session.forward_session);
+      rc = ForwardCurrentMitmRequest(session.forward_session);
       if (R_FAILED(rc)) {
         PrepareCmifResponseWithToken(rc, 0, nullptr, 0);
       }
@@ -918,6 +997,411 @@ class DnsMitmServer {
   std::array<DnsMitmClientSession, kDnsMitmMaxSessions> sessions_{};
 };
 
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+struct BsdServiceConfigIn {
+  std::uint32_t version = 0;
+  std::uint32_t tcp_tx_buf_size = 0;
+  std::uint32_t tcp_rx_buf_size = 0;
+  std::uint32_t tcp_tx_buf_max_size = 0;
+  std::uint32_t tcp_rx_buf_max_size = 0;
+  std::uint32_t udp_tx_buf_size = 0;
+  std::uint32_t udp_rx_buf_size = 0;
+  std::uint32_t sb_efficiency = 0;
+};
+
+struct BsdRegisterClientIn {
+  BsdServiceConfigIn config{};
+  std::uint64_t pid_placeholder = 0;
+  std::uint64_t transfer_memory_size = 0;
+};
+
+struct BsdSocketIn {
+  std::int32_t domain = 0;
+  std::int32_t type = 0;
+  std::int32_t protocol = 0;
+};
+
+struct BsdRetErrnoOut {
+  std::int32_t ret = 0;
+  std::int32_t errno_ = 0;
+};
+
+static_assert(sizeof(BsdRegisterClientIn) == 0x30);
+static_assert(sizeof(BsdSocketIn) == 0x0c);
+static_assert(sizeof(BsdRetErrnoOut) == 0x08);
+
+const char* DescribeBsdCommand(std::uint32_t command_id) {
+  switch (command_id) {
+    case 0:
+      return "RegisterClient";
+    case 1:
+      return "StartMonitoring";
+    case 2:
+      return "Socket";
+    case 3:
+      return "SocketExempt";
+    case 4:
+      return "Open";
+    case 5:
+      return "Select";
+    case 6:
+      return "Poll";
+    case 7:
+      return "Sysctl";
+    case 8:
+      return "Recv";
+    case 9:
+      return "RecvFrom";
+    case 10:
+      return "Send";
+    case 11:
+      return "SendTo";
+    case 12:
+      return "Accept";
+    case 13:
+      return "Bind";
+    case 14:
+      return "Connect";
+    case 15:
+      return "GetPeerName";
+    case 16:
+      return "GetSockName";
+    case 17:
+      return "GetSockOpt";
+    case 18:
+      return "Listen";
+    case 19:
+      return "Ioctl";
+    case 20:
+      return "Fcntl";
+    case 21:
+      return "SetSockOpt";
+    case 22:
+      return "Shutdown";
+    case 23:
+      return "ShutdownAllSockets";
+    case 24:
+      return "Write";
+    case 25:
+      return "Read";
+    case 26:
+      return "Close";
+    case 27:
+      return "DuplicateSocket";
+    case 29:
+      return "RecvMMsg";
+    case 30:
+      return "SendMMsg";
+    default:
+      return "Unknown";
+  }
+}
+
+template <typename T>
+const T* GetCmifPayloadAs(const HipcParsedRequest& request) {
+  const CmifInHeader* header = GetCmifHeader(request);
+  if (header == nullptr) {
+    return nullptr;
+  }
+
+  const std::size_t data_size = static_cast<std::size_t>(request.meta.num_data_words) * sizeof(std::uint32_t);
+  if (data_size < sizeof(CmifInHeader) + sizeof(T)) {
+    return nullptr;
+  }
+  return reinterpret_cast<const T*>(header + 1);
+}
+
+void CloseIncomingRequestHandles(const HipcParsedRequest& request) {
+  for (std::uint32_t index = 0; index < request.meta.num_copy_handles; ++index) {
+    svcCloseHandle(request.data.copy_handles[index]);
+  }
+  for (std::uint32_t index = 0; index < request.meta.num_move_handles; ++index) {
+    svcCloseHandle(request.data.move_handles[index]);
+  }
+}
+
+void PrepareBsdRetErrnoResponse(std::uint32_t token, std::int32_t ret, std::int32_t errno_value) {
+  BsdRetErrnoOut out{};
+  out.ret = ret;
+  out.errno_ = ret < 0 ? errno_value : 0;
+  PrepareCmifResponseWithToken(0, token, &out, sizeof(out));
+}
+
+std::optional<std::int32_t> AllocateVirtualBsdSocket(BsdMitmClientSession& session) {
+  auto slot = std::find(session.virtual_fds.begin(), session.virtual_fds.end(), 0);
+  if (slot == session.virtual_fds.end()) {
+    return std::nullopt;
+  }
+
+  const std::int32_t fd = session.next_virtual_fd++;
+  *slot = fd;
+  return fd;
+}
+
+bool CloseVirtualBsdSocket(BsdMitmClientSession& session, std::int32_t fd) {
+  auto slot = std::find(session.virtual_fds.begin(), session.virtual_fds.end(), fd);
+  if (slot == session.virtual_fds.end()) {
+    return false;
+  }
+
+  *slot = 0;
+  return true;
+}
+
+class BsdMitmAdapterServer {
+ public:
+  explicit BsdMitmAdapterServer(BsdMitmServerContext* context) : context_(context) {
+    sessions_.fill({});
+  }
+
+  ::Result Initialize() {
+    return OpenAtmosphereSession(&sm_session_);
+  }
+
+  [[noreturn]] void Run() {
+    while (true) {
+      ProcessNext();
+    }
+  }
+
+ private:
+  void ProcessNext() {
+    std::array<Handle, kBsdMitmMaxSessions + 1> handles{};
+    handles[0] = context_->service.mitm_port;
+    std::size_t handle_count = 1;
+    std::array<std::size_t, kBsdMitmMaxSessions> session_indices{};
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+      if (sessions_[index].client_session != INVALID_HANDLE) {
+        handles[handle_count] = sessions_[index].client_session;
+        session_indices[handle_count - 1] = index;
+        ++handle_count;
+      }
+    }
+
+    s32 signaled_index = -1;
+    const ::Result wait_result =
+        svcWaitSynchronization(&signaled_index, handles.data(), static_cast<s32>(handle_count), UINT64_MAX);
+    if (R_FAILED(wait_result)) {
+      LogWarning("bsd-mitm", "wait failed: " + FormatLibnxResult(wait_result));
+      svcSleepThread(kObserverRetryDelayNs);
+      return;
+    }
+    if (signaled_index == 0) {
+      AcceptSession();
+      return;
+    }
+    if (signaled_index < 0 || static_cast<std::size_t>(signaled_index) >= handle_count) {
+      return;
+    }
+
+    const std::size_t session_index = session_indices[static_cast<std::size_t>(signaled_index) - 1];
+    ProcessSession(session_index);
+  }
+
+  void AcceptSession() {
+    Handle client_session = INVALID_HANDLE;
+    ::Result rc = svcAcceptSession(&client_session, context_->service.mitm_port);
+    if (R_FAILED(rc)) {
+      LogWarning("bsd-mitm", "failed to accept bsd:u MITM session: " + FormatLibnxResult(rc));
+      return;
+    }
+
+    auto slot = std::find_if(sessions_.begin(), sessions_.end(), [](const BsdMitmClientSession& session) {
+      return session.client_session == INVALID_HANDLE;
+    });
+    if (slot == sessions_.end()) {
+      LogWarning("bsd-mitm", "rejected bsd:u MITM session because the server is at capacity");
+      svcCloseHandle(client_session);
+      return;
+    }
+
+    AtmosphereMitmProcessInfo info{};
+    Handle forward_session = INVALID_HANDLE;
+    rc = AcknowledgeAtmosphereMitmSession(&sm_session_, context_->service.service_name, &info, &forward_session);
+    if (R_FAILED(rc)) {
+      LogWarning("bsd-mitm", "failed to acknowledge bsd:u MITM session: " + FormatLibnxResult(rc));
+      svcCloseHandle(client_session);
+      return;
+    }
+
+    slot->client_session = client_session;
+    slot->forward_session = forward_session;
+    slot->client_info = info;
+    slot->virtual_fds.fill(0);
+    slot->next_virtual_fd = kBsdMitmFirstVirtualFd;
+    slot->request_count = 0;
+    slot->handled_count = 0;
+    slot->unsupported_count = 0;
+    slot->registered = false;
+    slot->monitoring_started = false;
+    LogInfo("bsd-mitm", "accepted bsd:u adapter session: pid=0x" + FormatHex(info.process_id, 16) +
+                            " program=0x" + FormatHex(info.program_id, 16) +
+                            " override_flags=0x" + FormatHex(info.override_flags, 16));
+  }
+
+  void CloseSession(std::size_t index) {
+    if (index >= sessions_.size()) {
+      return;
+    }
+
+    const BsdMitmClientSession& session = sessions_[index];
+    if (session.client_session != INVALID_HANDLE) {
+      LogInfo("bsd-mitm", "closed bsd:u adapter session: pid=0x" +
+                              FormatHex(session.client_info.process_id, 16) +
+                              " program=0x" + FormatHex(session.client_info.program_id, 16) +
+                              " requests=" + std::to_string(session.request_count) +
+                              " handled=" + std::to_string(session.handled_count) +
+                              " unsupported=" + std::to_string(session.unsupported_count));
+      svcCloseHandle(session.client_session);
+    }
+    if (session.forward_session != INVALID_HANDLE) {
+      svcCloseHandle(session.forward_session);
+    }
+    sessions_[index] = {};
+  }
+
+  bool HandleRequest(BsdMitmClientSession& session, const HipcParsedRequest& request) {
+    const CmifInHeader* header = GetCmifHeader(request);
+    if (header == nullptr) {
+      PrepareCmifResponseWithToken(MakeLibnxBadInput(), 0, nullptr, 0);
+      return true;
+    }
+
+    const auto command_id = static_cast<std::uint32_t>(header->command_id);
+    const std::uint32_t token = header->token;
+    switch (command_id) {
+      case 0: {
+        const BsdRegisterClientIn* input = GetCmifPayloadAs<BsdRegisterClientIn>(request);
+        if (input == nullptr) {
+          PrepareCmifResponseWithToken(MakeLibnxBadInput(), token, nullptr, 0);
+          return true;
+        }
+
+        session.registered = true;
+        ++session.handled_count;
+        const std::uint64_t pid = session.client_info.process_id;
+        LogInfo("bsd-mitm", "handled bsd:u RegisterClient: pid=0x" +
+                                FormatHex(session.client_info.process_id, 16) +
+                                " program=0x" + FormatHex(session.client_info.program_id, 16) +
+                                " version=" + std::to_string(input->config.version) +
+                                " tmem=0x" + FormatHex(input->transfer_memory_size, 0));
+        PrepareCmifResponseWithToken(0, token, &pid, sizeof(pid));
+        return true;
+      }
+      case 1: {
+        const std::uint64_t* pid = GetCmifPayloadAs<std::uint64_t>(request);
+        if (pid == nullptr) {
+          PrepareCmifResponseWithToken(MakeLibnxBadInput(), token, nullptr, 0);
+          return true;
+        }
+
+        session.monitoring_started = true;
+        ++session.handled_count;
+        LogInfo("bsd-mitm", "handled bsd:u StartMonitoring: pid=0x" +
+                                FormatHex(session.client_info.process_id, 16) +
+                                " monitor_pid=0x" + FormatHex(*pid, 16));
+        PrepareCmifResponseWithToken(0, token, nullptr, 0);
+        return true;
+      }
+      case 2:
+      case 3: {
+        const BsdSocketIn* input = GetCmifPayloadAs<BsdSocketIn>(request);
+        if (input == nullptr) {
+          PrepareCmifResponseWithToken(MakeLibnxBadInput(), token, nullptr, 0);
+          return true;
+        }
+
+        const std::optional<std::int32_t> fd = AllocateVirtualBsdSocket(session);
+        if (!fd.has_value()) {
+          PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoTooManyOpenFiles);
+          return true;
+        }
+
+        ++session.handled_count;
+        LogInfo("bsd-mitm", std::string("handled bsd:u ") + DescribeBsdCommand(command_id) +
+                                ": pid=0x" + FormatHex(session.client_info.process_id, 16) +
+                                " fd=" + std::to_string(*fd) +
+                                " domain=" + std::to_string(input->domain) +
+                                " type=" + std::to_string(input->type) +
+                                " protocol=" + std::to_string(input->protocol));
+        PrepareBsdRetErrnoResponse(token, *fd, 0);
+        return true;
+      }
+      case 26: {
+        const auto* fd = GetCmifPayloadAs<std::int32_t>(request);
+        if (fd == nullptr) {
+          PrepareCmifResponseWithToken(MakeLibnxBadInput(), token, nullptr, 0);
+          return true;
+        }
+
+        if (!CloseVirtualBsdSocket(session, *fd)) {
+          PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
+          return true;
+        }
+
+        ++session.handled_count;
+        LogInfo("bsd-mitm", "handled bsd:u Close: pid=0x" +
+                                FormatHex(session.client_info.process_id, 16) +
+                                " fd=" + std::to_string(*fd));
+        PrepareBsdRetErrnoResponse(token, 0, 0);
+        return true;
+      }
+      default:
+        ++session.unsupported_count;
+        if (ShouldLogSparseCount(session.unsupported_count)) {
+          LogWarning("bsd-mitm", std::string("unsupported bsd:u adapter command: pid=0x") +
+                                     FormatHex(session.client_info.process_id, 16) +
+                                     " command=" + std::to_string(command_id) +
+                                     " name=" + DescribeBsdCommand(command_id) +
+                                     " count=" + std::to_string(session.unsupported_count));
+        }
+        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
+        return true;
+    }
+  }
+
+  void ProcessSession(std::size_t index) {
+    BsdMitmClientSession& session = sessions_[index];
+    s32 unused_index = -1;
+    hipcMakeRequestInline(armGetTls());
+    ::Result rc = svcReplyAndReceive(&unused_index, &session.client_session, 1, INVALID_HANDLE, UINT64_MAX);
+    if (R_FAILED(rc)) {
+      LogWarning("bsd-mitm", "failed to receive bsd:u request: " + FormatLibnxResult(rc));
+      CloseSession(index);
+      return;
+    }
+
+    const HipcParsedRequest request = hipcParseRequest(armGetTls());
+    bool close_session = false;
+
+    if (request.meta.type == CmifCommandType_Close) {
+      close_session = true;
+      PrepareCmifResponseWithToken(0, 0, nullptr, 0);
+    } else if (request.meta.type == CmifCommandType_Request ||
+               request.meta.type == CmifCommandType_RequestWithContext) {
+      ++session.request_count;
+      HandleRequest(session, request);
+      CloseIncomingRequestHandles(request);
+    } else {
+      PrepareCmifResponseWithToken(MakeLibnxBadInput(), 0, nullptr, 0);
+    }
+
+    rc = svcReplyAndReceive(&unused_index, &session.client_session, 0, session.client_session, 0);
+    if (R_FAILED(rc) && rc != KERNELRESULT(TimedOut)) {
+      LogWarning("bsd-mitm", "failed to reply to bsd:u client: " + FormatLibnxResult(rc));
+      close_session = true;
+    }
+    if (close_session) {
+      CloseSession(index);
+    }
+  }
+
+  BsdMitmServerContext* context_ = nullptr;
+  TipcService sm_session_{};
+  std::array<BsdMitmClientSession, kBsdMitmMaxSessions> sessions_{};
+};
+#endif
+
 void DnsMitmServerThreadMain(void* arg) {
   auto* context = static_cast<DnsMitmServerContext*>(arg);
   DnsMitmServer server(context);
@@ -929,6 +1413,21 @@ void DnsMitmServerThreadMain(void* arg) {
   LogInfo("dns-mitm", "active sfdnsres MITM proxy ready");
   server.Run();
 }
+
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+void BsdMitmAdapterThreadMain(void* arg) {
+  auto* context = static_cast<BsdMitmServerContext*>(arg);
+  BsdMitmAdapterServer server(context);
+  const ::Result init_result = server.Initialize();
+  if (R_FAILED(init_result)) {
+    LogWarning("bsd-mitm", "failed to open SM session for bsd:u MITM adapter lab: " +
+                               FormatLibnxResult(init_result));
+    return;
+  }
+  LogInfo("bsd-mitm", "active bsd:u MITM adapter lab ready");
+  server.Run();
+}
+#endif
 
 void TryInstallObservedService(TipcService* sm_session, ObservedService& service) {
   if (!service.requested || service.installed || service.blocked) {
@@ -964,7 +1463,7 @@ void TryInstallObservedService(TipcService* sm_session, ObservedService& service
     const std::size_t slot = service.target == MitmServiceTarget::DnsResolver ? 0 : 1;
     g_observer_runtime.installed_services[slot] = service;
   }
-  const char* mode = service.target == MitmServiceTarget::DnsResolver ? "active DNS replacement" : "observe-only";
+  const char* mode = service.target == MitmServiceTarget::DnsResolver ? "active DNS replacement" : DescribeBsdMitmMode();
   LogInfo("mitm-observer", std::string("installed ") + mode + " MitM handles for " + service.service_name);
 }
 
@@ -1125,6 +1624,37 @@ void MitmQueryResponderThreadMain(void* arg) {
   return 0;
 }
 
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+::Result StartBsdMitmAdapterThread(const ObservedService& service) {
+  if (g_observer_runtime.bsd_thread_started) {
+    return 0;
+  }
+  if (!service.installed || service.mitm_port == INVALID_HANDLE) {
+    return MakeLibnxBadInput();
+  }
+
+  g_observer_runtime.bsd_context.service = service;
+
+  const int priority = 43;
+  const int core_id = -2;
+  const ::Result create_result =
+      threadCreate(&g_observer_runtime.bsd_thread, BsdMitmAdapterThreadMain,
+                   &g_observer_runtime.bsd_context, nullptr, kBsdMitmStackSize, priority, core_id);
+  if (R_FAILED(create_result)) {
+    return create_result;
+  }
+
+  const ::Result start_result = threadStart(&g_observer_runtime.bsd_thread);
+  if (R_FAILED(start_result)) {
+    threadClose(&g_observer_runtime.bsd_thread);
+    return start_result;
+  }
+
+  g_observer_runtime.bsd_thread_started = true;
+  return 0;
+}
+#endif
+
 void LogQueryCounterSnapshots(const std::array<ObservedService, 2>& services,
                               std::array<std::uint64_t, 2>* last_totals) {
   for (std::size_t index = 0; index < services.size(); ++index) {
@@ -1142,6 +1672,8 @@ void LogQueryCounterSnapshots(const std::array<ObservedService, 2>& services,
 
     LogInfo("mitm-observer", std::string("MitM query stats service=") + service.service_name +
                                   " total=" + std::to_string(total) +
+                                  " selected=" +
+                                  std::to_string(counters.selected.load(std::memory_order_relaxed)) +
                                   " unsupported=" +
                                   std::to_string(counters.unsupported.load(std::memory_order_relaxed)) +
                                   " reply_failures=" +
@@ -1176,7 +1708,7 @@ void ClearFutureMitmDeclarations(TipcService* sm_session, const std::array<Obser
       continue;
     }
 
-    const char* mode = service.target == MitmServiceTarget::DnsResolver ? "active DNS replacement" : "observe-only";
+    const char* mode = service.target == MitmServiceTarget::DnsResolver ? "active DNS replacement" : DescribeBsdMitmMode();
     LogInfo("mitm-observer", std::string("activated ") + mode + " MitM hook for " + service.service_name);
   }
 }
@@ -1247,6 +1779,26 @@ void MitmObserverThreadMain(void*) {
                                  FormatLibnxResult(dns_thread_result));
       return;
     }
+  }
+
+  const ObservedService* bsd_service = nullptr;
+  for (const ObservedService& service : services) {
+    if (service.target == MitmServiceTarget::BsdUser && service.installed) {
+      bsd_service = &service;
+      break;
+    }
+  }
+  if (bsd_service != nullptr) {
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+    const ::Result bsd_thread_result = StartBsdMitmAdapterThread(*bsd_service);
+    if (R_FAILED(bsd_thread_result)) {
+      LogWarning("bsd-mitm", "failed to start bsd:u MITM adapter lab thread: " +
+                               FormatLibnxResult(bsd_thread_result));
+      return;
+    }
+#else
+    LogWarning("bsd-mitm", "bsd:u adapter lab disabled; query hook will fail open");
+#endif
   }
 
   const ::Result query_thread_result = StartMitmQueryResponderThread(services, settings);
