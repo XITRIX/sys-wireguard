@@ -14,7 +14,7 @@
 | Switch configure preset | Implemented | Uses `$DEVKITPRO/cmake/Switch.cmake` |
 | libnx service registration | Implemented | `swg:ctl` is registered on Switch and exercised by the manager app |
 | Tesla integration | Deferred | Intentionally excluded from Phase A; host overlay stub only for now |
-| DNS MITM | Scaffolded | Dormant `sfdnsres` planning code exists in `swg_sysmodule_core`, but no Switch-side MITM server is installed yet |
+| DNS MITM | Active lab | Normal `switch-debug` installs an active `sfdnsres` Atmosphere MITM replacement, loads Atmosphere-compatible hosts/settings, redirects matching hosts, and forwards unsupported requests |
 | `bsd:u` MITM | Planned | Deferred until DNS MITM stabilizes and direct `bsd:u` probing exists |
 
 ## Service assumptions

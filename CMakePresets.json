@@ -33,7 +33,7 @@
     },
     {
       "name": "switch-debug",
-      "displayName": "Switch Debug",
+      "displayName": "Switch Debug MITM",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/switch-debug",
       "toolchainFile": "$env{DEVKITPRO}/cmake/Switch.cmake",
@@ -41,7 +41,9 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "SWG_BUILD_HOST_TOOLS": "OFF",
         "SWG_BUILD_SWITCH_TARGETS": "ON",
-        "SWG_BUILD_TESTS": "OFF"
+        "SWG_BUILD_TESTS": "OFF",
+        "SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER": "ON",
+        "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER": "OFF"
       }
     }
   ],

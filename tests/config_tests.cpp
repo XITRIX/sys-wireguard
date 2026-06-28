@@ -35,6 +35,7 @@
 #include "swg_sysmodule/socket_runtime.h"
 
 bool TestExperimentalMitmHarness();
+bool TestAtmosphereDnsMitmRules();
 
 namespace {
 
@@ -4295,6 +4296,7 @@ int main() {
   const bool endpoint_parser_ok = TestEndpointAndNetworkParsing();
   const bool config_ok = TestConfigRoundTrip();
   const bool mitm_scaffold_ok = TestExperimentalMitmHarness();
+  const bool atmosphere_dns_mitm_rules_ok = TestAtmosphereDnsMitmRules();
   const bool wg_crypto_ok = TestWireGuardCrypto();
   const bool wg_handshake_ok = TestWireGuardHandshakeRoundTrip();
   const bool wg_validation_ok = TestWireGuardProfileValidation();
@@ -4334,7 +4336,8 @@ int main() {
   const bool tunnel_stream_deferred_synack_ok = TestTunnelStreamSocketUsesDeferredSynAck();
   const bool tunnel_stream_idle_recovery_ok = TestTunnelStreamSocketRecoversAfterIdleTimeout();
   const bool tunnel_stream_disconnect_reset_ok = TestDisconnectReconnectInvalidatesOldTunnelStreamHandles();
-    return (endpoint_parser_ok && config_ok && mitm_scaffold_ok && wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
+    return (endpoint_parser_ok && config_ok && mitm_scaffold_ok && atmosphere_dns_mitm_rules_ok &&
+      wg_crypto_ok && wg_handshake_ok && wg_validation_ok &&
       tunnel_session_ok && endpoint_resolution_ok && engine_handshake_ok && engine_payload_queue_ok &&
       engine_payload_burst_queue_ok &&
       state_ok && client_ok &&

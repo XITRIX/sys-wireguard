@@ -22,7 +22,9 @@
 | Engine reconnect after receive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one receive-loop transport failure, then verifies the engine re-handshakes and remains usable |
 | Engine reconnect after keepalive failure | Verified | `swg_tests` uses a scripted UDP runtime to force one periodic keepalive send failure, then verifies the engine re-handshakes and remains usable |
 | Live real-config handshake probe | Manual | `build/host-debug/tests/swg_live_handshake_probe --config "$PWD/docs/config.ini"` exercises the real host `Connect()` path against a live endpoint without making `ctest` depend on external network state |
-| Experimental MITM scaffold policy | Verified | `swg_tests` now covers dormant `sfdnsres` policy selection and DNS planning without changing runtime behavior |
+| Atmosphere DNS MITM compatibility core | Verified | `swg_tests` covers `sfdnsres` policy selection, hosts matching, resolver serialization, and unsupported IPv6-hint forwarding behavior |
+| Active Switch `sfdnsres` replacement | Build verified | Normal `switch-debug` builds an active DNS MITM proxy; on-device ownership and Moonlight launch still need hardware validation |
+| Atmosphere DNS hosts compatibility | Verified | `swg_tests` covers default telemetry redirections, wildcard and `%` matching, last-rule-wins behavior, add-defaults opt-out, and emummc/sysmmc/default hosts search order |
 | Integration config round-trip | Verified | `swg_tests` now covers `[integration_test]` settings through config save/load |
 | Moonlight route planning | Verified | Covered by `swg_tests` using app-session helpers |
 | App-session DNS resolution policy | Verified | `swg_tests` now covers direct DNS fallback, fail-closed tunnel-DNS policy before connect, and connected tunnel-DNS A-record resolution |

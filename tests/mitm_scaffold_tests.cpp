@@ -1,5 +1,9 @@
+#include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "swg/config.h"
 #include "swg/ipc_protocol.h"
@@ -14,6 +18,21 @@ bool Expect(bool condition, const std::string& message) {
     return false;
   }
   return true;
+}
+
+std::uint16_t ReadSerializedU16(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+  std::uint16_t value = 0;
+  std::memcpy(&value, bytes.data() + offset, sizeof(value));
+  return static_cast<std::uint16_t>(((value & 0x00ffu) << 8) | ((value & 0xff00u) >> 8));
+}
+
+std::uint32_t ReadSerializedU32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+  std::uint32_t value = 0;
+  std::memcpy(&value, bytes.data() + offset, sizeof(value));
+  return ((value & 0x000000ffu) << 24) |
+         ((value & 0x0000ff00u) << 8) |
+         ((value & 0x00ff0000u) >> 8) |
+         ((value & 0xff000000u) >> 24);
 }
 
 swg::Config MakeExperimentalMitmConfig() {
@@ -170,6 +189,173 @@ bool TestExperimentalMitmHarness() {
                "redirect-to-tunnel dns MITM must still forward while the scaffold is inactive");
   ok &= Expect(redirect_plan.reason.find("not wired") != std::string::npos,
                "redirect-to-tunnel dns MITM must explain that activation is still pending");
+
+  return ok;
+}
+
+bool TestAtmosphereDnsMitmRules() {
+  bool ok = true;
+
+  swg::sysmodule::AtmosphereDnsMitmRules rules;
+  rules.AddDefaultTelemetryRules("lp1");
+
+  const auto telemetry_dg = rules.ResolveRedirect("receive-lp1.dg.srv.nintendo.net");
+  ok &= Expect(telemetry_dg.has_value(), "Atmosphere DNS defaults must redirect telemetry dg host");
+  if (telemetry_dg.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*telemetry_dg) == "127.0.0.1",
+                 "Atmosphere DNS telemetry redirect must target loopback");
+  }
+  ok &= Expect(rules.ResolveRedirect("receive-dev.dg.srv.nintendo.net") == std::nullopt,
+               "Atmosphere DNS percent expansion must use the active environment identifier");
+
+  rules.AddHostsText(
+      "# ignored comment\n"
+      "1.2.3.4 *.example.com api.%.*\n"
+      "5.6.7.8 api.example.com\n"
+      " 9.9.9.9 indented.invalid\n"
+      "300.301.302.303 wrapped.example.com\r\n",
+      "lp1");
+
+  const auto wildcard = rules.ResolveRedirect("cdn.example.com");
+  ok &= Expect(wildcard.has_value(), "Atmosphere DNS wildcard rules must match subdomains");
+  if (wildcard.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*wildcard) == "1.2.3.4",
+                 "Atmosphere DNS wildcard redirect must preserve IPv4 octet order");
+  }
+
+  const auto specific = rules.ResolveRedirect("api.example.com");
+  ok &= Expect(specific.has_value(), "Atmosphere DNS specific rule must match exact host");
+  if (specific.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*specific) == "5.6.7.8",
+                 "Atmosphere DNS later specific rule must override earlier wildcard match");
+  }
+
+  const auto percent_wildcard = rules.ResolveRedirect("api.lp1.anything");
+  ok &= Expect(percent_wildcard.has_value(), "Atmosphere DNS percent tokens must expand inside host patterns");
+  if (percent_wildcard.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*percent_wildcard) == "1.2.3.4",
+                 "Atmosphere DNS percent-expanded wildcard must keep its redirect address");
+  }
+
+  ok &= Expect(rules.ResolveRedirect("indented.invalid") == std::nullopt,
+               "Atmosphere DNS parser must ignore lines that do not begin with an IPv4 digit");
+
+  const auto wrapped = rules.ResolveRedirect("wrapped.example.com");
+  ok &= Expect(wrapped.has_value(), "Atmosphere DNS parser must accept numeric octets beyond 255 like Atmosphere");
+  if (wrapped.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*wrapped) == "44.45.46.47",
+                 "Atmosphere DNS parser must preserve Atmosphere-style octet wrapping");
+  }
+
+  rules.AddHostsText("10.0.0.5 receive-lp1.dg.srv.nintendo.net\n", "lp1");
+  const auto overridden_default = rules.ResolveRedirect("receive-lp1.dg.srv.nintendo.net");
+  ok &= Expect(overridden_default.has_value(), "Atmosphere DNS host file rules must still match defaults");
+  if (overridden_default.has_value()) {
+    ok &= Expect(swg::sysmodule::FormatAtmosphereDnsIpv4(*overridden_default) == "10.0.0.5",
+                 "Atmosphere DNS loaded hosts must override prepended defaults");
+  }
+
+  ok &= Expect(swg::sysmodule::AtmosphereDnsWildcardMatch("*", "anything.example"),
+               "Atmosphere DNS wildcard '*' must match any host");
+  ok &= Expect(swg::sysmodule::AtmosphereDnsWildcardMatch("api.*.example.com", "api.lp1.example.com"),
+               "Atmosphere DNS wildcard must match a middle segment");
+  ok &= Expect(!swg::sysmodule::AtmosphereDnsWildcardMatch("api.*.example.com", "cdn.lp1.example.com"),
+               "Atmosphere DNS wildcard must still respect literal prefixes");
+
+  const auto with_defaults = swg::sysmodule::BuildAtmosphereDnsMitmRules(
+      "10.0.0.8 custom.example\n", "lp1", true);
+  ok &= Expect(with_defaults.ResolveRedirect("receive-lp1.er.srv.nintendo.net").has_value(),
+               "Atmosphere DNS builder must prepend defaults when add-defaults is enabled");
+  ok &= Expect(with_defaults.ResolveRedirect("custom.example").has_value(),
+               "Atmosphere DNS builder must include loaded host rules after defaults");
+
+  const auto without_defaults = swg::sysmodule::BuildAtmosphereDnsMitmRules(
+      "10.0.0.8 custom.example\n", "lp1", false);
+  ok &= Expect(without_defaults.ResolveRedirect("receive-lp1.er.srv.nintendo.net") == std::nullopt,
+               "Atmosphere DNS builder must support the add-defaults opt-out");
+
+  const auto emummc_paths = swg::sysmodule::AtmosphereDnsHostsFileSearchOrder(true, 0x42);
+  ok &= Expect(emummc_paths.size() == 3, "Atmosphere DNS emummc search order must include three candidates");
+  if (emummc_paths.size() == 3) {
+    ok &= Expect(emummc_paths[0] == "/atmosphere/hosts/emummc_0042.txt",
+                 "Atmosphere DNS emummc search order must check the specific emummc hosts file first");
+    ok &= Expect(emummc_paths[1] == "/atmosphere/hosts/emummc.txt",
+                 "Atmosphere DNS emummc search order must check the generic emummc hosts file second");
+    ok &= Expect(emummc_paths[2] == swg::sysmodule::AtmosphereDnsDefaultHostsPath(),
+                 "Atmosphere DNS emummc search order must fall back to default hosts");
+  }
+
+  const auto sysmmc_paths = swg::sysmodule::AtmosphereDnsHostsFileSearchOrder(false, 0);
+  ok &= Expect(sysmmc_paths.size() == 2, "Atmosphere DNS sysmmc search order must include two candidates");
+  if (sysmmc_paths.size() == 2) {
+    ok &= Expect(sysmmc_paths[0] == "/atmosphere/hosts/sysmmc.txt",
+                 "Atmosphere DNS sysmmc search order must check sysmmc hosts first");
+    ok &= Expect(sysmmc_paths[1] == swg::sysmodule::AtmosphereDnsDefaultHostsPath(),
+                 "Atmosphere DNS sysmmc search order must fall back to default hosts");
+  }
+
+  std::vector<std::uint8_t> hostent_buffer(128);
+  const auto hostent_size = swg::sysmodule::SerializeAtmosphereDnsHostEnt(
+      hostent_buffer.data(), hostent_buffer.size(), "blocked.example", 0x0100007fu);
+  ok &= Expect(hostent_size.has_value(), "Atmosphere DNS hostent serialization must fit in the output buffer");
+  if (hostent_size.has_value()) {
+    ok &= Expect(std::string(reinterpret_cast<const char*>(hostent_buffer.data())) == "blocked.example",
+                 "Atmosphere DNS hostent serialization must start with the canonical hostname");
+    const std::size_t aliases_offset = std::string("blocked.example").size() + 1;
+    ok &= Expect(ReadSerializedU32(hostent_buffer, aliases_offset) == 0,
+                 "Atmosphere DNS hostent serialization must emit an empty alias list");
+    ok &= Expect(ReadSerializedU16(hostent_buffer, aliases_offset + 4) == 2,
+                 "Atmosphere DNS hostent serialization must emit AF_INET");
+    ok &= Expect(ReadSerializedU16(hostent_buffer, aliases_offset + 6) == 4,
+                 "Atmosphere DNS hostent serialization must emit a four-byte IPv4 address length");
+    ok &= Expect(ReadSerializedU32(hostent_buffer, aliases_offset + 8) == 1,
+                 "Atmosphere DNS hostent serialization must emit one IPv4 address");
+    ok &= Expect(ReadSerializedU32(hostent_buffer, aliases_offset + 12) == 0x0100007fu,
+                 "Atmosphere DNS hostent serialization must preserve the redirected IPv4 address");
+  }
+
+  std::vector<std::uint8_t> addrinfo_buffer(128);
+  const auto addrinfo_size = swg::sysmodule::SerializeAtmosphereDnsAddrInfo(
+      addrinfo_buffer.data(), addrinfo_buffer.size(), "blocked.example", 0x08080808u, 443, nullptr);
+  ok &= Expect(addrinfo_size.has_value(), "Atmosphere DNS addrinfo serialization must fit in the output buffer");
+  if (addrinfo_size.has_value()) {
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 0) == 0xbeefcafeu,
+                 "Atmosphere DNS addrinfo serialization must start with the expected magic");
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 8) == 2,
+                 "Atmosphere DNS addrinfo serialization must default to AF_INET");
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 12) == 1,
+                 "Atmosphere DNS addrinfo serialization must default to SOCK_STREAM");
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 16) == 6,
+                 "Atmosphere DNS addrinfo serialization must default to TCP");
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 20) == 16,
+                 "Atmosphere DNS addrinfo serialization must emit a sockaddr_in length");
+    ok &= Expect(ReadSerializedU16(addrinfo_buffer, 24) == 2,
+                 "Atmosphere DNS addrinfo serialization must emit sockaddr AF_INET");
+    ok &= Expect(ReadSerializedU16(addrinfo_buffer, 26) == 0xbb01,
+                 "Atmosphere DNS addrinfo serialization must preserve the numeric service port in sockaddr order");
+    ok &= Expect(ReadSerializedU32(addrinfo_buffer, 28) == 0x08080808u,
+                 "Atmosphere DNS addrinfo serialization must preserve the redirected IPv4 address");
+  }
+
+  std::vector<std::uint8_t> hint(24);
+  auto write_serialized_u32 = [&hint](std::size_t offset, std::uint32_t value) {
+    const std::uint32_t serialized = ((value & 0x000000ffu) << 24) |
+                                     ((value & 0x0000ff00u) << 8) |
+                                     ((value & 0x00ff0000u) >> 8) |
+                                     ((value & 0xff000000u) >> 24);
+    std::memcpy(hint.data() + offset, &serialized, sizeof(serialized));
+  };
+  write_serialized_u32(0, 0xbeefcafeu);
+  write_serialized_u32(8, 10);
+  const auto parsed_hint =
+      swg::sysmodule::ParseAtmosphereDnsSerializedAddrInfoHint(hint.data(), hint.size());
+  ok &= Expect(parsed_hint.has_value() && parsed_hint->unsupported_family,
+               "Atmosphere DNS addrinfo hint parser must flag IPv6-only hints for forwarding");
+  ok &= Expect(!swg::sysmodule::SerializeAtmosphereDnsAddrInfo(
+                    addrinfo_buffer.data(), addrinfo_buffer.size(), "blocked.example", 0x08080808u, 443,
+                    parsed_hint.has_value() ? &*parsed_hint : nullptr)
+                    .has_value(),
+               "Atmosphere DNS addrinfo serializer must refuse unsupported IPv6-only hints");
 
   return ok;
 }

@@ -13,13 +13,27 @@ That keeps the interception surface narrow, lets the current tunnel-aware DNS pa
 
 ## Scope
 
-Initial DNS MITM should do only the following:
+Current DNS MITM replacement does the following:
 
 - install an Atmosphere MITM server for `sfdnsres`
-- decide per client whether interception is active
-- observe and log resolver requests first
-- forward unchanged when the feature is disabled or unsupported
+- return `ShouldMitm=true` for resolver clients when the replacement is enabled
+- load Atmosphere-compatible hosts/settings on-device
+- synthesize matching hosts-file A/hostent answers
+- forward unchanged when a hostname is unmatched or a request shape is unsupported
 - later answer selected A-record lookups through the existing tunnel-DNS path
+
+## Atmosphere-Compatible Replacement Core
+
+Before SWG can safely replace Atmosphere's built-in DNS MITM, it must preserve Atmosphere's documented DNS protection behavior:
+
+- default telemetry hosts redirect to `127.0.0.1`
+- `%` expands to the active `nsd!environment_identifier` value, normally `lp1` on production devices
+- `*` is a hostname wildcard
+- later matching hosts rules override earlier rules
+- the selected hosts file is loaded after defaults unless add-defaults is disabled
+- host files are searched in the emummc/sysmmc/default order documented by Atmosphere
+
+The current implementation covers this rules layer in `swg_sysmodule_core`, host tests, and the Switch-side active `sfdnsres` proxy.
 
 ## Non-goals for the first slice
 
@@ -42,20 +56,18 @@ Anything else should forward untouched unless a specific title proves it is requ
 
 ## Proposed repo shape
 
-Current scaffold files:
+Current shared files:
 
 - `sysmodule/include/swg_sysmodule/experimental_mitm.h`
 - `sysmodule/src/experimental_mitm.cpp`
 - `sysmodule/include/swg_sysmodule/experimental_dns_mitm.h`
 - `sysmodule/src/experimental_dns_mitm.cpp`
 
-Future Switch-only activation files:
+Current Switch activation file:
 
-- `sysmodule/src/dns_mitm_switch.cpp`
-- `sysmodule/src/dns_mitm_switch.h`
-- optional later `sysmodule/src/bsd_mitm_switch.cpp`
+- `sysmodule/src/mitm_observer_switch.cpp`
 
-The scaffold is intentionally dormant. It does not change `swg:ctl` behavior until a dedicated Switch-only resolver server is added.
+The normal Switch debug preset now builds this activation path. A non-MITM build remains possible only by turning `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=OFF` manually.
 
 ## Request flow
 
@@ -73,19 +85,26 @@ The scaffold is intentionally dormant. It does not change `swg:ctl` behavior unt
 ### Stage 0
 
 - research complete
-- dormant scaffold compiled into `swg_sysmodule_core`
-- host tests cover policy and planning logic only
+- shared scaffold compiled into `swg_sysmodule_core`
+- host tests cover policy, planning, hosts matching, and resolver serialization
 
 ### Stage 1a
 
-- Switch-only `sfdnsres` and `bsd:u` MITM query hooks install when transparent mode is requested
-- service-open observation logs client program IDs, process IDs, override flags, service name, and policy decision
-- the query hook returns `false`, so the original service is handed to the client and command traffic is untouched
+- `sfdnsres` MITM query hook installs in the normal Switch debug build
+- `bsd:u` remains behind `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER`
+- service-open observation logs client program IDs, process IDs, override flags, service name, and query counters
+
+### Stage 1a.5
+
+- load Atmosphere-compatible DNS hosts/settings on-device
+- create `/atmosphere/hosts/default.txt` with the default telemetry rules when missing
+- honor add-defaults and debug-log settings before taking ownership of resolver sessions
+- emit startup diagnostics for the selected hosts file and loaded redirect rules
 
 ### Stage 1b
 
-- Switch-only `sfdnsres` active observe proxy accepts selected sessions behind an explicit feature flag
-- observe-only mode logs client program IDs, hostnames, request kind, and decision
+- Switch-only `sfdnsres` active proxy accepts selected sessions in the normal MITM debug build
+- debug-log mode records client program IDs, hostnames, request kind, and decision
 - unmatched or unsupported requests forward untouched
 
 ### Stage 2
@@ -113,8 +132,8 @@ The scaffold is intentionally dormant. It does not change `swg:ctl` behavior unt
 
 ## Immediate next implementation tasks
 
-1. run the query-only observer on hardware and record which `program_id` appears for Moonlight-Switch
-2. add a Switch-only `sfdnsres` active observe proxy that installs through Atmosphere SM MITM APIs
-3. map only the core resolver commands listed above
-4. forward everything while emitting structured logs
-5. connect the forwarded-path decision layer to the current `ResolveDns()` and tunnel-DNS stats once observe-only logging is stable
+1. deploy the normal `switch-debug` package with `atmosphere!enable_dns_mitm=false` and confirm SWG owns `sfdnsres`
+2. launch Moonlight-Switch and verify resolver clients are accepted without freezing
+3. confirm telemetry hosts still resolve to loopback through the SWG replacement
+4. connect matched non-Atmosphere DNS policy to the current `ResolveDns()` and tunnel-DNS stats
+5. only after DNS replacement is stable, begin the separately gated `bsd:u` observation work
