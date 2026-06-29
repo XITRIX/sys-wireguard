@@ -2083,7 +2083,13 @@ bool TestIpcCodecRoundTrip() {
   ok &= Require(decoded_version.value.semantic_version == expected_version.semantic_version,
                 "version payload must preserve semantic version");
 
-  const swg::Config expected_config = MakeValidConfig();
+  swg::Config expected_config = MakeValidConfig();
+  swg::AppPolicyConfig expected_policy{};
+  expected_policy.name = "moonlight-forwarder";
+  expected_policy.title_id = 0x055a4327caef0000ull;
+  expected_policy.desired_profile = "default";
+  expected_policy.requested_flags = swg::ToFlags(swg::RuntimeFlag::TransparentMode);
+  expected_config.app_policies[expected_policy.name] = expected_policy;
   const swg::Result<swg::ByteBuffer> config_payload = swg::EncodePayload(expected_config);
   ok &= Require(config_payload.ok(), "config payload encoding must succeed");
   if (!config_payload.ok()) {
@@ -2106,6 +2112,9 @@ bool TestIpcCodecRoundTrip() {
   ok &= Require(decoded_config.value.app_policies.at("default").prefer_tunnel_dns ==
                     expected_config.app_policies.at("default").prefer_tunnel_dns,
                 "config payload must preserve default app-policy dns preference");
+  ok &= Require(decoded_config.value.app_policies.at("moonlight-forwarder").title_id ==
+                    expected_policy.title_id,
+                "config payload must preserve app-policy title id");
 
   const swg::TunnelPacket expected_packet{swg::kAbiVersion, 7, {0x41, 0x42, 0x43}};
   const swg::Result<swg::ByteBuffer> packet_payload = swg::EncodePayload(expected_packet);
@@ -2667,6 +2676,7 @@ bool TestConfigDrivenAppPolicies() {
   swg::Config config = MakeValidConfig();
   swg::AppPolicyConfig moonlight_policy{};
   moonlight_policy.name = "moonlight-switch";
+  moonlight_policy.title_id = 0x055a4327caef0000ull;
   moonlight_policy.client_name = "Moonlight-Switch";
   moonlight_policy.integration_tag = "moonlight-switch";
   moonlight_policy.desired_profile = "default";
@@ -2736,6 +2746,20 @@ bool TestConfigDrivenAppPolicies() {
   }
 
   ok &= Require(moonlight_session.Close().ok(), "Moonlight app session must close cleanly");
+
+  swg::AppSession moonlight_title_session(client);
+  swg::AppTunnelRequest moonlight_title_request{};
+  moonlight_title_request.app.title_id = 0x055a4327caef0000ull;
+
+  const auto moonlight_title_opened = moonlight_title_session.Open(moonlight_title_request);
+  ok &= Require(moonlight_title_opened.ok(), "Moonlight title-id app session must open");
+  if (!moonlight_title_opened.ok()) {
+    return false;
+  }
+
+  ok &= Require(moonlight_title_opened.value.notes.find("app_policy=moonlight-switch") != std::string::npos,
+                "Moonlight title-id app session must report the matched app policy in notes");
+  ok &= Require(moonlight_title_session.Close().ok(), "Moonlight title-id app session must close cleanly");
 
   swg::AppSession override_session(client);
   const auto override_opened = override_session.Open(swg::MakeMoonlightSessionRequest("default", true));

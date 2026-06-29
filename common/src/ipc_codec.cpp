@@ -196,6 +196,7 @@ void WriteProfileConfig(BufferWriter& writer, const ProfileConfig& value) {
 
 void WriteAppPolicyConfig(BufferWriter& writer, const AppPolicyConfig& value) {
   writer.WriteString(value.name);
+  writer.WritePod<std::uint64_t>(value.title_id);
   writer.WriteString(value.client_name);
   writer.WriteString(value.integration_tag);
   writer.WriteString(value.desired_profile);
@@ -306,6 +307,12 @@ Result<AppPolicyConfig> ReadAppPolicyConfig(BufferReader& reader) {
     return MakeFailure<AppPolicyConfig>(name.error.code, name.error.message);
   }
   value.name = name.value;
+
+  const Result<std::uint64_t> title_id = reader.ReadPod<std::uint64_t>();
+  if (!title_id.ok()) {
+    return MakeFailure<AppPolicyConfig>(title_id.error.code, title_id.error.message);
+  }
+  value.title_id = title_id.value;
 
   const Result<std::string> client_name = reader.ReadString();
   if (!client_name.ok()) {

@@ -644,22 +644,31 @@ const AppPolicyConfig* FindMatchingAppPolicy(const Config& config,
     }
 
     bool has_explicit_match_fields = false;
+    bool matched_explicit_field = false;
     int score = 0;
+
+    if (policy.title_id != 0) {
+      has_explicit_match_fields = true;
+      if (app.title_id != 0 && policy.title_id == app.title_id) {
+        matched_explicit_field = true;
+        score += 8;
+      }
+    }
 
     if (!policy.client_name.empty()) {
       has_explicit_match_fields = true;
-      if (policy.client_name != app.client_name) {
-        continue;
+      if (!app.client_name.empty() && policy.client_name == app.client_name) {
+        matched_explicit_field = true;
+        score += 2;
       }
-      score += 2;
     }
 
     if (!policy.integration_tag.empty()) {
       has_explicit_match_fields = true;
-      if (policy.integration_tag != app.integration_tag) {
-        continue;
+      if (!app.integration_tag.empty() && policy.integration_tag == app.integration_tag) {
+        matched_explicit_field = true;
+        score += 4;
       }
-      score += 4;
     }
 
     if (!has_explicit_match_fields) {
@@ -669,6 +678,8 @@ const AppPolicyConfig* FindMatchingAppPolicy(const Config& config,
         continue;
       }
       score = 1;
+    } else if (!matched_explicit_field) {
+      continue;
     }
 
     if (score > best_score) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -77,6 +78,33 @@ Result<std::uint16_t> ParseU16(std::string_view input) {
   } catch (const std::exception&) {
     return MakeFailure<std::uint16_t>(ErrorCode::ParseError, "invalid integer value: " + value);
   }
+}
+
+Result<std::uint64_t> ParseU64(std::string_view input) {
+  const std::string value = Trim(input);
+  if (value.empty()) {
+    return MakeSuccess<std::uint64_t>(0);
+  }
+
+  try {
+    std::size_t consumed = 0;
+    const unsigned long long parsed = std::stoull(value, &consumed, 0);
+    if (consumed != value.size()) {
+      return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "invalid integer value: " + value);
+    }
+    return MakeSuccess(static_cast<std::uint64_t>(parsed));
+  } catch (const std::exception&) {
+    return MakeFailure<std::uint64_t>(ErrorCode::ParseError, "invalid integer value: " + value);
+  }
+}
+
+std::string FormatOptionalTitleId(std::uint64_t title_id) {
+  if (title_id == 0) {
+    return "";
+  }
+  char buffer[19]{};
+  std::snprintf(buffer, sizeof(buffer), "0x%016llx", static_cast<unsigned long long>(title_id));
+  return buffer;
 }
 
 RuntimeFlags ParseRuntimeFlags(std::string_view input) {
@@ -180,6 +208,15 @@ Error AssignProfileValue(ProfileConfig& profile, const std::string& key, const s
 }
 
 Error AssignAppPolicyValue(AppPolicyConfig& policy, const std::string& key, const std::string& value) {
+  if (key == "title_id") {
+    const Result<std::uint64_t> parsed = ParseU64(value);
+    if (!parsed.ok()) {
+      return parsed.error;
+    }
+    policy.title_id = parsed.value;
+    return Error::None();
+  }
+
   if (key == "client_name") {
     policy.client_name = value;
     return Error::None();
@@ -501,6 +538,7 @@ Error SaveConfigFile(const Config& config, const std::filesystem::path& path) {
 
   for (const auto& [name, policy] : config.app_policies) {
     output << "[app_policy." << name << "]\n";
+    output << "title_id = " << FormatOptionalTitleId(policy.title_id) << "\n";
     output << "client_name = " << policy.client_name << "\n";
     output << "integration_tag = " << policy.integration_tag << "\n";
     output << "desired_profile = " << policy.desired_profile << "\n";

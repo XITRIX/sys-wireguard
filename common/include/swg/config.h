@@ -29,6 +29,7 @@ struct ProfileConfig {
 
 struct AppPolicyConfig {
   std::string name;
+  std::uint64_t title_id = 0;
   std::string client_name;
   std::string integration_tag;
   std::string desired_profile;

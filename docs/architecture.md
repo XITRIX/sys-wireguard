@@ -25,7 +25,7 @@ Current implementation boundaries:
 - Host execution is a first-class development mode so the control plane can be tested without device-only dependencies.
 - A dedicated host live-handshake probe now exists for Milestone 4 diagnosis so a real config can be exercised through the same local control service and tunnel engine path without deploying to hardware.
 - Experimental service MITM work is isolated from the stable control plane. The current Switch build actively owns `sfdnsres`, loads Atmosphere-compatible hosts/settings, redirects matching hosts, forwards unmatched resolver commands to the original service, and observes `bsd:u` service-open queries without selecting clients in the normal build.
-- The `bsd:u` path is not final transparent VPN routing yet; the normal build is query-only and the manual adapter lab now maps IPv4 UDP virtual sockets onto SWG tunnel datagram handles. TCP command adapters and broader socket options are still pending.
+- The `bsd:u` path is not final transparent VPN routing yet; the normal build is query-only and the manual adapter lab now maps tracked IPv4 UDP sockets onto SWG tunnel datagram handles after asking the original BSD service to allocate client-visible fd numbers. TCP command adapters and broader socket options are still pending.
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.
@@ -91,7 +91,7 @@ Moonlight-Switch already uses libcurl, direct sockets, local discovery, STUN, an
 
 App-policy model:
 - `app_policy.default` defines the baseline route and DNS behavior for apps that do not have a more specific match
-- per-app sections can match on `client_name`, `integration_tag`, or a section name that mirrors one of those identifiers
+- per-app sections can match on `title_id`, `client_name`, `integration_tag`, or a section name that mirrors one of the string identifiers
 - callers can still force specific booleans through explicit `AppPolicyOverrideFlag` bits when a compat shim or test really needs to override config
 
 The current tunnel DNS implementation is intentionally conservative: it crafts IPv4 UDP DNS queries inside the WireGuard transport for SDK consumers, parses matching IPv4 A-record answers back out of the receive queue, and leaves broader resolver features to later milestones.
