@@ -34,7 +34,7 @@ Moonlight-Switch now mirrors its Borealis and connection-callback logs into `moo
 
 ## MITM Observer Triage
 
-The normal `switch-debug` preset now builds with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=ON` and `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=ON`, but keeps `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=OFF`. It starts an active Atmosphere-compatible `sfdnsres` replacement and installs a `bsd:u` query hook that fails open. The old raw BSD pass-through lab crashed Moonlight during BSD initialization; the manual lab mode now uses explicit BSD command adapters and returns unsupported BSD errors for commands that are not implemented yet.
+The normal `switch-debug` preset now builds with `SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER=ON` and `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER=ON`, but keeps `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=OFF`. It starts an active Atmosphere-compatible `sfdnsres` replacement and installs a `bsd:u` query hook that fails open. The old raw BSD pass-through lab crashed Moonlight during BSD initialization; the manual lab mode now uses explicit BSD command adapters and returns BSD errno values for unsupported commands.
 
 Resolver-replacement builds should show activation and later snapshot lines like:
 
@@ -69,6 +69,22 @@ In MITM-enabled packages, the safe startup sequence is:
 - optional `MitM query stats service=bsd:u ... selected=0 ...` lines after application or homebrew clients open the socket service
 
 The current hardware baseline is healthy when Moonlight-Switch opens `bsd:u` with `selected=0`, opens `sfdnsres` with `selected` increasing, exits without app or console freeze, and SWG stop logs `uninstalled MitM hook for sfdnsres` plus `uninstalled MitM hook for bsd:u`.
+
+When `SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB=ON`, the BSD hook is expected to show `installed adapter lab MitM handles for bsd:u`, `active bsd:u MITM adapter lab ready`, and `selected` increasing for `bsd:u`. The current UDP slice handles `RegisterClient`, `StartMonitoring`, `cmifCloneCurrentObject` session cloning, virtual `Socket`/`SocketExempt`, `Bind`, UDP `Connect`, `Send`/`SendTo`, `Recv`/`RecvFrom`, `Poll`, `Select`, `GetSockName`, `GetPeerName`, `Fcntl`, `GetSockOpt(SO_ERROR)`, `SetSockOpt`, `Shutdown`, and `Close`. It also has a direct native BSD backend for policy-approved local/multicast IPv4 UDP and local IPv4 TCP probes. Useful lab logs include `cloned bsd:u adapter session`, `opened transparent app session`, `opened direct native BSD socket`, `handled bsd:u Connect direct`, `opened tunnel UDP adapter`, `sent tunnel UDP datagram`, `received tunnel UDP datagram`, and sparse `unsupported bsd:u adapter command` lines for commands not implemented yet.
+
+If host discovery logs `rejected tunnel datagram open ... target=224.0.0.251:5353`, the adapter is incorrectly treating mDNS as tunnel-required traffic. The local/multicast direct backend should instead open a native BSD socket and send that packet outside the tunnel.
+
+If the transparent BSD session log says `app=bsd:u` without `local_bypass=enabled`, the adapter request did not override the default app policy and all local discovery/status traffic can be denied while disconnected. The adapter-lab build should request `AllowLocalNetworkBypass` explicitly before opening its transparent app session.
+
+If a selected app accepts `bsd:u`, logs `RegisterClient` and `StartMonitoring`, then immediately closes both adapter sessions without any `cloned bsd:u adapter session` line, libnx probably failed during BSD session-manager setup. The adapter must support `cmifCloneCurrentObject` before production apps such as Moonlight-Switch can safely progress to normal socket calls.
+
+If `cloned bsd:u adapter session` appears repeatedly and then logs `failed to clone bsd:u adapter session because the server is at capacity`, the lab session table is too small for the app's libnx BSD session pool. The adapter-lab build now reserves enough slots for libnx's 16-session maximum plus the extra monitor session.
+
+If Moonlight-Switch opens successfully but crashes while closing and the crash report symbols land in `socketExit()` / `bsdExit()` / libnx `tmemClose`, check the `RegisterClient` line for `tmem_handle=preserved`. The adapter must keep the `RegisterClient` transfer-memory handle alive until the root BSD session closes; closing that incoming handle during request cleanup can break the client's BSD transfer-memory teardown.
+
+If HOS crashes while Moonlight reaches host-status ping and the sysmodule crash symbols land in `BsdMitmAdapterServer::HandleGetSockName`, suspect an unsafe HIPC AutoSelect output buffer. The adapter-lab build now reports a non-zero BSD pointer-buffer size, masks recv-list addresses, uses AutoSelect buffer decoding for BSD command payloads, and bounces direct native `send`/`recv`/`getsockopt` data through sysmodule-owned scratch buffers. A bad forwarded buffer should now return BSD `EFAULT` instead of causing a sysmodule data abort.
+
+If an adapter-lab crash report points at `BsdMitmAdapterThreadMain` and the saved stack pointer is outside the crashed thread stack range, treat it as a sysmodule thread stack overflow. The BSD adapter server state must stay heap-backed; moving its session/socket table back onto the thread stack can crash HOS before the `active bsd:u MITM adapter lab ready` line is written.
 
 The DNS replacement also writes `sdmc:/atmosphere/logs/dns_mitm_startup.log` when it loads settings and host rules. If `atmosphere!enable_dns_mitm_debug_log` is enabled, per-query redirect decisions are appended to `sdmc:/atmosphere/logs/dns_mitm_debug.log`.
 

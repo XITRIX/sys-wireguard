@@ -15,11 +15,11 @@
 | libnx service registration | Implemented | `swg:ctl` is registered on Switch and exercised by the manager app |
 | Tesla integration | Deferred | Intentionally excluded from Phase A; host overlay stub only for now |
 | DNS MITM | Active lab | Normal `switch-debug` installs an active `sfdnsres` Atmosphere MITM replacement, loads Atmosphere-compatible hosts/settings, redirects matching hosts, and forwards unsupported requests |
-| `bsd:u` MITM | Query lab | Normal `switch-debug` installs the query hook and fails open; hardware logs show Moonlight starts cleanly with `selected=0`; the manual adapter lab handles only bootstrap/socket bookkeeping commands so far |
+| `bsd:u` MITM | UDP adapter lab | Normal `switch-debug` installs the query hook and fails open; hardware logs show Moonlight starts cleanly with `selected=0`; the manual adapter lab now routes virtual IPv4 UDP sockets through SWG tunnel datagram handles |
 
 ## Service assumptions
 
 - No tun/tap device is assumed.
 - No Linux route-table or raw-socket behavior is assumed.
 - Future service checks must stay centralized in `swg/hos_caps.h` and its implementation.
-- `sfdnsres` is the first transparent-mode interception target; `bsd:u` is now a validated query-only lab and still needs UDP/TCP command adapters before it can force traffic through the tunnel.
+- `sfdnsres` is the first transparent-mode interception target; `bsd:u` is now a validated query-only lab in normal builds, and the manual adapter lab has the first IPv4 UDP command path wired to tunnel datagram handles. TCP command adapters are still pending.

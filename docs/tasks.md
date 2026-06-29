@@ -67,7 +67,9 @@
 - The sysmodule now calls Atmosphere `UninstallMitm` on graceful exit so stop/start can release `sfdnsres` ownership instead of leaking the active MITM registration.
 - The control service now exposes a `RequestShutdown` command and the Switch manager maps it to `- stop sysmodule`, giving MITM builds a graceful stop path before restart.
 - The Switch MITM lab now includes a `bsd:u` query-only hook in the normal build. Hardware logs confirm Moonlight opens it with `selected=0`, does not crash or freeze, and graceful SWG stop uninstalls both `sfdnsres` and `bsd:u`.
-- The manual `bsd:u` adapter lab now replaces the old raw pass-through proxy. It handles `RegisterClient`, `StartMonitoring`, virtual `Socket`/`SocketExempt`, and `Close`, while unsupported commands return a BSD unsupported error instead of being blindly forwarded.
+- The manual `bsd:u` adapter lab now replaces the old raw pass-through proxy. It handles BSD bootstrap, virtual socket bookkeeping, IPv4 UDP `bind`/`connect`/`send`/`sendto`/`recv`/`recvfrom`, readiness through `poll`/`select`, common socket metadata calls, and clean unsupported-command errors instead of blindly forwarding.
+- The manual `bsd:u` adapter lab now keeps the `RegisterClient` transfer-memory handle alive until root BSD session close, matching libnx `socketExit()` cleanup expectations after a Moonlight close crash symbolicated into BSD transfer-memory teardown.
+- The manual `bsd:u` adapter lab now uses the route planner before UDP send/connect and proxies policy-approved local/multicast IPv4 UDP plus local IPv4 TCP through direct native BSD sockets. This is meant to unblock Moonlight LAN discovery/status checks without tunneling mDNS or requiring the VPN to be connected first.
 - The runtime config and IPC path now carry a dedicated `[integration_test]` section so on-device diagnostics can target a routed LAN test host independently from the WireGuard endpoint.
 - The integration component now builds a passive host-side harness server (`swg_integration_server`) with TCP echo, UDP echo, and plain HTTP probe listeners.
 - The Switch integration NRO now exposes a one-button `Y` path that ensures the tunnel and app session are ready, then runs DNS, session-socket, TCP stream, HTTP stream, and UDP datagram checks against the configured integration target.
@@ -80,8 +82,9 @@
 - Audit whether exact-payload transport helpers should adopt WireGuard's usual 16-byte inner-packet padding once all app-facing packet consumers carry parseable IPv4 payloads.
 - After rebooting once to clear any stale owner from older builds, stop the sysmodule with the manager `- stop sysmodule` action and confirm the next launch can own `sfdnsres` again without `0x815`.
 - Capture `mitm-observer` and `dns-mitm` log lines for Moonlight-Switch, especially the `program=0x...` value that identifies whether Moonlight is visible directly or through hbloader/a forwarder host title.
-- Test the manual `bsd:u` adapter lab on hardware only after deploying a clearly labeled lab build. Expected first failure is clean networking failure with `unsupported bsd:u adapter command`, not an app or console freeze.
-- Continue replacing specific `bsd:u` commands behind the adapter lab: UDP `sendto`/`recvfrom` and poll/select readiness first, then TCP `connect`/`send`/`recv`.
+- Test the manual `bsd:u` adapter lab on hardware only after deploying a clearly labeled lab build. Expected logs for LAN discovery/status include `opened direct native BSD socket` and `handled bsd:u Connect direct`; expected first failures are clean direct BSD errno responses, clean tunnel-datagram routing failures, or `unsupported bsd:u adapter command`, not an app or console freeze.
+- Re-run Moonlight-Switch host discovery/status with the guarded HIPC-buffer adapter build and confirm the previous `HandleGetSockName` data-abort no longer occurs. If networking still fails, collect the first `EFAULT`, direct BSD errno, or unsupported-command line after `opened direct native BSD socket`.
+- Continue replacing specific `bsd:u` commands behind the adapter lab: TCP `connect`/`send`/`recv` next, then broader socket options only when real app traces require them.
 - Verify telemetry hosts still resolve to loopback through SWG's replacement before treating it as a safe Atmosphere DNS MITM substitute.
 - Reuse the existing `ResolveDns()` and tunnel-DNS path for DNS MITM answers instead of building a second resolver stack.
 - Run the broadened reconnect paths on-device and confirm the same bounded recovery behavior under Horizon BSD.

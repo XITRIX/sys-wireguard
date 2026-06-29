@@ -4,12 +4,19 @@
 
 #include <switch.h>
 
-namespace swg::sysmodule {
+#include <memory>
+
+namespace swg {
+
+class IControlService;
+
+namespace sysmodule {
 
 bool IsExperimentalMitmObserverBuildEnabled();
-::Result StartExperimentalMitmObserverThread();
+::Result StartExperimentalMitmObserverThread(std::shared_ptr<IControlService> control_service = {});
 void ShutdownExperimentalMitmObserver();
 
-}  // namespace swg::sysmodule
+}  // namespace sysmodule
+}  // namespace swg
 
 #endif

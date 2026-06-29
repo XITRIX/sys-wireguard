@@ -122,7 +122,7 @@ The normal Switch debug preset now builds this activation path. A non-MITM build
 
 ### Stage 4
 
-- keep the normal `bsd:u` query lab fail-open, then replace individual socket commands in the manual adapter lab with tunnel-backed adapters
+- keep the normal `bsd:u` query lab fail-open, validate the manual UDP adapter lab on hardware, then add TCP command adapters
 
 ## Key constraints
 
@@ -135,5 +135,5 @@ The normal Switch debug preset now builds this activation path. A non-MITM build
 
 1. confirm telemetry hosts still resolve to loopback through the SWG replacement
 2. connect matched non-Atmosphere DNS policy to the current `ResolveDns()` and tunnel-DNS stats
-3. implement tunnel-backed UDP `bsd:u` adapters for `sendto`/`recvfrom` plus poll/select readiness in the manual adapter lab
+3. validate the tunnel-backed UDP `bsd:u` adapter lab on hardware and capture `opened tunnel UDP adapter` / `sent tunnel UDP datagram` / `received tunnel UDP datagram` traces
 4. add TCP `connect`/`send`/`recv` adapters after the UDP path has a clean hardware trace

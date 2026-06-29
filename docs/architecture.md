@@ -25,7 +25,7 @@ Current implementation boundaries:
 - Host execution is a first-class development mode so the control plane can be tested without device-only dependencies.
 - A dedicated host live-handshake probe now exists for Milestone 4 diagnosis so a real config can be exercised through the same local control service and tunnel engine path without deploying to hardware.
 - Experimental service MITM work is isolated from the stable control plane. The current Switch build actively owns `sfdnsres`, loads Atmosphere-compatible hosts/settings, redirects matching hosts, forwards unmatched resolver commands to the original service, and observes `bsd:u` service-open queries without selecting clients in the normal build.
-- The `bsd:u` path is not final transparent VPN routing yet; the normal build is query-only and the manual adapter lab handles only BSD bootstrap plus virtual socket bookkeeping before UDP/TCP command adapters are added.
+- The `bsd:u` path is not final transparent VPN routing yet; the normal build is query-only and the manual adapter lab now maps IPv4 UDP virtual sockets onto SWG tunnel datagram handles. TCP command adapters and broader socket options are still pending.
 - Firmware and service assumptions are isolated behind `swg/hos_caps.h` and documented separately.
 - App-facing routing decisions are exposed as a stable control-plane concern before transparent MITM exists.
 - Moonlight-Switch compatibility is treated as a concrete design constraint for the SDK surface.

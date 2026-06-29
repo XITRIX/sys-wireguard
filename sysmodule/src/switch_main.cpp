@@ -442,7 +442,7 @@ int main(int argc, char** argv) {
   WriteBootMarker("main: service created");
 
   if (swg::sysmodule::IsExperimentalMitmObserverBuildEnabled()) {
-    const ::Result observer_result = swg::sysmodule::StartExperimentalMitmObserverThread();
+    const ::Result observer_result = swg::sysmodule::StartExperimentalMitmObserverThread(service);
     if (R_FAILED(observer_result)) {
       swg::LogWarning("sysmodule", "failed to start experimental MITM observer: " +
                                        FormatLibnxResult(observer_result));
