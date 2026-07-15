@@ -356,7 +356,9 @@ void BsdSocketRuntime::Stop() {
   }
 
 #if defined(SWG_PLATFORM_SWITCH)
+  LogInfo("socket_runtime", "BSD runtime shutdown: bsdExit begin");
   bsdExit();
+  LogInfo("socket_runtime", "BSD runtime shutdown: bsdExit complete");
 #endif
 
   started_ = false;

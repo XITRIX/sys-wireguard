@@ -14,7 +14,7 @@ namespace sysmodule {
 
 bool IsExperimentalMitmObserverBuildEnabled();
 ::Result StartExperimentalMitmObserverThread(std::shared_ptr<IControlService> control_service = {});
-void ShutdownExperimentalMitmObserver();
+bool ShutdownExperimentalMitmObserver();
 
 }  // namespace sysmodule
 }  // namespace swg

@@ -59,6 +59,8 @@ namespace {
 constexpr std::size_t kObserverStackSize = 0x8000;
 constexpr std::size_t kQueryResponderStackSize = 0x8000;
 constexpr std::uint64_t kObserverRetryDelayNs = 1'000'000'000ULL;
+constexpr std::uint64_t kObserverWorkerPollNs = 100'000'000ULL;
+constexpr std::uint64_t kObserverShutdownWaitNs = 5'000'000'000ULL;
 constexpr std::uint64_t kQueryResponderReadyPollNs = 1'000'000ULL;
 constexpr std::uint32_t kQueryResponderReadyPolls = 3000;
 constexpr std::uint32_t kShouldMitmCommandId = 65000;
@@ -77,8 +79,14 @@ constexpr std::size_t kBsdMitmMaxHipcBufferBytes = 256 * 1024;
 constexpr std::uint32_t kBsdMitmDatagramBurstMaxDatagrams = 8;
 constexpr std::uint32_t kBsdMitmDatagramBurstMaxPayloadBytes = 32 * 1024;
 constexpr std::size_t kBsdMitmForwardedResponseSnapshotBytes = 0x100;
+constexpr std::uint32_t kBsdMitmMaxMMsgEntries = 32;
+constexpr std::uint32_t kBsdMitmMaxMMsgIovEntries = 1024;
+constexpr std::uint64_t kBsdMitmSlowForwardThresholdNs = 50'000'000ULL;
+constexpr std::int32_t kBsdMitmDirectWaitSliceMs = 1;
+constexpr std::uint16_t kBsdMitmRtspDiagnosticPort = 48010;
 constexpr std::int32_t kBsdMitmFirstVirtualFd = 4;
 constexpr std::int32_t kBsdMitmInvalidNativeFd = -1;
+constexpr std::int32_t kBsdMessageDontWait = 0x80;
 constexpr std::int32_t kBsdSocketCreateCloseOnExec = 0x10000000;
 constexpr std::int32_t kBsdSocketCreateNonBlock = 0x20000000;
 constexpr std::int32_t kBsdFcntlNxNonBlock = 0x800;
@@ -163,6 +171,7 @@ struct BsdMitmRemoteDatagram {
 
 enum class BsdMitmSocketBackend : std::uint8_t {
   Undecided = 0,
+  OriginalForwarded,
   DirectNative,
   TunnelDatagram,
 };
@@ -188,6 +197,7 @@ struct BsdMitmVirtualSocket {
   bool original_bsd_fd = false;
   bool bound = false;
   bool connected = false;
+  bool direct_receive_armed = false;
   sockaddr_storage local_address{};
   socklen_t local_address_length = 0;
   sockaddr_storage connected_remote_address{};
@@ -197,6 +207,8 @@ struct BsdMitmVirtualSocket {
   std::deque<BsdMitmPendingDatagram> pending_datagrams;
   std::uint64_t send_calls = 0;
   std::uint64_t recv_calls = 0;
+  std::uint64_t send_mmsg_calls = 0;
+  std::uint64_t recv_mmsg_calls = 0;
   std::uint64_t poll_calls = 0;
 };
 
@@ -223,6 +235,15 @@ struct BsdMitmClientSession {
   std::uint64_t request_count = 0;
   std::uint64_t handled_count = 0;
   std::uint64_t unsupported_count = 0;
+  std::uint64_t slow_forward_count = 0;
+  std::uint64_t max_forward_us = 0;
+  std::uint64_t last_forward_elapsed_us = 0;
+  bool last_forward_was_slow = false;
+  std::uint64_t wait_slice_count = 0;
+  std::uint64_t poll_timeout_count = 0;
+  std::uint64_t poll_error_count = 0;
+  std::uint64_t poll_ready_repair_count = 0;
+  std::uint64_t media_nonblocking_recv_count = 0;
 };
 
 struct BsdMitmServerContext {
@@ -250,6 +271,7 @@ struct ObserverRuntime {
   DnsMitmServerContext dns_context{};
   BsdMitmServerContext bsd_context{};
   std::array<ObservedService, 2> installed_services{};
+  std::atomic<bool> stop_requested{false};
   bool started = false;
   bool query_thread_started = false;
   bool dns_thread_started = false;
@@ -261,6 +283,14 @@ std::array<QueryCounters, 2> g_query_counters{};
 std::atomic<bool> g_query_responder_ready{false};
 std::atomic<std::uint64_t> g_query_wait_failures{0};
 std::atomic<std::uint64_t> g_query_invalid_signals{0};
+
+bool IsMitmShutdownRequested() {
+  return g_observer_runtime.stop_requested.load(std::memory_order_acquire);
+}
+
+#if !defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+bool WaitAndCloseMitmThread(Thread* thread, bool* started, const char* name);
+#endif
 
 ::Result FormatLibnxResult(::Result rc, char* output, std::size_t output_size) {
   if (output == nullptr || output_size == 0) {
@@ -717,6 +747,14 @@ HipcBufferView GetRecvBuffer(const HipcParsedRequest& request, std::size_t index
   return {hipcGetBufferAddress(&descriptor), hipcGetBufferSize(&descriptor)};
 }
 
+[[maybe_unused]] HipcBufferView GetExchangeBuffer(const HipcParsedRequest& request, std::size_t index) {
+  if (index >= request.meta.num_exch_buffers) {
+    return {};
+  }
+  const auto& descriptor = request.data.exch_buffers[index];
+  return {hipcGetBufferAddress(&descriptor), hipcGetBufferSize(&descriptor)};
+}
+
 HipcBufferView GetSendStatic(const HipcParsedRequest& request, std::size_t index) {
   if (index >= request.meta.num_send_statics) {
     return {};
@@ -1043,17 +1081,36 @@ class DnsMitmServer {
     sessions_.fill({});
   }
 
-  ::Result Initialize() {
-    return OpenAtmosphereSession(&sm_session_);
+  ~DnsMitmServer() {
+    Shutdown();
   }
 
-  [[noreturn]] void Run() {
-    while (true) {
+  ::Result Initialize() {
+    const ::Result rc = OpenAtmosphereSession(&sm_session_);
+    if (R_SUCCEEDED(rc)) {
+      sm_session_open_ = true;
+    }
+    return rc;
+  }
+
+  void Run() {
+    while (!IsMitmShutdownRequested()) {
       ProcessNext();
     }
+    Shutdown();
   }
 
  private:
+  void Shutdown() {
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+      CloseSession(index);
+    }
+    if (sm_session_open_) {
+      tipcClose(&sm_session_);
+      sm_session_open_ = false;
+    }
+  }
+
   void ProcessNext() {
     std::array<Handle, kDnsMitmMaxSessions + 1> handles{};
     handles[0] = context_->service.mitm_port;
@@ -1069,8 +1126,14 @@ class DnsMitmServer {
 
     s32 signaled_index = -1;
     const ::Result wait_result =
-        svcWaitSynchronization(&signaled_index, handles.data(), static_cast<s32>(handle_count), UINT64_MAX);
+        svcWaitSynchronization(&signaled_index, handles.data(), static_cast<s32>(handle_count), kObserverWorkerPollNs);
+    if (wait_result == KERNELRESULT(TimedOut)) {
+      return;
+    }
     if (R_FAILED(wait_result)) {
+      if (IsMitmShutdownRequested()) {
+        return;
+      }
       LogWarning("dns-mitm", "wait failed: " + FormatLibnxResult(wait_result));
       svcSleepThread(kObserverRetryDelayNs);
       return;
@@ -1091,7 +1154,14 @@ class DnsMitmServer {
     Handle client_session = INVALID_HANDLE;
     ::Result rc = svcAcceptSession(&client_session, context_->service.mitm_port);
     if (R_FAILED(rc)) {
+      if (IsMitmShutdownRequested()) {
+        return;
+      }
       LogWarning("dns-mitm", "failed to accept sfdnsres MITM session: " + FormatLibnxResult(rc));
+      return;
+    }
+    if (IsMitmShutdownRequested()) {
+      svcCloseHandle(client_session);
       return;
     }
 
@@ -1137,7 +1207,11 @@ class DnsMitmServer {
     DnsMitmClientSession& session = sessions_[index];
     s32 unused_index = -1;
     hipcMakeRequestInline(armGetTls());
-    ::Result rc = svcReplyAndReceive(&unused_index, &session.client_session, 1, INVALID_HANDLE, UINT64_MAX);
+    ::Result rc = svcReplyAndReceive(&unused_index, &session.client_session, 1, INVALID_HANDLE,
+                                     kObserverWorkerPollNs);
+    if (rc == KERNELRESULT(TimedOut)) {
+      return;
+    }
     if (R_FAILED(rc)) {
       CloseSession(index);
       return;
@@ -1176,6 +1250,7 @@ class DnsMitmServer {
 
   DnsMitmServerContext* context_ = nullptr;
   TipcService sm_session_{};
+  bool sm_session_open_ = false;
   std::array<DnsMitmClientSession, kDnsMitmMaxSessions> sessions_{};
 };
 
@@ -1235,6 +1310,12 @@ struct BsdFcntlIn {
   std::int32_t flags = 0;
 };
 
+struct BsdMMsgIn {
+  std::int32_t sockfd = 0;
+  std::uint32_t vlen = 0;
+  std::int32_t flags = 0;
+};
+
 struct BsdRetErrnoOut {
   std::int32_t ret = 0;
   std::int32_t errno_ = 0;
@@ -1245,7 +1326,66 @@ static_assert(sizeof(BsdSocketIn) == 0x0c);
 static_assert(sizeof(BsdSockFdIn) == 0x08);
 static_assert(sizeof(BsdPollIn) == 0x08);
 static_assert(sizeof(BsdFcntlIn) == 0x0c);
+static_assert(sizeof(BsdMMsgIn) == 0x0c);
 static_assert(sizeof(BsdRetErrnoOut) == 0x08);
+
+using BsdMitmTlsSnapshot =
+    std::array<std::uint8_t, kBsdMitmForwardedResponseSnapshotBytes>;
+
+BsdMitmTlsSnapshot CaptureCurrentBsdMitmTls() {
+  BsdMitmTlsSnapshot snapshot{};
+  std::memcpy(snapshot.data(), armGetTls(), snapshot.size());
+  return snapshot;
+}
+
+void RestoreCurrentBsdMitmTls(const BsdMitmTlsSnapshot& snapshot) {
+  std::memcpy(armGetTls(), snapshot.data(), snapshot.size());
+}
+
+std::optional<BsdRetErrnoOut> ParseCurrentBsdRetErrnoResponse() {
+  CmifResponse response{};
+  const ::Result parse_result =
+      cmifParseResponse(&response, armGetTls(), false, sizeof(BsdRetErrnoOut));
+  if (R_FAILED(parse_result) || response.data == nullptr) {
+    return std::nullopt;
+  }
+  return *static_cast<const BsdRetErrnoOut*>(response.data);
+}
+
+struct BsdCmifResponseInspection {
+  std::uint32_t data_words = 0;
+  std::uint32_t magic = 0;
+  bool header_in_bounds = false;
+  std::optional<::Result> result;
+};
+
+BsdCmifResponseInspection InspectCurrentCmifResponse() {
+  BsdCmifResponseInspection inspection{};
+  void* const tls = armGetTls();
+  const HipcResponse hipc = hipcParseResponse(tls);
+  inspection.data_words = hipc.num_data_words;
+  if (hipc.data_words == nullptr || hipc.num_data_words == 0) {
+    return inspection;
+  }
+
+  const std::uintptr_t words_begin = reinterpret_cast<std::uintptr_t>(hipc.data_words);
+  const std::uintptr_t words_end = words_begin +
+                                   static_cast<std::uintptr_t>(hipc.num_data_words) *
+                                       sizeof(std::uint32_t);
+  const auto* header = static_cast<const CmifOutHeader*>(
+      cmifGetAlignedDataStart(hipc.data_words, tls));
+  const std::uintptr_t header_address = reinterpret_cast<std::uintptr_t>(header);
+  if (header_address < words_begin || header_address > words_end ||
+      words_end - header_address < sizeof(CmifOutHeader)) {
+    return inspection;
+  }
+  inspection.header_in_bounds = true;
+  inspection.magic = header->magic;
+  if (header->magic == CMIF_OUT_HEADER_MAGIC) {
+    inspection.result = header->result;
+  }
+  return inspection;
+}
 
 const char* DescribeBsdCommand(std::uint32_t command_id) {
   switch (command_id) {
@@ -1328,6 +1468,11 @@ const T* GetCmifPayloadAs(const HipcParsedRequest& request) {
   return reinterpret_cast<const T*>(header + 1);
 }
 
+template <typename T>
+T* GetMutableCmifPayloadAs(const HipcParsedRequest& request) {
+  return const_cast<T*>(GetCmifPayloadAs<T>(request));
+}
+
 Handle GetFirstIncomingHandle(const HipcParsedRequest& request) {
   if (request.meta.num_copy_handles > 0) {
     return request.data.copy_handles[0];
@@ -1406,6 +1551,47 @@ std::optional<std::uint16_t> Ipv4SockaddrToPort(const sockaddr_storage& address,
   return ntohs(ipv4->sin_port);
 }
 
+std::string ClassifyRtspPayload(const HipcBufferView& payload, std::size_t actual_size) {
+  const std::size_t bounded_size = std::min(payload.size, actual_size);
+  if (payload.address == nullptr || bounded_size == 0) {
+    return "empty";
+  }
+
+  const auto* bytes = static_cast<const std::uint8_t*>(payload.address);
+  const auto starts_with = [bytes, bounded_size](const char* prefix) {
+    const std::size_t prefix_size = std::strlen(prefix);
+    return bounded_size >= prefix_size && std::memcmp(bytes, prefix, prefix_size) == 0;
+  };
+  static constexpr std::array<const char*, 9> kMethods = {
+      "OPTIONS ",
+      "DESCRIBE ",
+      "SETUP ",
+      "ANNOUNCE ",
+      "PLAY ",
+      "PAUSE ",
+      "TEARDOWN ",
+      "GET_PARAMETER ",
+      "SET_PARAMETER ",
+  };
+  for (const char* method : kMethods) {
+    if (starts_with(method)) {
+      std::string classification = "request-";
+      classification.append(method, std::strlen(method) - 1);
+      return classification;
+    }
+  }
+
+  if (bounded_size >= 12 && std::memcmp(bytes, "RTSP/1.0 ", 9) == 0 &&
+      std::isdigit(bytes[9]) && std::isdigit(bytes[10]) && std::isdigit(bytes[11])) {
+    std::string classification = "response-";
+    classification.push_back(static_cast<char>(bytes[9]));
+    classification.push_back(static_cast<char>(bytes[10]));
+    classification.push_back(static_cast<char>(bytes[11]));
+    return classification;
+  }
+  return "opaque";
+}
+
 std::uint32_t Ipv4SockaddrToHostOrder(const sockaddr_storage& address) {
   const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&address);
   return ntohl(ipv4->sin_addr.s_addr);
@@ -1427,6 +1613,14 @@ bool IsLocalBypassSockaddr(const sockaddr_storage& address, socklen_t length) {
   }
   const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&address);
   return ipv4->sin_family == AF_INET && IsLocalBypassIpv4Host(Ipv4SockaddrToHostOrder(address));
+}
+
+bool IsWildcardIpv4Sockaddr(const sockaddr_storage& address, socklen_t length) {
+  if (length < sizeof(sockaddr_in)) {
+    return false;
+  }
+  const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&address);
+  return ipv4->sin_family == AF_INET && ipv4->sin_addr.s_addr == htonl(INADDR_ANY);
 }
 
 AppTrafficClass GuessBsdTrafficClass(const sockaddr_storage& address,
@@ -1455,6 +1649,184 @@ bool SameSockaddr(const sockaddr_storage& lhs, socklen_t lhs_length,
   return lhs_ipv4->sin_family == AF_INET && rhs_ipv4->sin_family == AF_INET &&
          lhs_ipv4->sin_port == rhs_ipv4->sin_port &&
          lhs_ipv4->sin_addr.s_addr == rhs_ipv4->sin_addr.s_addr;
+}
+
+struct BsdMMsgDestinations {
+  std::array<sockaddr_storage, kBsdMitmMaxMMsgEntries> addresses{};
+  std::array<socklen_t, kBsdMitmMaxMMsgEntries> lengths{};
+  std::size_t count = 0;
+};
+
+struct BsdMMsgPackedBuffer {
+  HipcBufferView view{};
+  const char* source = "none";
+};
+
+BsdMMsgPackedBuffer SelectBsdMMsgPackedBuffer(const HipcParsedRequest& request) {
+  const HipcBufferView exchange = GetExchangeBuffer(request, 0);
+  if (exchange.address != nullptr && exchange.size != 0) {
+    return {exchange, "exchange-buffer"};
+  }
+
+  const HipcBufferView receive = GetRecvBuffer(request, 0);
+  if (receive.address != nullptr && receive.size != 0) {
+    return {receive, "receive-buffer"};
+  }
+
+  const HipcBufferView receive_static = GetRecvList(request, 0);
+  if (receive_static.address != nullptr && receive_static.size != 0) {
+    return {receive_static, "receive-static"};
+  }
+
+  const HipcBufferView send = GetSendBuffer(request, 0);
+  if (send.address != nullptr && send.size != 0) {
+    return {send, "send-buffer"};
+  }
+
+  const HipcBufferView send_static = GetSendStatic(request, 0);
+  if (send_static.address != nullptr && send_static.size != 0) {
+    return {send_static, "send-static"};
+  }
+  return {};
+}
+
+template <typename T>
+bool ReadBsdMMsgValue(const std::uint8_t* data,
+                      std::size_t size,
+                      std::size_t* offset,
+                      T* out) {
+  if (data == nullptr || offset == nullptr || out == nullptr ||
+      *offset > size || sizeof(T) > size - *offset) {
+    return false;
+  }
+  std::memcpy(out, data + *offset, sizeof(T));
+  *offset += sizeof(T);
+  return true;
+}
+
+bool SkipBsdMMsgBytes(std::size_t size, std::size_t* offset, std::uint64_t bytes) {
+  if (offset == nullptr || *offset > size || bytes > size - *offset) {
+    return false;
+  }
+  *offset += static_cast<std::size_t>(bytes);
+  return true;
+}
+
+bool AddBsdMMsgDestination(const sockaddr_storage& address,
+                           socklen_t length,
+                           BsdMMsgDestinations* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  for (std::size_t index = 0; index < out->count; ++index) {
+    if (SameSockaddr(out->addresses[index], out->lengths[index], address, length)) {
+      return true;
+    }
+  }
+  if (out->count >= out->addresses.size()) {
+    return false;
+  }
+  out->addresses[out->count] = address;
+  out->lengths[out->count] = length;
+  ++out->count;
+  return true;
+}
+
+bool ParseBsdSendMMsgDestinations(const BsdMMsgIn& input,
+                                  const BsdMitmVirtualSocket& socket,
+                                  const HipcBufferView& packed_buffer,
+                                  BsdMMsgDestinations* out,
+                                  const char** out_error) {
+  auto fail = [out_error](const char* reason) {
+    if (out_error != nullptr) {
+      *out_error = reason;
+    }
+    return false;
+  };
+
+  if (out == nullptr || input.vlen == 0 || input.vlen > kBsdMitmMaxMMsgEntries) {
+    return fail("invalid-vlen");
+  }
+  if (packed_buffer.size == 0 || packed_buffer.size > kBsdMitmMaxHipcBufferBytes ||
+      !IsLikelyHipcBuffer(packed_buffer, packed_buffer.size)) {
+    return fail("invalid-packed-buffer");
+  }
+
+  *out = {};
+  const auto* data = static_cast<const std::uint8_t*>(packed_buffer.address);
+  std::size_t offset = 0;
+  std::uint8_t serialized_word_size = 0;
+  if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &serialized_word_size) ||
+      serialized_word_size != sizeof(std::uint64_t)) {
+    return fail("unsupported-packed-format");
+  }
+
+  for (std::uint32_t message_index = 0; message_index < input.vlen; ++message_index) {
+    std::uint32_t name_length = 0;
+    if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &name_length)) {
+      return fail("truncated-name-length");
+    }
+
+    sockaddr_storage remote_address{};
+    socklen_t remote_address_length = 0;
+    if (name_length == 0) {
+      if (!socket.connected || socket.connected_remote_address_length == 0) {
+        return fail("missing-message-destination");
+      }
+      remote_address = socket.connected_remote_address;
+      remote_address_length = socket.connected_remote_address_length;
+    } else {
+      if (name_length < sizeof(sockaddr_in) || name_length > sizeof(sockaddr_storage) ||
+          offset > packed_buffer.size || name_length > packed_buffer.size - offset) {
+        return fail("invalid-message-destination");
+      }
+      std::memcpy(&remote_address, data + offset, name_length);
+      remote_address_length = static_cast<socklen_t>(name_length);
+      if (!Ipv4SockaddrToHost(remote_address, remote_address_length).has_value() ||
+          !Ipv4SockaddrToPort(remote_address, remote_address_length).has_value()) {
+        return fail("unsupported-message-destination");
+      }
+    }
+    if (!SkipBsdMMsgBytes(packed_buffer.size, &offset, name_length) ||
+        !AddBsdMMsgDestination(remote_address, remote_address_length, out)) {
+      return fail("message-destination-overflow");
+    }
+
+    std::uint32_t iov_count = 0;
+    if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &iov_count) ||
+        iov_count > kBsdMitmMaxMMsgIovEntries) {
+      return fail("invalid-iov-count");
+    }
+    for (std::uint32_t iov_index = 0; iov_index < iov_count; ++iov_index) {
+      std::uint64_t payload_length = 0;
+      if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &payload_length) ||
+          !SkipBsdMMsgBytes(packed_buffer.size, &offset, payload_length)) {
+        return fail("truncated-iov-payload");
+      }
+    }
+
+    std::uint32_t control_length = 0;
+    if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &control_length) ||
+        !SkipBsdMMsgBytes(packed_buffer.size, &offset, control_length)) {
+      return fail("truncated-control-data");
+    }
+    std::uint32_t message_flags = 0;
+    std::uint32_t message_length = 0;
+    if (!ReadBsdMMsgValue(data, packed_buffer.size, &offset, &message_flags) ||
+        !ReadBsdMMsgValue(data, packed_buffer.size, &offset, &message_length)) {
+      return fail("truncated-message-trailer");
+    }
+    (void)message_flags;
+    (void)message_length;
+  }
+
+  if (out->count == 0) {
+    return fail("empty-destination-set");
+  }
+  if (out_error != nullptr) {
+    *out_error = nullptr;
+  }
+  return true;
 }
 
 std::optional<sockaddr_storage> ReadSockaddrFromBuffer(const HipcBufferView& buffer, socklen_t* out_length) {
@@ -1634,16 +2006,14 @@ void CloseDirectNativeSocket(BsdMitmVirtualSocket& socket) {
   }
 }
 
-bool CloseVirtualBsdSocket(IControlService* control_service, BsdMitmClientSession& session, std::int32_t fd) {
+bool ReleaseVirtualBsdSocket(IControlService* control_service,
+                             BsdMitmClientSession& session,
+                             std::int32_t fd) {
   BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fd);
   if (socket == nullptr) {
     return false;
   }
 
-  if (socket->original_bsd_fd && session.forward_session != INVALID_HANDLE) {
-    BsdRetErrnoOut original_close{};
-    static_cast<void>(CloseOriginalBsdSocketFd(session.forward_session, socket->fd, &original_close));
-  }
   CloseTunnelDatagramsForSocket(control_service, *socket);
   CloseDirectNativeSocket(*socket);
   *socket = {};
@@ -1853,10 +2223,10 @@ void RefreshBsdSocketPendingDatagrams(IControlService* control_service, BsdMitmV
   }
 }
 
-bool StorePendingSocketOption(BsdMitmVirtualSocket& socket,
-                              std::int32_t level,
-                              std::int32_t optname,
-                              const HipcBufferView& value) {
+[[maybe_unused]] bool StorePendingSocketOption(BsdMitmVirtualSocket& socket,
+                                               std::int32_t level,
+                                               std::int32_t optname,
+                                               const HipcBufferView& value) {
   if (value.address == nullptr || value.size > kBsdMitmMaxPendingSocketOptionBytes ||
       !IsLikelyHipcBuffer(value, value.size)) {
     return false;
@@ -1965,29 +2335,111 @@ void FdSetInsert(const HipcBufferView& buffer, std::int32_t fd) {
 }
 }
 
+bool WaitAndCloseMitmThread(Thread* thread, bool* started, const char* name);
+
 class BsdMitmAdapterServer {
  public:
   explicit BsdMitmAdapterServer(BsdMitmServerContext* context) : context_(context) {
     sessions_.fill({});
   }
 
-  ::Result Initialize() {
-    return OpenAtmosphereSession(&sm_session_);
+  ~BsdMitmAdapterServer() {
+    Shutdown();
   }
 
-  [[noreturn]] void Run() {
-    while (true) {
+  ::Result Initialize() {
+    const ::Result rc = OpenAtmosphereSession(&sm_session_);
+    if (R_SUCCEEDED(rc)) {
+      sm_session_open_ = true;
+    }
+    return rc;
+  }
+
+  void Run() {
+    while (!IsMitmShutdownRequested()) {
       ProcessNext();
     }
+    Shutdown();
   }
 
  private:
+  void Shutdown() {
+    if (shutdown_complete_) {
+      return;
+    }
+    LogInfo("bsd-mitm", "adapter shutdown stage: begin");
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+      CloseSession(index);
+    }
+    LogInfo("bsd-mitm", "adapter shutdown stage: client sessions released");
+    if (direct_socket_runtime_.IsStarted()) {
+      LogWarning("bsd-mitm", "adapter shutdown stage: stopping legacy private BSD runtime");
+      direct_socket_runtime_.Stop();
+      LogInfo("bsd-mitm", "adapter shutdown stage: legacy private BSD runtime stopped");
+    }
+    if (sm_session_open_) {
+      tipcClose(&sm_session_);
+      sm_session_open_ = false;
+    }
+    shutdown_complete_ = true;
+    LogInfo("bsd-mitm", "adapter shutdown stage: complete");
+  }
+
+  bool ForwardOriginalRequest(BsdMitmClientSession& session,
+                              const BsdMitmVirtualSocket* socket,
+                              std::uint32_t token,
+                              const char* operation) {
+    session.last_forward_elapsed_us = 0;
+    session.last_forward_was_slow = false;
+    if (session.forward_session == INVALID_HANDLE ||
+        (socket != nullptr && !socket->original_bsd_fd)) {
+      ++session.handled_count;
+      LogWarning("bsd-mitm", std::string("cannot forward original bsd:u ") + operation +
+                                  ": pid=0x" + FormatHex(session.client_info.process_id, 16) +
+                                  " reason=missing-original-session-or-fd");
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
+      return false;
+    }
+
+    const std::uint64_t forward_started_tick = armGetSystemTick();
+    const ::Result forward_result = ForwardCurrentMitmRequest(session.forward_session);
+    const std::uint64_t forward_elapsed_ticks = armGetSystemTick() - forward_started_tick;
+    const std::uint64_t tick_frequency = armGetSystemTickFreq();
+    const std::uint64_t forward_elapsed_us =
+        tick_frequency != 0 ? (forward_elapsed_ticks * 1'000'000ULL) / tick_frequency : 0;
+    session.last_forward_elapsed_us = forward_elapsed_us;
+    session.max_forward_us = std::max(session.max_forward_us, forward_elapsed_us);
+    if (forward_elapsed_ticks >= armNsToTicks(kBsdMitmSlowForwardThresholdNs)) {
+      session.last_forward_was_slow = true;
+      ++session.slow_forward_count;
+      if (ShouldLogSparseCount(session.slow_forward_count)) {
+        LogWarning("bsd-mitm", std::string("slow original bsd:u forward: pid=0x") +
+                                    FormatHex(session.client_info.process_id, 16) +
+                                    " fd=" + std::to_string(socket != nullptr ? socket->fd : -1) +
+                                    " operation=" + operation +
+                                    " elapsed_us=" + std::to_string(forward_elapsed_us) +
+                                    " count=" + std::to_string(session.slow_forward_count));
+      }
+    }
+    ++session.handled_count;
+    if (R_FAILED(forward_result)) {
+      LogWarning("bsd-mitm", std::string("failed to forward original bsd:u ") + operation +
+                                  ": pid=0x" + FormatHex(session.client_info.process_id, 16) +
+                                  " rc=" + FormatLibnxResult(forward_result));
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoNetworkUnreachable);
+      return false;
+    }
+    return true;
+  }
+
   void ProcessNext() {
     std::array<Handle, kBsdMitmMaxSessions + 1> handles{};
     handles[0] = context_->service.mitm_port;
     std::size_t handle_count = 1;
     std::array<std::size_t, kBsdMitmMaxSessions> session_indices{};
-    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+    const std::size_t first_session_index = media_phase_enabled_ ? next_session_index_ : 0;
+    for (std::size_t offset = 0; offset < sessions_.size(); ++offset) {
+      const std::size_t index = (first_session_index + offset) % sessions_.size();
       if (sessions_[index].client_session != INVALID_HANDLE) {
         handles[handle_count] = sessions_[index].client_session;
         session_indices[handle_count - 1] = index;
@@ -1997,8 +2449,14 @@ class BsdMitmAdapterServer {
 
     s32 signaled_index = -1;
     const ::Result wait_result =
-        svcWaitSynchronization(&signaled_index, handles.data(), static_cast<s32>(handle_count), UINT64_MAX);
+        svcWaitSynchronization(&signaled_index, handles.data(), static_cast<s32>(handle_count), kObserverWorkerPollNs);
+    if (wait_result == KERNELRESULT(TimedOut)) {
+      return;
+    }
     if (R_FAILED(wait_result)) {
+      if (IsMitmShutdownRequested()) {
+        return;
+      }
       LogWarning("bsd-mitm", "wait failed: " + FormatLibnxResult(wait_result));
       svcSleepThread(kObserverRetryDelayNs);
       return;
@@ -2012,6 +2470,7 @@ class BsdMitmAdapterServer {
     }
 
     const std::size_t session_index = session_indices[static_cast<std::size_t>(signaled_index) - 1];
+    next_session_index_ = media_phase_enabled_ ? (session_index + 1) % sessions_.size() : 0;
     ProcessSession(session_index);
   }
 
@@ -2019,7 +2478,14 @@ class BsdMitmAdapterServer {
     Handle client_session = INVALID_HANDLE;
     ::Result rc = svcAcceptSession(&client_session, context_->service.mitm_port);
     if (R_FAILED(rc)) {
+      if (IsMitmShutdownRequested()) {
+        return;
+      }
       LogWarning("bsd-mitm", "failed to accept bsd:u MITM session: " + FormatLibnxResult(rc));
+      return;
+    }
+    if (IsMitmShutdownRequested()) {
+      svcCloseHandle(client_session);
       return;
     }
 
@@ -2066,6 +2532,15 @@ class BsdMitmAdapterServer {
     slot->request_count = 0;
     slot->handled_count = 0;
     slot->unsupported_count = 0;
+    slot->slow_forward_count = 0;
+    slot->max_forward_us = 0;
+    slot->last_forward_elapsed_us = 0;
+    slot->last_forward_was_slow = false;
+    slot->wait_slice_count = 0;
+    slot->poll_timeout_count = 0;
+    slot->poll_error_count = 0;
+    slot->poll_ready_repair_count = 0;
+    slot->media_nonblocking_recv_count = 0;
     slot->post_reply_log.clear();
     LogInfo("bsd-mitm", "accepted bsd:u adapter session: pid=0x" + FormatHex(info.process_id, 16) +
                             " program=0x" + FormatHex(info.program_id, 16) +
@@ -2107,13 +2582,30 @@ class BsdMitmAdapterServer {
                               " program=0x" + FormatHex(session.client_info.program_id, 16) +
                               " requests=" + std::to_string(session.request_count) +
                               " handled=" + std::to_string(session.handled_count) +
-                              " unsupported=" + std::to_string(session.unsupported_count));
+                              " unsupported=" + std::to_string(session.unsupported_count) +
+                              " slow_forwards=" + std::to_string(session.slow_forward_count) +
+                              " max_forward_us=" + std::to_string(session.max_forward_us) +
+                              " wait_slices=" + std::to_string(session.wait_slice_count) +
+                              " poll_timeouts=" + std::to_string(session.poll_timeout_count) +
+                              " poll_errors=" + std::to_string(session.poll_error_count) +
+                              " poll_ready_repairs=" +
+                              std::to_string(session.poll_ready_repair_count) +
+                              " media_nonblocking_recvs=" +
+                              std::to_string(session.media_nonblocking_recv_count));
       svcCloseHandle(session.client_session);
     }
     if (session.forward_session != INVALID_HANDLE) {
       svcCloseHandle(session.forward_session);
     }
     sessions_[index] = {};
+    const bool any_session_active = std::any_of(
+        sessions_.begin(), sessions_.end(), [](const BsdMitmClientSession& candidate) {
+          return candidate.client_session != INVALID_HANDLE;
+        });
+    if (!any_session_active) {
+      media_phase_enabled_ = false;
+      next_session_index_ = 0;
+    }
   }
 
   bool AddClonedSession(const BsdMitmClientSession& parent, Handle server_session, Handle forward_session) {
@@ -2136,6 +2628,15 @@ class BsdMitmAdapterServer {
     slot->request_count = 0;
     slot->handled_count = 0;
     slot->unsupported_count = 0;
+    slot->slow_forward_count = 0;
+    slot->max_forward_us = 0;
+    slot->last_forward_elapsed_us = 0;
+    slot->last_forward_was_slow = false;
+    slot->wait_slice_count = 0;
+    slot->poll_timeout_count = 0;
+    slot->poll_error_count = 0;
+    slot->poll_ready_repair_count = 0;
+    slot->media_nonblocking_recv_count = 0;
     slot->post_reply_log.clear();
     return true;
   }
@@ -2471,20 +2972,31 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    socket->local_address = *address;
-    socket->local_address_length = address_length;
-    socket->bound = true;
-    if (socket->native_fd != kBsdMitmInvalidNativeFd &&
-        bsdBind(socket->native_fd, reinterpret_cast<const sockaddr*>(&socket->local_address),
-                socket->local_address_length) < 0) {
-      PrepareBsdRetErrnoResponse(token, -1, CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument));
+    if (!ForwardOriginalRequest(session, socket, token, "Bind")) {
       return true;
     }
-    ++session.handled_count;
-    LogInfo("bsd-mitm", "handled bsd:u Bind: pid=0x" +
-                            FormatHex(session.client_info.process_id, 16) +
-                            " fd=" + std::to_string(socket->fd));
-    PrepareBsdRetErrnoResponse(token, 0, 0);
+
+    const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+    if (forwarded.has_value() && forwarded->ret >= 0) {
+      socket->local_address = *address;
+      socket->local_address_length = address_length;
+      socket->bound = true;
+      if (IsBsdDatagramSocket(*socket) &&
+          (IsWildcardIpv4Sockaddr(*address, address_length) ||
+           IsLocalBypassSockaddr(*address, address_length))) {
+        socket->direct_receive_armed = true;
+      }
+    }
+    const std::optional<std::string> local_host = Ipv4SockaddrToHost(*address, address_length);
+    const std::optional<std::uint16_t> local_port = Ipv4SockaddrToPort(*address, address_length);
+    session.post_reply_log = "forwarded bsd:u Bind to original service: pid=0x" +
+                             FormatHex(session.client_info.process_id, 16) +
+                             " fd=" + std::to_string(socket->fd) +
+                             " local=" + local_host.value_or("?") +
+                             ":" + std::to_string(local_port.value_or(0)) +
+                             " direct_receive=" + (socket->direct_receive_armed ? "armed" : "off") +
+                             " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                             " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0);
     return true;
   }
 
@@ -2512,6 +3024,7 @@ class BsdMitmAdapterServer {
       return true;
     }
 
+    const BsdMitmTlsSnapshot request_snapshot = CaptureCurrentBsdMitmTls();
     const Result<NetworkPlan> plan =
         PlanBsdRoute(session, *address, address_length, stream_socket ? TransportProtocol::Tcp : TransportProtocol::Udp);
     if (!plan.ok()) {
@@ -2519,41 +3032,33 @@ class BsdMitmAdapterServer {
       return true;
     }
     if (plan.value.action == RouteAction::Direct) {
-      if (!EnsureDirectNativeSocket(session, *socket, token)) {
-        return true;
-      }
-      const int ret = bsdConnect(socket->native_fd, reinterpret_cast<const sockaddr*>(&*address), address_length);
-      const std::int32_t errno_value = CurrentBsdErrnoOr(EINPROGRESS);
-      if (ret == 0 || IsNonBlockingConnectProgress(errno_value)) {
-        socket->connected_remote_address = *address;
-        socket->connected_remote_address_length = address_length;
-        socket->connected = true;
-        ++session.handled_count;
-        const std::optional<std::string> remote_host = Ipv4SockaddrToHost(*address, address_length);
-        const std::optional<std::uint16_t> remote_port = Ipv4SockaddrToPort(*address, address_length);
-        LogInfo("bsd-mitm", std::string("handled bsd:u Connect direct ") +
-                                (stream_socket ? "TCP" : "UDP") +
-                                ": pid=0x" + FormatHex(session.client_info.process_id, 16) +
-                                " fd=" + std::to_string(socket->fd) +
-                                " target=" + remote_host.value_or("?") +
-                                ":" + std::to_string(remote_port.value_or(0)) +
-                                " ret=" + std::to_string(ret) +
-                                " errno=" + std::to_string(ret < 0 ? errno_value : 0));
-        PrepareBsdRetErrnoResponse(token, ret, ret < 0 ? errno_value : 0);
+      RestoreCurrentBsdMitmTls(request_snapshot);
+      if (!ForwardOriginalRequest(session, socket, token, "Connect")) {
         return true;
       }
 
+      const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+      const bool connected_or_pending =
+          forwarded.has_value() &&
+          (forwarded->ret == 0 ||
+           (forwarded->ret < 0 && IsNonBlockingConnectProgress(forwarded->errno_)));
+      if (connected_or_pending) {
+        socket->connected_remote_address = *address;
+        socket->connected_remote_address_length = address_length;
+        socket->connected = true;
+        socket->backend = BsdMitmSocketBackend::OriginalForwarded;
+      }
       const std::optional<std::string> remote_host = Ipv4SockaddrToHost(*address, address_length);
       const std::optional<std::uint16_t> remote_port = Ipv4SockaddrToPort(*address, address_length);
-      LogWarning("bsd-mitm", std::string("failed bsd:u Connect direct ") +
-                                    (stream_socket ? "TCP" : "UDP") +
-                                    ": pid=0x" + FormatHex(session.client_info.process_id, 16) +
-                                    " fd=" + std::to_string(socket->fd) +
-                                    " target=" + remote_host.value_or("?") +
-                                    ":" + std::to_string(remote_port.value_or(0)) +
-                                    " ret=" + std::to_string(ret) +
-                                    " errno=" + std::to_string(errno_value));
-      PrepareBsdRetErrnoResponse(token, -1, errno_value);
+      session.post_reply_log = std::string("forwarded bsd:u Connect direct ") +
+                               (stream_socket ? "TCP" : "UDP") +
+                               " to original service: pid=0x" +
+                               FormatHex(session.client_info.process_id, 16) +
+                               " fd=" + std::to_string(socket->fd) +
+                               " target=" + remote_host.value_or("?") +
+                               ":" + std::to_string(remote_port.value_or(0)) +
+                               " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                               " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0);
       return true;
     }
     if (plan.value.action != RouteAction::Tunnel) {
@@ -2621,18 +3126,34 @@ class BsdMitmAdapterServer {
     }
 
     const HipcBufferView payload = GetAutoSendBuffer(request, 0);
-    if (socket->backend == BsdMitmSocketBackend::DirectNative || stream_socket) {
-      if (stream_socket && socket->backend != BsdMitmSocketBackend::DirectNative) {
+    if (stream_socket) {
+      if (socket->backend != BsdMitmSocketBackend::OriginalForwarded) {
         PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoNotConnected);
         return true;
       }
-      return HandleDirectSend(session, *socket, payload,
-                              has_explicit_remote ? &remote_address : nullptr,
-                              remote_address_length,
-                              input->flags,
-                              token);
+      const std::optional<std::uint16_t> remote_port =
+          Ipv4SockaddrToPort(remote_address, remote_address_length);
+      const std::string protocol = remote_port == kBsdMitmRtspDiagnosticPort
+                                       ? ClassifyRtspPayload(payload, payload.size)
+                                       : "unclassified";
+      if (ForwardOriginalRequest(session, socket, token, has_explicit_remote ? "SendTo" : "Send")) {
+        ++socket->send_calls;
+        if (ShouldLogSparseCount(socket->send_calls)) {
+          const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+          session.post_reply_log = "forwarded TCP payload to original bsd:u: pid=0x" +
+                                   FormatHex(session.client_info.process_id, 16) +
+                                   " fd=" + std::to_string(socket->fd) +
+                                   " requested_bytes=" + std::to_string(payload.size) +
+                                   " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                                   " remote_port=" + std::to_string(remote_port.value_or(0)) +
+                                   " protocol=" + protocol +
+                                   " count=" + std::to_string(socket->send_calls);
+        }
+      }
+      return true;
     }
 
+    const BsdMitmTlsSnapshot request_snapshot = CaptureCurrentBsdMitmTls();
     const Result<NetworkPlan> plan =
         PlanBsdRoute(session, remote_address, remote_address_length, TransportProtocol::Udp);
     if (!plan.ok()) {
@@ -2640,17 +3161,30 @@ class BsdMitmAdapterServer {
       return true;
     }
     if (plan.value.action == RouteAction::Direct) {
-      return HandleDirectSend(session, *socket, payload,
-                              has_explicit_remote ? &remote_address : nullptr,
-                              remote_address_length,
-                              input->flags,
-                              token);
+      RestoreCurrentBsdMitmTls(request_snapshot);
+      if (ForwardOriginalRequest(session, socket, token, has_explicit_remote ? "SendTo" : "Send")) {
+        socket->backend = BsdMitmSocketBackend::OriginalForwarded;
+        ++socket->send_calls;
+        if (ShouldLogSparseCount(socket->send_calls)) {
+          const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+          session.post_reply_log = "forwarded direct UDP payload to original bsd:u: pid=0x" +
+                                   FormatHex(session.client_info.process_id, 16) +
+                                   " fd=" + std::to_string(socket->fd) +
+                                   " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                                   " count=" + std::to_string(socket->send_calls);
+        }
+      }
+      return true;
     }
     if (plan.value.action != RouteAction::Tunnel) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoNetworkUnreachable);
       return true;
     }
 
+    if (socket->native_fd != kBsdMitmInvalidNativeFd && socket->direct_receive_armed) {
+      CloseDirectNativeSocket(*socket);
+      socket->direct_receive_armed = false;
+    }
     socket->backend = BsdMitmSocketBackend::TunnelDatagram;
     const Result<std::uint64_t> sent =
         SendBsdTunnelDatagram(context_, session, *socket, remote_address, remote_address_length, payload);
@@ -2668,8 +3202,13 @@ class BsdMitmAdapterServer {
                           const HipcParsedRequest& request,
                           std::uint32_t token,
                           bool include_remote_address) {
-    const BsdSockFdIn* input = GetCmifPayloadAs<BsdSockFdIn>(request);
-    BsdMitmVirtualSocket* socket = input != nullptr ? FindVirtualSocket(session, input->sockfd) : nullptr;
+    const BsdSockFdIn* input_ptr = GetCmifPayloadAs<BsdSockFdIn>(request);
+    if (input_ptr == nullptr) {
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+      return true;
+    }
+    const BsdSockFdIn input = *input_ptr;
+    BsdMitmVirtualSocket* socket = FindVirtualSocket(session, input.sockfd);
     if (socket == nullptr) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
       return true;
@@ -2681,17 +3220,72 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    if (socket->backend == BsdMitmSocketBackend::DirectNative || stream_socket) {
-      if (stream_socket && socket->backend != BsdMitmSocketBackend::DirectNative) {
+    if (stream_socket || socket->backend == BsdMitmSocketBackend::OriginalForwarded ||
+        socket->direct_receive_armed) {
+      if (stream_socket && socket->backend != BsdMitmSocketBackend::OriginalForwarded) {
         PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoNotConnected);
         return true;
       }
-      return HandleDirectRecv(session, *socket,
-                              GetAutoRecvBuffer(request, 0),
-                              GetAutoRecvBuffer(request, 1),
-                              include_remote_address,
-                              input->flags,
-                              token);
+      const std::int32_t original_flags = input.flags;
+      std::int32_t forwarded_flags = original_flags;
+      bool media_forced_nonblocking = false;
+      if (media_phase_enabled_ && datagram_socket &&
+          (original_flags & kBsdMessageDontWait) == 0) {
+        BsdSockFdIn* forward_input = GetMutableCmifPayloadAs<BsdSockFdIn>(request);
+        if (forward_input == nullptr) {
+          PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+          return true;
+        }
+        forward_input->flags |= kBsdMessageDontWait;
+        forwarded_flags = forward_input->flags;
+        media_forced_nonblocking = true;
+        ++session.media_nonblocking_recv_count;
+      }
+      const HipcBufferView payload_output = GetAutoRecvBuffer(request, 0);
+      const HipcBufferView remote_output =
+          include_remote_address ? GetAutoRecvBuffer(request, 1) : HipcBufferView{};
+      if (ForwardOriginalRequest(session, socket, token,
+                                 include_remote_address ? "RecvFrom" : "Recv")) {
+        ++socket->recv_calls;
+        if (ShouldLogSparseCount(socket->recv_calls)) {
+          const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+          const std::optional<std::uint16_t> remote_port = Ipv4SockaddrToPort(
+              socket->connected_remote_address, socket->connected_remote_address_length);
+          const std::size_t received_size =
+              forwarded.has_value() && forwarded->ret > 0
+                  ? static_cast<std::size_t>(forwarded->ret)
+                  : 0;
+          std::optional<std::uint16_t> source_port;
+          if (include_remote_address && received_size != 0) {
+            socklen_t source_address_length = 0;
+            const std::optional<sockaddr_storage> source_address =
+                ReadSockaddrFromBuffer(remote_output, &source_address_length);
+            if (source_address.has_value()) {
+              source_port = Ipv4SockaddrToPort(*source_address, source_address_length);
+            }
+          }
+          const std::string protocol = remote_port == kBsdMitmRtspDiagnosticPort
+                                           ? ClassifyRtspPayload(payload_output, received_size)
+                                           : "unclassified";
+          session.post_reply_log = "forwarded receive to original bsd:u: pid=0x" +
+                                   FormatHex(session.client_info.process_id, 16) +
+                                   " fd=" + std::to_string(socket->fd) +
+                                   " requested_bytes=" + std::to_string(payload_output.size) +
+                                   " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                                   " remote_port=" + std::to_string(remote_port.value_or(0)) +
+                                   " source_port=" + std::to_string(source_port.value_or(0)) +
+                                   " protocol=" + protocol +
+                                   " original_flags=" + std::to_string(original_flags) +
+                                   " forwarded_flags=" + std::to_string(forwarded_flags) +
+                                   " media_forced_nonblocking=" +
+                                   (media_forced_nonblocking ? std::string("true")
+                                                              : std::string("false")) +
+                                   " media_nonblocking_recv_count=" +
+                                   std::to_string(session.media_nonblocking_recv_count) +
+                                   " count=" + std::to_string(socket->recv_calls);
+        }
+      }
+      return true;
     }
 
     RefreshBsdSocketPendingDatagrams(context_ != nullptr ? context_->control_service.get() : nullptr, *socket);
@@ -2750,15 +3344,16 @@ class BsdMitmAdapterServer {
   }
 
   bool HandlePoll(BsdMitmClientSession& session, const HipcParsedRequest& request, std::uint32_t token) {
-    const BsdPollIn* input = GetCmifPayloadAs<BsdPollIn>(request);
-    if (input == nullptr) {
+    const BsdPollIn* input_ptr = GetCmifPayloadAs<BsdPollIn>(request);
+    if (input_ptr == nullptr) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
       return true;
     }
+    const BsdPollIn input = *input_ptr;
 
     const HipcBufferView input_buffer = GetAutoSendBuffer(request, 0);
     const HipcBufferView output_buffer = GetAutoRecvBuffer(request, 0);
-    const std::size_t fds_size = static_cast<std::size_t>(input->nfds) * sizeof(pollfd);
+    const std::size_t fds_size = static_cast<std::size_t>(input.nfds) * sizeof(pollfd);
     if (input_buffer.address == nullptr || output_buffer.address == nullptr ||
         input_buffer.size < fds_size || output_buffer.size < fds_size) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
@@ -2770,92 +3365,292 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    std::vector<pollfd> fds(input->nfds);
+    std::vector<pollfd> fds(input.nfds);
     if (!fds.empty() && !CopyFromHipcBuffer(fds.data(), input_buffer, fds_size)) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
       return true;
     }
-    for (nfds_t index = 0; index < input->nfds; ++index) {
-      fds[index].revents = 0;
-      BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fds[index].fd);
-      if (socket == nullptr) {
-        fds[index].revents = POLLNVAL;
-        continue;
-      }
-      ++socket->poll_calls;
-      if (socket->backend == BsdMitmSocketBackend::DirectNative) {
-        fds[index].revents = PollDirectNativeSocket(*socket, fds[index].events);
-        continue;
-      }
-      if ((fds[index].events & POLLIN) != 0 &&
-          IsBsdSocketReadable(context_ != nullptr ? context_->control_service.get() : nullptr, *socket)) {
-        fds[index].revents |= POLLIN;
-      }
-      if ((fds[index].events & POLLOUT) != 0 && IsBsdSocketWritable(*socket)) {
-        fds[index].revents |= POLLOUT;
+    bool contains_tunnel_socket = false;
+    for (pollfd& entry : fds) {
+      if (BsdMitmVirtualSocket* socket = FindVirtualSocket(session, entry.fd)) {
+        ++socket->poll_calls;
+        contains_tunnel_socket = contains_tunnel_socket ||
+                                 socket->backend == BsdMitmSocketBackend::TunnelDatagram;
       }
     }
+
+    if (!contains_tunnel_socket) {
+      const bool sliced_wait = media_phase_enabled_ &&
+                               (input.timeout < 0 || input.timeout > kBsdMitmDirectWaitSliceMs);
+      BsdPollIn* forward_input = GetMutableCmifPayloadAs<BsdPollIn>(request);
+      if (forward_input == nullptr) {
+        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+        return true;
+      }
+      if (sliced_wait) {
+        forward_input->timeout = kBsdMitmDirectWaitSliceMs;
+      }
+      if (ForwardOriginalRequest(session, nullptr, token, "Poll")) {
+        const BsdCmifResponseInspection cmif_inspection = InspectCurrentCmifResponse();
+        std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+        std::vector<pollfd> result_fds(input.nfds);
+        const bool have_result_fds = result_fds.empty() ||
+                                     CopyFromHipcBuffer(result_fds.data(), output_buffer, fds_size);
+        const std::int32_t input_ready_count = CountPollReady(fds.data(), input.nfds);
+        const std::int32_t descriptor_ready_count =
+            have_result_fds ? CountPollReady(result_fds.data(), input.nfds) : 0;
+        const bool repaired_ready_result =
+            !forwarded.has_value() && have_result_fds && input_ready_count == 0 &&
+            descriptor_ready_count > 0;
+        if (repaired_ready_result) {
+          PrepareBsdRetErrnoResponse(token, descriptor_ready_count, 0);
+          forwarded = BsdRetErrnoOut{descriptor_ready_count, 0};
+          ++session.poll_ready_repair_count;
+        }
+        if (forwarded.has_value() && forwarded->ret == 0) {
+          ++session.poll_timeout_count;
+        } else if (forwarded.has_value() && forwarded->ret < 0) {
+          ++session.poll_error_count;
+        }
+        if (sliced_wait) {
+          ++session.wait_slice_count;
+        }
+        const bool trace_poll_outcome =
+            ShouldTraceBsdRequest(session.request_count) || session.last_forward_was_slow ||
+            repaired_ready_result ||
+            (forwarded.has_value() && forwarded->ret == 0 &&
+             ShouldLogSparseCount(session.poll_timeout_count)) ||
+            (forwarded.has_value() && forwarded->ret < 0 &&
+             ShouldLogSparseCount(session.poll_error_count));
+        if (trace_poll_outcome ||
+            (sliced_wait && ShouldLogSparseCount(session.wait_slice_count))) {
+          session.post_reply_log = "forwarded bsd:u Poll to original service: pid=0x" +
+                                   FormatHex(session.client_info.process_id, 16) +
+                                   " nfds=" + std::to_string(input.nfds) +
+                                   " requested_timeout_ms=" + std::to_string(input.timeout) +
+                                   " forwarded_timeout_ms=" +
+                                   std::to_string(sliced_wait ? kBsdMitmDirectWaitSliceMs : input.timeout) +
+                                   " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                                   " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0) +
+                                   " original_cmif_result=" +
+                                   (cmif_inspection.result.has_value()
+                                        ? FormatLibnxResult(*cmif_inspection.result)
+                                        : std::string("unparsed")) +
+                                   " response_data_words=" +
+                                   std::to_string(cmif_inspection.data_words) +
+                                   " response_header_in_bounds=" +
+                                   (cmif_inspection.header_in_bounds ? std::string("true")
+                                                                     : std::string("false")) +
+                                   " response_magic=0x" +
+                                   FormatHex(cmif_inspection.magic, 8) +
+                                   " elapsed_us=" + std::to_string(session.last_forward_elapsed_us) +
+                                   " first_fd=" +
+                                   std::to_string(!fds.empty() ? fds.front().fd : -1) +
+                                   " events=" +
+                                   std::to_string(!fds.empty() ? fds.front().events : 0) +
+                                   " input_revents=" +
+                                   std::to_string(!fds.empty() ? fds.front().revents : 0) +
+                                   " revents=" +
+                                   std::to_string(have_result_fds && !result_fds.empty()
+                                                      ? result_fds.front().revents
+                                                      : 0) +
+                                   " input_ready_count=" +
+                                   std::to_string(input_ready_count) +
+                                   " descriptor_ready_count=" +
+                                   std::to_string(descriptor_ready_count) +
+                                   " ready_result_repaired=" +
+                                   (repaired_ready_result ? std::string("true") : std::string("false")) +
+                                   " wait_slice_count=" + std::to_string(session.wait_slice_count) +
+                                   " poll_timeout_count=" + std::to_string(session.poll_timeout_count) +
+                                   " poll_error_count=" + std::to_string(session.poll_error_count) +
+                                   " poll_ready_repair_count=" +
+                                   std::to_string(session.poll_ready_repair_count);
+        }
+      }
+      return true;
+    }
+
+    const auto poll_started = std::chrono::steady_clock::now();
+    std::int32_t ready = 0;
+    do {
+      for (nfds_t index = 0; index < input.nfds; ++index) {
+        fds[index].revents = 0;
+        BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fds[index].fd);
+        if (socket == nullptr) {
+          fds[index].revents = POLLNVAL;
+          continue;
+        }
+        if (socket->backend == BsdMitmSocketBackend::DirectNative ||
+            socket->native_fd != kBsdMitmInvalidNativeFd) {
+          fds[index].revents = PollDirectNativeSocket(*socket, fds[index].events);
+          continue;
+        }
+        if ((fds[index].events & POLLIN) != 0 &&
+            IsBsdSocketReadable(context_ != nullptr ? context_->control_service.get() : nullptr, *socket)) {
+          fds[index].revents |= POLLIN;
+        }
+        if ((fds[index].events & POLLOUT) != 0 && IsBsdSocketWritable(*socket)) {
+          fds[index].revents |= POLLOUT;
+        }
+      }
+      ready = CountPollReady(fds.data(), input.nfds);
+      if (ready != 0 || input.timeout == 0 || IsMitmShutdownRequested()) {
+        break;
+      }
+      if (input.timeout > 0) {
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - poll_started)
+                                    .count();
+        if (elapsed_ms >= input.timeout) {
+          break;
+        }
+      }
+      svcSleepThread(1'000'000ULL);
+    } while (true);
 
     if (!CopyToHipcBuffer(output_buffer, fds.data(), fds_size)) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
       return true;
     }
     ++session.handled_count;
-    PrepareBsdRetErrnoResponse(token, CountPollReady(fds.data(), input->nfds), 0);
+    PrepareBsdRetErrnoResponse(token, ready, 0);
     return true;
   }
 
   bool HandleSelect(BsdMitmClientSession& session, const HipcParsedRequest& request, std::uint32_t token) {
-    const BsdSelectIn* input = GetCmifPayloadAs<BsdSelectIn>(request);
-    if (input == nullptr || input->nfds < 0 || input->nfds > FD_SETSIZE) {
+    const BsdSelectIn* input_ptr = GetCmifPayloadAs<BsdSelectIn>(request);
+    if (input_ptr == nullptr || input_ptr->nfds < 0 || input_ptr->nfds > FD_SETSIZE) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
       return true;
     }
+    const BsdSelectIn input = *input_ptr;
 
     const HipcBufferView read_input = GetAutoSendBuffer(request, 0);
     const HipcBufferView write_input = GetAutoSendBuffer(request, 1);
     const HipcBufferView read_output = GetAutoRecvBuffer(request, 0);
     const HipcBufferView write_output = GetAutoRecvBuffer(request, 1);
     const HipcBufferView except_output = GetAutoRecvBuffer(request, 2);
-    ClearFdSetBuffer(read_output);
-    ClearFdSetBuffer(write_output);
-    ClearFdSetBuffer(except_output);
 
-    std::int32_t ready = 0;
-    for (std::int32_t fd = 0; fd < input->nfds; ++fd) {
-      BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fd);
-      if (socket == nullptr) {
-        continue;
-      }
-      if (socket->backend == BsdMitmSocketBackend::DirectNative) {
-        std::int16_t events = 0;
-        if (FdSetContains(read_input, fd)) {
-          events |= POLLIN;
+    bool contains_tunnel_socket = false;
+    for (std::int32_t fd = 0; fd < input.nfds; ++fd) {
+      if (BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fd)) {
+        if ((FdSetContains(read_input, fd) || FdSetContains(write_input, fd)) &&
+            socket->backend == BsdMitmSocketBackend::TunnelDatagram) {
+          contains_tunnel_socket = true;
+          break;
         }
-        if (FdSetContains(write_input, fd)) {
-          events |= POLLOUT;
-        }
-        const std::int32_t revents = PollDirectNativeSocket(*socket, events);
-        if ((revents & (POLLIN | POLLERR | POLLHUP)) != 0 && FdSetContains(read_input, fd)) {
-          FdSetInsert(read_output, fd);
-          ++ready;
-        }
-        if ((revents & (POLLOUT | POLLERR | POLLHUP)) != 0 && FdSetContains(write_input, fd)) {
-          FdSetInsert(write_output, fd);
-          ++ready;
-        }
-        continue;
-      }
-      if (FdSetContains(read_input, fd) &&
-          IsBsdSocketReadable(context_ != nullptr ? context_->control_service.get() : nullptr, *socket)) {
-        FdSetInsert(read_output, fd);
-        ++ready;
-      }
-      if (FdSetContains(write_input, fd) && IsBsdSocketWritable(*socket)) {
-        FdSetInsert(write_output, fd);
-        ++ready;
       }
     }
+    if (!contains_tunnel_socket) {
+      const std::int64_t requested_timeout_us =
+          input.timeout.is_null
+              ? -1
+              : std::max<std::int64_t>(
+                    0,
+                    static_cast<std::int64_t>(input.timeout.tv.tv_sec) * 1'000'000LL +
+                        input.timeout.tv.tv_usec);
+      const std::int64_t wait_slice_us =
+          static_cast<std::int64_t>(kBsdMitmDirectWaitSliceMs) * 1'000LL;
+      const bool sliced_wait = media_phase_enabled_ &&
+                               (requested_timeout_us < 0 || requested_timeout_us > wait_slice_us);
+      BsdSelectIn* forward_input = GetMutableCmifPayloadAs<BsdSelectIn>(request);
+      if (forward_input == nullptr) {
+        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+        return true;
+      }
+      if (sliced_wait) {
+        forward_input->timeout.is_null = false;
+        forward_input->timeout.tv.tv_sec = 0;
+        forward_input->timeout.tv.tv_usec = wait_slice_us;
+      }
+      if (ForwardOriginalRequest(session, nullptr, token, "Select")) {
+        const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+        if (sliced_wait) {
+          ++session.wait_slice_count;
+        }
+        if (ShouldTraceBsdRequest(session.request_count) ||
+            (sliced_wait && ShouldLogSparseCount(session.wait_slice_count))) {
+          session.post_reply_log = "forwarded bsd:u Select to original service: pid=0x" +
+                                   FormatHex(session.client_info.process_id, 16) +
+                                   " nfds=" + std::to_string(input.nfds) +
+                                   " requested_timeout_us=" +
+                                   (requested_timeout_us < 0 ? std::string("infinite")
+                                                             : std::to_string(requested_timeout_us)) +
+                                   " forwarded_timeout_us=" +
+                                   std::to_string(sliced_wait ? wait_slice_us : requested_timeout_us) +
+                                   " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                                   " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0) +
+                                   " wait_slice_count=" + std::to_string(session.wait_slice_count);
+        }
+      }
+      return true;
+    }
+
+    const auto select_started = std::chrono::steady_clock::now();
+    const std::int64_t timeout_us = input.timeout.is_null
+                                        ? -1
+                                        : std::max<std::int64_t>(
+                                              0,
+                                              static_cast<std::int64_t>(input.timeout.tv.tv_sec) * 1'000'000LL +
+                                                  input.timeout.tv.tv_usec);
+    std::int32_t ready = 0;
+    do {
+      ClearFdSetBuffer(read_output);
+      ClearFdSetBuffer(write_output);
+      ClearFdSetBuffer(except_output);
+
+      ready = 0;
+      for (std::int32_t fd = 0; fd < input.nfds; ++fd) {
+        BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fd);
+        if (socket == nullptr) {
+          continue;
+        }
+        bool fd_ready = false;
+        if (socket->backend == BsdMitmSocketBackend::DirectNative ||
+            socket->native_fd != kBsdMitmInvalidNativeFd) {
+          std::int16_t events = 0;
+          if (FdSetContains(read_input, fd)) {
+            events |= POLLIN;
+          }
+          if (FdSetContains(write_input, fd)) {
+            events |= POLLOUT;
+          }
+          const std::int32_t revents = PollDirectNativeSocket(*socket, events);
+          if ((revents & (POLLIN | POLLERR | POLLHUP)) != 0 && FdSetContains(read_input, fd)) {
+            FdSetInsert(read_output, fd);
+            fd_ready = true;
+          }
+          if ((revents & (POLLOUT | POLLERR | POLLHUP)) != 0 && FdSetContains(write_input, fd)) {
+            FdSetInsert(write_output, fd);
+            fd_ready = true;
+          }
+          ready += fd_ready ? 1 : 0;
+          continue;
+        }
+        if (FdSetContains(read_input, fd) &&
+            IsBsdSocketReadable(context_ != nullptr ? context_->control_service.get() : nullptr, *socket)) {
+          FdSetInsert(read_output, fd);
+          fd_ready = true;
+        }
+        if (FdSetContains(write_input, fd) && IsBsdSocketWritable(*socket)) {
+          FdSetInsert(write_output, fd);
+          fd_ready = true;
+        }
+        ready += fd_ready ? 1 : 0;
+      }
+      if (ready != 0 || timeout_us == 0 || IsMitmShutdownRequested()) {
+        break;
+      }
+      if (timeout_us > 0) {
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - select_started)
+                                    .count();
+        if (elapsed_us >= timeout_us) {
+          break;
+        }
+      }
+      svcSleepThread(1'000'000ULL);
+    } while (true);
 
     ++session.handled_count;
     PrepareBsdRetErrnoResponse(token, ready, 0);
@@ -2870,6 +3665,19 @@ class BsdMitmAdapterServer {
     BsdMitmVirtualSocket* socket = fd != nullptr ? FindVirtualSocket(session, *fd) : nullptr;
     if (socket == nullptr) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
+      return true;
+    }
+
+    if (socket->original_bsd_fd && socket->backend != BsdMitmSocketBackend::TunnelDatagram) {
+      if (ForwardOriginalRequest(session, socket, token, peer ? "GetPeerName" : "GetSockName")) {
+        const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+        session.post_reply_log = std::string("forwarded bsd:u ") +
+                                 (peer ? "GetPeerName" : "GetSockName") +
+                                 " to original service: pid=0x" +
+                                 FormatHex(session.client_info.process_id, 16) +
+                                 " fd=" + std::to_string(socket->fd) +
+                                 " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1);
+      }
       return true;
     }
 
@@ -2949,49 +3757,24 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    std::int32_t ret = -1;
-    std::int32_t errno_value = 0;
-    if (input.cmd == F_GETFL) {
-      if (socket->native_fd != kBsdMitmInvalidNativeFd) {
-        const int native_ret = bsdFcntl(socket->native_fd, F_GETFL, 0);
-        if (native_ret < 0) {
-          errno_value = CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument);
-        } else {
-          socket->status_flags = native_ret;
-          ret = native_ret;
-        }
-      } else {
-        ret = socket->status_flags;
-      }
-    } else if (input.cmd == F_SETFL) {
+    if (input.cmd == F_SETFL) {
       socket->status_flags = input.flags;
-      if (socket->native_fd != kBsdMitmInvalidNativeFd && bsdFcntl(socket->native_fd, F_SETFL, input.flags) < 0) {
-        errno_value = CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument);
-      } else {
-        ret = 0;
-      }
-#if defined(F_GETFD)
-    } else if (input.cmd == F_GETFD) {
-      ret = socket->descriptor_flags;
-#endif
 #if defined(F_SETFD)
     } else if (input.cmd == F_SETFD) {
       socket->descriptor_flags = input.flags;
-      ret = 0;
 #endif
-    } else {
-      errno_value = kLinuxErrnoOperationNotSupported;
     }
-    ++session.handled_count;
-    LogInfo("bsd-mitm", "handled bsd:u Fcntl: pid=0x" +
-                            FormatHex(session.client_info.process_id, 16) +
-                            " fd=" + std::to_string(input.fd) +
-                            " cmd=" + std::to_string(input.cmd) +
-                            " flags=" + std::to_string(input.flags) +
-                            " ret=" + std::to_string(ret) +
-                            " errno=" + std::to_string(ret < 0 ? errno_value : 0) +
-                            " native_fd=" + std::to_string(socket->native_fd));
-    PrepareBsdRetErrnoResponse(token, ret, errno_value);
+
+    if (ForwardOriginalRequest(session, socket, token, "Fcntl")) {
+      const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+      session.post_reply_log = "forwarded bsd:u Fcntl to original service: pid=0x" +
+                               FormatHex(session.client_info.process_id, 16) +
+                               " fd=" + std::to_string(input.fd) +
+                               " cmd=" + std::to_string(input.cmd) +
+                               " flags=" + std::to_string(input.flags) +
+                               " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                               " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0);
+    }
     return true;
   }
 
@@ -3003,52 +3786,7 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    if (socket->native_fd != kBsdMitmInvalidNativeFd) {
-      const HipcBufferView output = GetAutoRecvBuffer(request, 0);
-      constexpr std::size_t kMaxNativeSockOptBytes = 256;
-      std::array<std::uint8_t, kMaxNativeSockOptBytes> option_buffer{};
-      socklen_t output_length = 0;
-      if (output.address != nullptr && output.size != 0) {
-        output_length = static_cast<socklen_t>(std::min<std::size_t>(output.size, option_buffer.size()));
-        if (!IsLikelyHipcBuffer(output, output_length)) {
-          PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
-          return true;
-        }
-      }
-      const int ret = bsdGetSockOpt(socket->native_fd, input->level, input->optname,
-                                    option_buffer.data(), &output_length);
-      if (ret < 0) {
-        PrepareBsdRetErrnoResponse(token, -1, CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument));
-        return true;
-      }
-      if (output_length != 0 &&
-          !CopyToHipcBuffer(output, option_buffer.data(), std::min<std::size_t>(output_length, option_buffer.size()))) {
-        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
-        return true;
-      }
-
-      ++session.handled_count;
-      PrepareBsdRetErrnoExtraResponse(token, ret, 0, &output_length, sizeof(output_length));
-      return true;
-    }
-
-    if (input->level == SOL_SOCKET && input->optname == SO_ERROR) {
-      const HipcBufferView output = GetAutoRecvBuffer(request, 0);
-      socklen_t output_length = 0;
-      if (output.address != nullptr && output.size >= sizeof(std::int32_t)) {
-        const std::int32_t value = 0;
-        if (!CopyToHipcBuffer(output, &value, sizeof(value))) {
-          PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
-          return true;
-        }
-        output_length = sizeof(value);
-      }
-      PrepareBsdRetErrnoExtraResponse(token, 0, 0, &output_length, sizeof(output_length));
-      ++session.handled_count;
-      return true;
-    }
-
-    PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
+    ForwardOriginalRequest(session, socket, token, "GetSockOpt");
     return true;
   }
 
@@ -3060,37 +3798,7 @@ class BsdMitmAdapterServer {
       return true;
     }
 
-    const HipcBufferView option = GetAutoSendBuffer(request, 0);
-    if (socket->native_fd != kBsdMitmInvalidNativeFd) {
-      if (option.address == nullptr || option.size > kBsdMitmDatagramBurstMaxPayloadBytes ||
-          !IsLikelyHipcBuffer(option, option.size)) {
-        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
-        return true;
-      }
-      std::vector<std::uint8_t> option_copy(option.size);
-      if (!option_copy.empty() &&
-          !CopyFromHipcBuffer(option_copy.data(), option, option_copy.size())) {
-        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadAddress);
-        return true;
-      }
-      const int ret = bsdSetSockOpt(socket->native_fd, input->level, input->optname,
-                                    option_copy.data(), static_cast<socklen_t>(option_copy.size()));
-      if (ret < 0) {
-        PrepareBsdRetErrnoResponse(token, -1, CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument));
-        return true;
-      }
-      ++session.handled_count;
-      PrepareBsdRetErrnoResponse(token, ret, 0);
-      return true;
-    }
-
-    if (!StorePendingSocketOption(*socket, input->level, input->optname, option)) {
-      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
-      return true;
-    }
-
-    ++session.handled_count;
-    PrepareBsdRetErrnoResponse(token, 0, 0);
+    ForwardOriginalRequest(session, socket, token, "SetSockOpt");
     return true;
   }
 
@@ -3104,15 +3812,160 @@ class BsdMitmAdapterServer {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
       return true;
     }
-    if (socket->backend != BsdMitmSocketBackend::DirectNative) {
+    if (socket->backend == BsdMitmSocketBackend::TunnelDatagram) {
       PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
       return true;
     }
+    ForwardOriginalRequest(session, socket, token, write ? "Write" : "Read");
+    return true;
+  }
 
-    if (write) {
-      return HandleDirectSend(session, *socket, GetAutoSendBuffer(request, 0), nullptr, 0, 0, token);
+  bool HandleMMsg(BsdMitmClientSession& session,
+                  const HipcParsedRequest& request,
+                  std::uint32_t token,
+                  bool send) {
+    const BsdMMsgIn* input_ptr = GetCmifPayloadAs<BsdMMsgIn>(request);
+    if (input_ptr == nullptr) {
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+      return true;
     }
-    return HandleDirectRecv(session, *socket, GetAutoRecvBuffer(request, 0), {}, false, 0, token);
+    const BsdMMsgIn input = *input_ptr;
+    BsdMitmVirtualSocket* socket = FindVirtualSocket(session, input.sockfd);
+    if (socket == nullptr) {
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
+      return true;
+    }
+    if (!socket->original_bsd_fd || socket->backend == BsdMitmSocketBackend::TunnelDatagram) {
+      LogWarning("bsd-mitm", std::string("rejected bsd:u ") + (send ? "SendMMsg" : "RecvMMsg") +
+                                  " because tunnel-backed batches are not implemented: pid=0x" +
+                                  FormatHex(session.client_info.process_id, 16) +
+                                  " fd=" + std::to_string(socket->fd) +
+                                  " vlen=" + std::to_string(input.vlen));
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
+      return true;
+    }
+    const bool datagram_socket = IsBsdDatagramSocket(*socket);
+    const bool stream_socket = IsBsdStreamSocket(*socket);
+    if (!datagram_socket && !stream_socket) {
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoOperationNotSupported);
+      return true;
+    }
+    if (input.vlen == 0 || input.vlen > kBsdMitmMaxMMsgEntries) {
+      PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+      return true;
+    }
+
+    std::size_t destination_count = 0;
+    const char* packed_buffer_source = "none";
+    std::size_t packed_buffer_size = 0;
+    BsdMitmTlsSnapshot request_snapshot{};
+    if (send) {
+      BsdMMsgDestinations destinations{};
+      const char* parse_error = nullptr;
+      const BsdMMsgPackedBuffer packed_buffer = SelectBsdMMsgPackedBuffer(request);
+      packed_buffer_source = packed_buffer.source;
+      packed_buffer_size = packed_buffer.view.size;
+      if (!ParseBsdSendMMsgDestinations(input,
+                                        *socket,
+                                        packed_buffer.view,
+                                        &destinations,
+                                        &parse_error)) {
+        LogWarning("bsd-mitm", "rejected bsd:u SendMMsg packed buffer: pid=0x" +
+                                    FormatHex(session.client_info.process_id, 16) +
+                                    " fd=" + std::to_string(socket->fd) +
+                                    " vlen=" + std::to_string(input.vlen) +
+                                    " source=" + packed_buffer_source +
+                                    " size=" + std::to_string(packed_buffer_size) +
+                                    " send_buffers=" + std::to_string(request.meta.num_send_buffers) +
+                                    " recv_buffers=" + std::to_string(request.meta.num_recv_buffers) +
+                                    " exch_buffers=" + std::to_string(request.meta.num_exch_buffers) +
+                                    " reason=" + (parse_error != nullptr ? parse_error : "unknown"));
+        PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoInvalidArgument);
+        return true;
+      }
+
+      destination_count = destinations.count;
+      request_snapshot = CaptureCurrentBsdMitmTls();
+      const TransportProtocol transport = stream_socket ? TransportProtocol::Tcp : TransportProtocol::Udp;
+      for (std::size_t destination_index = 0;
+           destination_index < destinations.count;
+           ++destination_index) {
+        const Result<NetworkPlan> plan = PlanBsdRoute(session,
+                                                      destinations.addresses[destination_index],
+                                                      destinations.lengths[destination_index],
+                                                      transport);
+        if (!plan.ok()) {
+          LogWarning("bsd-mitm", "rejected bsd:u SendMMsg because route planning failed: pid=0x" +
+                                      FormatHex(session.client_info.process_id, 16) +
+                                      " fd=" + std::to_string(socket->fd) +
+                                      " target_index=" + std::to_string(destination_index) +
+                                      " error=" + plan.error.message);
+          PrepareBsdRetErrnoResponse(token, -1, ErrnoFromSwgErrorCode(plan.error.code));
+          return true;
+        }
+        if (plan.value.action != RouteAction::Direct) {
+          const std::optional<std::string> remote_host =
+              Ipv4SockaddrToHost(destinations.addresses[destination_index],
+                                 destinations.lengths[destination_index]);
+          const std::optional<std::uint16_t> remote_port =
+              Ipv4SockaddrToPort(destinations.addresses[destination_index],
+                                 destinations.lengths[destination_index]);
+          LogWarning("bsd-mitm", "rejected bsd:u SendMMsg because batch route is not direct: pid=0x" +
+                                      FormatHex(session.client_info.process_id, 16) +
+                                      " fd=" + std::to_string(socket->fd) +
+                                      " target=" + remote_host.value_or("?") +
+                                      ":" + std::to_string(remote_port.value_or(0)) +
+                                      " action=" + std::string(ToString(plan.value.action)));
+          PrepareBsdRetErrnoResponse(token,
+                                     -1,
+                                     plan.value.action == RouteAction::Tunnel
+                                         ? kLinuxErrnoOperationNotSupported
+                                         : kLinuxErrnoNetworkUnreachable);
+          return true;
+        }
+      }
+      RestoreCurrentBsdMitmTls(request_snapshot);
+    }
+
+    if (!ForwardOriginalRequest(session, socket, token, send ? "SendMMsg" : "RecvMMsg")) {
+      return true;
+    }
+    socket->backend = BsdMitmSocketBackend::OriginalForwarded;
+    if (send) {
+      ++socket->send_calls;
+      ++socket->send_mmsg_calls;
+    } else {
+      ++socket->recv_calls;
+      ++socket->recv_mmsg_calls;
+    }
+
+    const std::uint64_t call_count = send ? socket->send_mmsg_calls : socket->recv_mmsg_calls;
+    const std::optional<BsdRetErrnoOut> forwarded = ParseCurrentBsdRetErrnoResponse();
+    const bool media_phase_transition =
+        !media_phase_enabled_ && forwarded.has_value() && forwarded->ret >= 0;
+    if (media_phase_transition) {
+      media_phase_enabled_ = true;
+      next_session_index_ = 0;
+    }
+    if (ShouldLogSparseCount(call_count) || media_phase_transition) {
+      session.post_reply_log = std::string("forwarded bsd:u ") +
+                               (send ? "SendMMsg" : "RecvMMsg") +
+                               " to original service: pid=0x" +
+                               FormatHex(session.client_info.process_id, 16) +
+                               " fd=" + std::to_string(socket->fd) +
+                               " vlen=" + std::to_string(input.vlen) +
+                               " flags=" + std::to_string(input.flags) +
+                               (send ? " targets=" + std::to_string(destination_count) : "") +
+                               (send ? " buffer=" + std::string(packed_buffer_source) : "") +
+                               (send ? " buffer_size=" + std::to_string(packed_buffer_size) : "") +
+                               " ret=" + std::to_string(forwarded.has_value() ? forwarded->ret : -1) +
+                               " errno=" + std::to_string(forwarded.has_value() ? forwarded->errno_ : 0) +
+                               " count=" + std::to_string(call_count) +
+                               (media_phase_transition
+                                    ? " scheduler_phase=media_round_robin wait_slicing=enabled"
+                                    : "");
+    }
+    return true;
   }
 
   bool HandleRequest(std::size_t index, BsdMitmClientSession& session, const HipcParsedRequest& request) {
@@ -3332,23 +4185,36 @@ class BsdMitmAdapterServer {
           PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
           return true;
         }
-        if (socket->native_fd != kBsdMitmInvalidNativeFd &&
-            bsdShutdown(socket->native_fd, input->flags) < 0) {
-          PrepareBsdRetErrnoResponse(token, -1, CurrentBsdErrnoOr(kLinuxErrnoInvalidArgument));
-          return true;
-        }
-        ++session.handled_count;
-        PrepareBsdRetErrnoResponse(token, 0, 0);
+        ForwardOriginalRequest(session, socket, token, "Shutdown");
         return true;
       }
-      case 23:
-        ++session.handled_count;
-        PrepareBsdRetErrnoResponse(token, 0, 0);
+      case 23: {
+        if (!ForwardOriginalRequest(session, nullptr, token, "ShutdownAllSockets")) {
+          return true;
+        }
+        const BsdMitmTlsSnapshot forwarded_response = CaptureCurrentBsdMitmTls();
+        if (BsdMitmClientState* state = GetBsdClientState(session)) {
+          for (BsdMitmVirtualSocket& socket : state->virtual_sockets) {
+            if (!socket.used) {
+              continue;
+            }
+            CloseTunnelDatagramsForSocket(context_ != nullptr ? context_->control_service.get() : nullptr,
+                                          socket);
+            CloseDirectNativeSocket(socket);
+            socket = {};
+          }
+        }
+        RestoreCurrentBsdMitmTls(forwarded_response);
         return true;
+      }
       case 24:
         return HandleReadWrite(session, request, token, true);
       case 25:
         return HandleReadWrite(session, request, token, false);
+      case 29:
+        return HandleMMsg(session, request, token, false);
+      case 30:
+        return HandleMMsg(session, request, token, true);
       case 26: {
         const auto* fd = GetCmifPayloadAs<std::int32_t>(request);
         if (fd == nullptr) {
@@ -3357,16 +4223,23 @@ class BsdMitmAdapterServer {
         }
         const std::int32_t fd_value = *fd;
 
-        if (!CloseVirtualBsdSocket(context_ != nullptr ? context_->control_service.get() : nullptr, session, fd_value)) {
+        BsdMitmVirtualSocket* socket = FindVirtualSocket(session, fd_value);
+        if (socket == nullptr) {
           PrepareBsdRetErrnoResponse(token, -1, kLinuxErrnoBadFileDescriptor);
           return true;
         }
-
-        ++session.handled_count;
-        LogInfo("bsd-mitm", "handled bsd:u Close: pid=0x" +
-                                FormatHex(session.client_info.process_id, 16) +
-                                " fd=" + std::to_string(fd_value));
-        PrepareBsdRetErrnoResponse(token, 0, 0);
+        if (!ForwardOriginalRequest(session, socket, token, "Close")) {
+          return true;
+        }
+        const BsdMitmTlsSnapshot forwarded_response = CaptureCurrentBsdMitmTls();
+        static_cast<void>(ReleaseVirtualBsdSocket(
+            context_ != nullptr ? context_->control_service.get() : nullptr,
+            session,
+            fd_value));
+        RestoreCurrentBsdMitmTls(forwarded_response);
+        session.post_reply_log = "forwarded bsd:u Close to original service: pid=0x" +
+                                 FormatHex(session.client_info.process_id, 16) +
+                                 " fd=" + std::to_string(fd_value);
         return true;
       }
       default:
@@ -3387,10 +4260,14 @@ class BsdMitmAdapterServer {
     BsdMitmClientSession& session = sessions_[index];
     s32 unused_index = -1;
     hipcMakeRequestInline(armGetTls());
-    ::Result rc = svcReplyAndReceive(&unused_index, &session.client_session, 1, INVALID_HANDLE, UINT64_MAX);
+    ::Result rc = svcReplyAndReceive(&unused_index, &session.client_session, 1, INVALID_HANDLE,
+                                     kObserverWorkerPollNs);
+    if (rc == KERNELRESULT(TimedOut)) {
+      return;
+    }
     if (R_FAILED(rc)) {
       LogWarning("bsd-mitm", "failed to receive bsd:u request: slot=" + std::to_string(index) +
-                                  " requests=" + std::to_string(session.request_count) +
+                               " requests=" + std::to_string(session.request_count) +
                                   " handled=" + std::to_string(session.handled_count) +
                                   " rc=" + FormatLibnxResult(rc));
       CloseSession(index);
@@ -3420,6 +4297,7 @@ class BsdMitmAdapterServer {
                              " data_words=" + std::to_string(request.meta.num_data_words) +
                              " send_buffers=" + std::to_string(request.meta.num_send_buffers) +
                              " recv_buffers=" + std::to_string(request.meta.num_recv_buffers) +
+                             " exch_buffers=" + std::to_string(request.meta.num_exch_buffers) +
                              " send_statics=" + std::to_string(request.meta.num_send_statics) +
                              " recv_statics=" + std::to_string(request.meta.num_recv_statics) +
                              " copy_handles=" + std::to_string(request.meta.num_copy_handles) +
@@ -3463,6 +4341,10 @@ class BsdMitmAdapterServer {
   BsdMitmServerContext* context_ = nullptr;
   BsdSocketRuntime direct_socket_runtime_{};
   TipcService sm_session_{};
+  bool sm_session_open_ = false;
+  bool shutdown_complete_ = false;
+  bool media_phase_enabled_ = false;
+  std::size_t next_session_index_ = 0;
   std::array<BsdMitmClientSession, kBsdMitmMaxSessions> sessions_{};
 };
 #endif
@@ -3477,6 +4359,7 @@ void DnsMitmServerThreadMain(void* arg) {
   }
   LogInfo("dns-mitm", "active sfdnsres MITM proxy ready");
   server.Run();
+  LogInfo("dns-mitm", "active sfdnsres MITM proxy stopped");
 }
 
 #if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
@@ -3494,8 +4377,9 @@ void BsdMitmAdapterThreadMain(void* arg) {
                                FormatLibnxResult(init_result));
     return;
   }
-  LogInfo("bsd-mitm", "active bsd:u MITM adapter lab ready: socket_fd_source=forwarded_original_bsd, socket_response=forward_exact_fd0_patch, pointer_buffer_size=force_zero, stream_socket_native_open=deferred_connect, close_diag=enabled, fcntl_fd_flags=enabled, dispatch_trace=tls_deferred, title_selector=exact_allowlist, hbl_host_mitm=disabled");
+  LogInfo("bsd-mitm", "active bsd:u MITM adapter lab ready: direct_backend=original_bsd_forwarding, session_scheduler=control_priority_then_media_round_robin, direct_wait_slice_ms=1, wait_slicing=media_phase_only, media_udp_receive=force_dontwait, media_phase_trigger=successful_mmsg, mmsg_direct_forward=route_validated, mmsg_buffer=recv_inout_fallback, mmsg_logging=sparse, slow_forward_threshold_ms=50, rtsp_diagnostics=bounded_method_status, poll_outcome=hipc_shape_ready_repair, poll_ready_repair=unparseable_response_with_new_ready_descriptors_only, private_bsd_runtime=disabled, poll_select_timeout=exact_control_cooperative_media, socket_response=forward_exact_fd0_patch, pointer_buffer_size=force_zero, shutdown_guard=park_on_live_worker, dispatch_trace=tls_deferred, title_selector=exact_allowlist, hbl_host_mitm=disabled");
   server->Run();
+  LogInfo("bsd-mitm", "active bsd:u MITM adapter lab stopped");
 }
 #endif
 
@@ -3597,7 +4481,7 @@ void MitmQueryResponderThreadMain(void* arg) {
   auto* context = static_cast<QueryResponderContext*>(arg);
   g_query_responder_ready.store(true, std::memory_order_release);
 
-  while (true) {
+  while (!IsMitmShutdownRequested()) {
     std::array<Handle, 2> query_handles{};
     std::array<std::size_t, 2> service_indices{};
     const std::size_t handle_count = BuildQueryWaitSet(context->services, &query_handles, &service_indices);
@@ -3611,8 +4495,14 @@ void MitmQueryResponderThreadMain(void* arg) {
     hipcMakeRequestInline(armGetTls());
     const ::Result wait_result =
         svcReplyAndReceive(&signaled_index, query_handles.data(), static_cast<s32>(handle_count), INVALID_HANDLE,
-                           UINT64_MAX);
+                           kObserverWorkerPollNs);
+    if (wait_result == KERNELRESULT(TimedOut)) {
+      continue;
+    }
     if (R_FAILED(wait_result)) {
+      if (IsMitmShutdownRequested()) {
+        break;
+      }
       g_query_wait_failures.fetch_add(1, std::memory_order_relaxed);
       svcSleepThread(kObserverRetryDelayNs);
       continue;
@@ -3625,6 +4515,7 @@ void MitmQueryResponderThreadMain(void* arg) {
     const std::size_t service_index = service_indices[static_cast<std::size_t>(signaled_index)];
     ProcessQuerySession(service_index, context->services[service_index], *context);
   }
+  LogInfo("mitm-observer", "MitM query responder thread stopped");
 }
 
 ::Result StartMitmQueryResponderThread(const std::array<ObservedService, 2>& services,
@@ -3657,16 +4548,22 @@ void MitmQueryResponderThreadMain(void* arg) {
     threadClose(&g_observer_runtime.query_thread);
     return start_result;
   }
+  g_observer_runtime.query_thread_started = true;
 
   for (std::uint32_t attempt = 0; attempt < kQueryResponderReadyPolls; ++attempt) {
+    if (IsMitmShutdownRequested()) {
+      return KERNELRESULT(Cancelled);
+    }
     if (g_query_responder_ready.load(std::memory_order_acquire)) {
-      g_observer_runtime.query_thread_started = true;
       return 0;
     }
     svcSleepThread(kQueryResponderReadyPollNs);
   }
 
-  threadClose(&g_observer_runtime.query_thread);
+  g_observer_runtime.stop_requested.store(true, std::memory_order_release);
+  WaitAndCloseMitmThread(&g_observer_runtime.query_thread,
+                         &g_observer_runtime.query_thread_started,
+                         "MitM query responder");
   return MAKERESULT(Module_Libnx, LibnxError_Timeout);
 }
 
@@ -3825,18 +4722,31 @@ void MitmObserverThreadMain(void*) {
     LogWarning("mitm-observer", "failed to open Atmosphere SM session: " + FormatLibnxResult(open_result));
     return;
   }
+  bool sm_session_open = true;
+  auto close_sm_session = [&]() {
+    if (sm_session_open) {
+      tipcClose(&sm_session);
+      sm_session_open = false;
+    }
+  };
 
-  while (!AllRequestedServicesInstalled(services)) {
+  while (!IsMitmShutdownRequested() && !AllRequestedServicesInstalled(services)) {
     for (ObservedService& service : services) {
       TryInstallObservedService(&sm_session, service);
     }
-    if (!AllRequestedServicesInstalled(services)) {
+    if (!IsMitmShutdownRequested() && !AllRequestedServicesInstalled(services)) {
       svcSleepThread(kObserverRetryDelayNs);
     }
+  }
+  if (IsMitmShutdownRequested()) {
+    close_sm_session();
+    LogInfo("mitm-observer", "experimental MitM observer thread stopped before activation");
+    return;
   }
 
   if (!AnyRequestedServiceInstalled(services)) {
     LogWarning("mitm-observer", "MitM observer disabled because all requested hooks are unavailable");
+    close_sm_session();
     return;
   }
 
@@ -3854,6 +4764,7 @@ void MitmObserverThreadMain(void*) {
     if (R_FAILED(dns_thread_result)) {
       LogWarning("dns-mitm", "failed to start active DNS MITM proxy thread: " +
                                  FormatLibnxResult(dns_thread_result));
+      close_sm_session();
       return;
     }
   }
@@ -3871,6 +4782,7 @@ void MitmObserverThreadMain(void*) {
     if (R_FAILED(bsd_thread_result)) {
       LogWarning("bsd-mitm", "failed to start bsd:u MITM adapter lab thread: " +
                                FormatLibnxResult(bsd_thread_result));
+      close_sm_session();
       return;
     }
 #else
@@ -3882,15 +4794,64 @@ void MitmObserverThreadMain(void*) {
   if (R_FAILED(query_thread_result)) {
     LogWarning("mitm-observer", "failed to start MitM query responder thread: " +
                                     FormatLibnxResult(query_thread_result));
+    close_sm_session();
     return;
   }
 
   ClearFutureMitmDeclarations(&sm_session, services);
 
   std::array<std::uint64_t, 2> last_query_totals{};
-  while (true) {
+  while (!IsMitmShutdownRequested()) {
     LogQueryCounterSnapshots(services, &last_query_totals);
     svcSleepThread(kObserverRetryDelayNs);
+  }
+  close_sm_session();
+  LogInfo("mitm-observer", "experimental MitM observer thread stopped");
+}
+
+bool WaitAndCloseMitmThread(Thread* thread, bool* started, const char* name) {
+  if (thread == nullptr || started == nullptr || !*started) {
+    return true;
+  }
+
+  s32 signaled_index = -1;
+  const Handle thread_handle = thread->handle;
+  const ::Result wait_result =
+      svcWaitSynchronization(&signaled_index, &thread_handle, 1, kObserverShutdownWaitNs);
+  if (wait_result == KERNELRESULT(TimedOut)) {
+    LogWarning("mitm-observer", std::string("timed out waiting for ") + name + " thread to stop");
+    return false;
+  }
+  if (R_FAILED(wait_result)) {
+    LogWarning("mitm-observer", std::string("failed waiting for ") + name +
+                                    " thread to stop: " + FormatLibnxResult(wait_result));
+    return false;
+  }
+
+  const ::Result join_result = threadWaitForExit(thread);
+  if (R_FAILED(join_result)) {
+    LogWarning("mitm-observer", std::string("failed to join ") + name +
+                                    " thread: " + FormatLibnxResult(join_result));
+  }
+  threadClose(thread);
+  *thread = {};
+  *started = false;
+  return R_SUCCEEDED(join_result);
+}
+
+void CloseInstalledMitmServiceHandles() {
+  for (ObservedService& service : g_observer_runtime.installed_services) {
+    if (!service.installed) {
+      continue;
+    }
+    if (service.mitm_port != INVALID_HANDLE) {
+      svcCloseHandle(service.mitm_port);
+      service.mitm_port = INVALID_HANDLE;
+    }
+    if (service.query_session != INVALID_HANDLE) {
+      svcCloseHandle(service.query_session);
+      service.query_session = INVALID_HANDLE;
+    }
   }
 }
 
@@ -3904,6 +4865,8 @@ namespace swg::sysmodule {
   if (g_observer_runtime.started) {
     return 0;
   }
+  g_observer_runtime.stop_requested.store(false, std::memory_order_release);
+  g_observer_runtime.installed_services = {};
   g_observer_runtime.control_service = std::move(control_service);
 
   const int priority = 45;
@@ -3925,9 +4888,12 @@ namespace swg::sysmodule {
   return 0;
 }
 
-void ShutdownExperimentalMitmObserver() {
+bool ShutdownExperimentalMitmObserver() {
+  g_observer_runtime.stop_requested.store(true, std::memory_order_release);
+
   TipcService sm_session{};
   bool sm_open = false;
+
   for (ObservedService& service : g_observer_runtime.installed_services) {
     if (!service.installed) {
       continue;
@@ -3947,6 +4913,69 @@ void ShutdownExperimentalMitmObserver() {
     if (R_FAILED(clear_result) && !IsSmResult(clear_result, 7)) {
       LogWarning("mitm-observer", std::string("failed to clear future MitM declaration during shutdown for ") +
                                       service.service_name + ": " + FormatLibnxResult(clear_result));
+    }
+  }
+
+  CloseInstalledMitmServiceHandles();
+
+#if defined(SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB)
+  bool all_threads_stopped =
+      WaitAndCloseMitmThread(&g_observer_runtime.bsd_thread,
+                             &g_observer_runtime.bsd_thread_started,
+                             "bsd:u MITM adapter");
+#else
+  bool all_threads_stopped = true;
+#endif
+  all_threads_stopped =
+      WaitAndCloseMitmThread(&g_observer_runtime.dns_thread,
+                             &g_observer_runtime.dns_thread_started,
+                             "sfdnsres MITM proxy") &&
+      all_threads_stopped;
+  all_threads_stopped =
+      WaitAndCloseMitmThread(&g_observer_runtime.query_thread,
+                             &g_observer_runtime.query_thread_started,
+                             "MitM query responder") &&
+      all_threads_stopped;
+  all_threads_stopped =
+      WaitAndCloseMitmThread(&g_observer_runtime.thread,
+                             &g_observer_runtime.started,
+                             "MitM observer") &&
+      all_threads_stopped;
+  if (all_threads_stopped) {
+    g_observer_runtime.control_service.reset();
+  }
+
+  if (!all_threads_stopped) {
+    LogWarning("mitm-observer",
+               "unsafe shutdown refused: at least one MITM worker is still alive; hooks remain installed");
+    if (sm_open) {
+      tipcClose(&sm_session);
+    }
+    return false;
+  }
+
+  if (!sm_open) {
+    for (const ObservedService& service : g_observer_runtime.installed_services) {
+      if (!service.installed) {
+        continue;
+      }
+      const ::Result open_result = OpenAtmosphereSession(&sm_session);
+      if (R_FAILED(open_result)) {
+        LogWarning("mitm-observer", "failed to open Atmosphere SM session for MITM uninstall: " +
+                                      FormatLibnxResult(open_result));
+      } else {
+        sm_open = true;
+      }
+      break;
+    }
+  }
+
+  for (ObservedService& service : g_observer_runtime.installed_services) {
+    if (!service.installed) {
+      continue;
+    }
+    if (!sm_open) {
+      continue;
     }
 
     const ::Result uninstall_result = UninstallAtmosphereMitm(&sm_session, service.service_name);
@@ -3971,16 +5000,20 @@ void ShutdownExperimentalMitmObserver() {
   if (sm_open) {
     tipcClose(&sm_session);
   }
+  return true;
 }
 
 #else
 
-::Result StartExperimentalMitmObserverThread() {
+::Result StartExperimentalMitmObserverThread(std::shared_ptr<IControlService> control_service) {
+  (void)control_service;
   LogWarning("mitm-observer", "experimental MitM service-open observer is disabled in this build");
   return 0;
 }
 
-void ShutdownExperimentalMitmObserver() {}
+bool ShutdownExperimentalMitmObserver() {
+  return true;
+}
 
 #endif
 

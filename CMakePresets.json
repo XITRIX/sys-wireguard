@@ -46,6 +46,22 @@
         "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER": "ON",
         "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB": "OFF"
       }
+    },
+    {
+      "name": "switch-debug-bsd-adapter-lab",
+      "displayName": "Switch Debug BSD MITM Adapter Lab",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/switch-debug-bsd-adapter-lab",
+      "toolchainFile": "$env{DEVKITPRO}/cmake/Switch.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SWG_BUILD_HOST_TOOLS": "OFF",
+        "SWG_BUILD_SWITCH_TARGETS": "ON",
+        "SWG_BUILD_TESTS": "OFF",
+        "SWG_ENABLE_EXPERIMENTAL_MITM_OBSERVER": "ON",
+        "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_OBSERVER": "ON",
+        "SWG_ENABLE_EXPERIMENTAL_BSD_MITM_ADAPTER_LAB": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -60,6 +76,10 @@
     {
       "name": "switch-debug",
       "configurePreset": "switch-debug"
+    },
+    {
+      "name": "switch-debug-bsd-adapter-lab",
+      "configurePreset": "switch-debug-bsd-adapter-lab"
     }
   ],
   "testPresets": [

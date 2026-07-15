@@ -398,6 +398,21 @@ class SwitchControlServer {
   std::size_t handle_count_ = 0;
 };
 
+void ShutdownMitmOrPark(const char* reason) {
+  if (swg::sysmodule::ShutdownExperimentalMitmObserver()) {
+    return;
+  }
+
+  const std::string message =
+      std::string("refusing process exit after unsafe MITM shutdown: ") + reason +
+      "; reboot the console to recover cleanly";
+  WriteBootMarker(message.c_str());
+  swg::LogError("sysmodule", message);
+  while (true) {
+    svcSleepThread(1'000'000'000ULL);
+  }
+}
+
 }  // namespace
 
 extern "C" {
@@ -414,7 +429,7 @@ void __appInit(void) {
 }
 
 void __appExit(void) {
-  swg::sysmodule::ShutdownExperimentalMitmObserver();
+  ShutdownMitmOrPark("__appExit");
   if (g_sdmc_mounted) {
     fsdevUnmountAll();
   }
@@ -459,7 +474,7 @@ int main(int argc, char** argv) {
   if (R_FAILED(init_result)) {
     WriteBootMarker("main: service registration failed");
     swg::LogError("sysmodule", "failed to register swg:ctl: " + FormatLibnxResult(init_result));
-    swg::sysmodule::ShutdownExperimentalMitmObserver();
+    ShutdownMitmOrPark("control service registration failure");
     return 1;
   }
 
@@ -469,12 +484,12 @@ int main(int argc, char** argv) {
   if (R_FAILED(run_result)) {
     WriteBootMarker("main: service loop exited");
     swg::LogError("sysmodule", "swg:ctl service loop exited: " + FormatLibnxResult(run_result));
-    swg::sysmodule::ShutdownExperimentalMitmObserver();
+    ShutdownMitmOrPark("control service loop failure");
     return 1;
   }
 
   WriteBootMarker("main: service loop stopped");
   swg::LogInfo("sysmodule", "swg:ctl service loop stopped");
-  swg::sysmodule::ShutdownExperimentalMitmObserver();
+  ShutdownMitmOrPark("normal control service stop");
   return 0;
 }
